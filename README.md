@@ -2,19 +2,9 @@
 
 <div align="center">
 
+<img src="assets/logo.svg" alt="LLaMesa — local inference control plane" width="520" />
+
 <br />
-
-<span style="font-size:48px;font-weight:bold;font-family:monospace;">
-<span style="color:#5DCAA5">LL</span><span style="color:#EF9F27">a</span><span style="color:#5DCAA5">M</span><span style="color:#EF9F27">esa</span>
-</span>
-
-<br /><br />
-
-<span style="display:inline-block;background:#5DCAA5;color:#0a0e14;padding:2px 10px;border-radius:6px;font-family:monospace;font-weight:bold;">LLM</span>
-&nbsp;
-<span style="color:#6b7280;font-family:monospace;">local inference control plane · v0.1</span>
-
-<br /><br />
 
 <sup><span style="color:#6b7280;">LLaMesa = LLM + "lamesa" (table in Filipino)</span></sup>
 

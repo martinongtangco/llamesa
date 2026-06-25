@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 520 140" width="520" height="140">
+  <rect width="520" height="140" fill="#0d1117" rx="12"/>
+
+  <!-- LLaMesa wordmark -->
+  <text x="260" y="78" text-anchor="middle" font-family="'Segoe UI', system-ui, -apple-system, sans-serif" font-size="64" font-weight="700" letter-spacing="-1">
+    <tspan fill="#5DCAA5">LL</tspan><tspan fill="#EF9F27">a</tspan><tspan fill="#5DCAA5">M</tspan><tspan fill="#EF9F27">esa</tspan>
+  </text>
+
+  <!-- LLM badge -->
+  <rect x="40" y="95" width="56" height="26" rx="6" fill="none" stroke="#5DCAA5" stroke-width="1.5"/>
+  <text x="68" y="113" text-anchor="middle" font-family="'Segoe UI', system-ui, -apple-system, sans-serif" font-size="13" font-weight="600" fill="#5DCAA5">LLM</text>
+
+  <!-- Tagline -->
+  <text x="110" y="112" font-family="'Courier New', monospace" font-size="14" fill="#6b7280">local inference control plane · v0.1</text>
+</svg>
