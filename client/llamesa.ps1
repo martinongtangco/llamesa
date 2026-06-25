@@ -144,7 +144,7 @@ function Invoke-ServerCommand {
     $fullCommand = "bash ${llamesaPath} ${command}"
 
     try {
-        $result = ssh -o BatchMode=yes -o ConnectTimeout=5 "${sshUser}@${sshHost}" $fullCommand 2>&1
+        $result = ssh -o BatchMode=yes -o ConnectTimeout=5 "${sshUser}@${sshHost}" $fullCommand 2>$null
 
         if ($LASTEXITCODE -ne 0 -and -not $raw) {
             Write-Warning "SSH command failed (exit code: $LASTEXITCODE)"
