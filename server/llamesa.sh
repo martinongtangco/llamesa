@@ -491,14 +491,22 @@ cmd_restart() {
 
     sleep 1
 
-    # Extract model from status if available
-    local model
-    model=$(echo "$current_status" | grep -o '"model":"[^"]*"' | cut -d'"' -f4 || echo "")
-
-    if [[ -n "$model" ]] && [[ "$model" != "none" ]]; then
-        cmd_start --model "$model" "$@"
+    # Extract model file path from status, resolve to directory name for cmd_start
+    local model_file
+    model_file=$(echo "$current_status" | grep -o '"model":"[^"]*"' | cut -d'"' -f4 || echo "")
+    local model_name=""
+    if [[ -n "$model_file" ]] && [[ "$model_file" != "none" ]] && [[ "$model_file" != "unknown" ]]; then
+        # Search models_dir for a directory containing this file
+        local model_path
+        model_path=$(find "$MODELS_DIR" -name "$model_file" 2>/dev/null | head -1 || true)
+        if [[ -n "$model_path" ]]; then
+            model_name=$(basename "$(dirname "$model_path")")
+        fi
+    fi
+    if [[ -n "$model_name" ]]; then
+        cmd_start --model "$model_name" "$@"
     else
-        error "No model detected. Specify a model with --model <name>"
+        error "No model detected. Use /start to start manually."
     fi
 }
 
