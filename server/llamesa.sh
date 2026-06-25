@@ -72,7 +72,7 @@ read_config() {
 # Run a command inside the distrobox container
 run_in_container() {
     local cmd="$1"
-    distrobox enter --no-tty "$CONTAINER" -- bash -c "$cmd"
+    distrobox enter -T "$CONTAINER" -- bash -c "$cmd"
 }
 
 # Check if server is running
