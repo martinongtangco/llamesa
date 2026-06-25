@@ -154,7 +154,7 @@ auto_detected=$(distrobox enter "$container" -- bash -c "
     for path in /run/host/home/*/llama.cpp/build/bin/llama-server; do
         if [[ -x \"\$path\" ]]; then
             echo \"\$path\"
-            break
+            exit 0
         fi
     done
 
@@ -162,8 +162,9 @@ auto_detected=$(distrobox enter "$container" -- bash -c "
     which llama-server 2>/dev/null || true
 
     # Search broader
-    find /run/host/home /home /opt -name 'llama-server' -type f -executable 2>/dev/null | head -1
-" 2>/dev/null | head -1)
+    find /run/host/home /home /opt -name 'llama-server' -type f -executable 2>/dev/null | head -1 || true
+" 2>/dev/null || true)
+auto_detected=$(echo "$auto_detected" | head -1 || true)
 
 if [[ -n "$auto_detected" ]]; then
     llama_binary="$auto_detected"
