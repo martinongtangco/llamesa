@@ -34,7 +34,7 @@ error() {
 }
 
 info() {
-    echo -e "\033[32m[INFO]\033[0m $*"
+    echo -e "\033[32m[INFO]\033[0m $*" >&2
 }
 
 warn() {
