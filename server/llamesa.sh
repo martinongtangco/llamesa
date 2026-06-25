@@ -214,30 +214,20 @@ cmd_status() {
         local ram_used=0
         local ram_total=0
 
-        # Get VRAM usage from rocm-smi inside container (if available)
-        if command -v distrobox &>/dev/null; then
-            # Try rocm-smi for AMD GPU stats
+        # Get VRAM usage from rocm-smi inside container via podman exec
+        local container_id
+        container_id=$(podman ps --filter "name=^${CONTAINER}$" --format "{{.ID}}" 2>/dev/null | head -1 || true)
+        if [[ -n "$container_id" ]]; then
             local rocm_output
-            if rocm_output=$(distrobox enter "$CONTAINER" -- bash -c "rocm-smi --json 2>/dev/null || rocm-smi --showusedvram 2>/dev/null || echo ''" 2>/dev/null); then
-                if [[ -n "$rocm_output" ]] && [[ "$rocm_output" != "" ]]; then
-                    # Parse VRAM from rocm-smi output
-                    local used_vram_kb
-                    used_vram_kb=$(echo "$rocm_output" | grep -o '"vram_used":[0-9]*' | cut -d: -f2 || echo "")
-                    if [[ -n "$used_vram_kb" ]]; then
-                        vram_used=$((used_vram_kb * 1024))
-                    fi
+            if rocm_output=$(podman exec "$container_id" bash -c "rocm-smi --showmeminfo vram 2>/dev/null" 2>/dev/null); then
+                local used_bytes total_bytes
+                used_bytes=$(echo "$rocm_output" | grep -i "VRAM Total Used Memory" | grep -o '[0-9]*$' || echo "")
+                total_bytes=$(echo "$rocm_output" | grep -i "VRAM Total Memory (B)" | grep -v "Used" | grep -o '[0-9]*$' || echo "")
+                if [[ -n "$used_bytes" ]]; then
+                    vram_used=$used_bytes
                 fi
-            fi
-
-            # Get total VRAM from gpu_info or nvidia-smi equivalent
-            # For AMD with rocm-smi
-            local total_vram_line
-            if total_vram_line=$(distrobox enter "$CONTAINER" -- bash -c "rocm-smi 2>/dev/null | grep -i 'vram\|memory' | head -1" 2>/dev/null); then
-                # Parse total from output like "VRAM: 50539 MB"
-                local total_vram_mb
-                total_vram_mb=$(echo "$total_vram_line" | grep -o '[0-9]*' | head -1 || echo "")
-                if [[ -n "$total_vram_mb" ]]; then
-                    vram_total=$((total_vram_mb * 1048576))
+                if [[ -n "$total_bytes" ]]; then
+                    vram_total=$total_bytes
                 fi
             fi
         fi
