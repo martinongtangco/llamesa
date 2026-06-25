@@ -459,37 +459,23 @@ cmd_stop() {
 
     if ! is_server_running >/dev/null 2>&1; then
         info "Server is not running."
-        rm -f "$SERVER_PID_FILE"
+        echo '{"running":false}'
         return 0
     fi
 
-    local pid
-    pid=$(is_server_running)
+    info "Stopping llama-server inside container '${CONTAINER}'..."
+    local container_id
+    container_id=$(podman ps --filter "name=^${CONTAINER}$" --format "{{.ID}}" 2>/dev/null | head -1)
 
-    info "Stopping server (PID ${pid})..."
-
-    # Send SIGTERM for graceful shutdown
-    kill "$pid" 2>/dev/null || true
-
-    # Wait up to 10 seconds for it to stop
-    local waited=0
-    while [[ $waited -lt 10 ]]; do
-        if ! kill -0 "$pid" 2>/dev/null; then
-            break
-        fi
-        sleep 1
-        waited=$((waited + 1))
-    done
-
-    # Force kill if still running
-    if kill -0 "$pid" 2>/dev/null; then
-        warn "Server did not stop gracefully, forcing..."
-        kill -9 "$pid" 2>/dev/null || true
+    if [[ -n "$container_id" ]]; then
+        podman exec "$container_id" bash -c "pkill -f 'llama-server' 2>/dev/null || true"
+        sleep 2
+        # Force kill if still running
+        podman exec "$container_id" bash -c "pkill -9 -f 'llama-server' 2>/dev/null || true"
     fi
 
     rm -f "$SERVER_PID_FILE"
     info "Server stopped."
-
     echo '{"running":false}'
 }
 
