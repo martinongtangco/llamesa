@@ -61,7 +61,7 @@ read_config() {
 
     # Defaults if missing
     MODELS_DIR="${MODELS_DIR:-/var/mnt/games/models}"
-    LLAMA_BINARY="${LLAMA_BINARY:-/run/host/home/bongtangco/llama.cpp/build/bin/llama-server}"
+    LLAMA_BINARY="${LLAMA_BINARY:-}"
     CONTAINER="${CONTAINER:-rocm-r9700}"
     DEFAULT_CTX="${DEFAULT_CTX:-131072}"
     DEFAULT_GPU_LAYERS="${DEFAULT_GPU_LAYERS:-99}"
@@ -191,7 +191,7 @@ cmd_status() {
         local models_response
         if models_response=$(curl -s --max-time 3 "http://localhost:${PORT}/v1/models" 2>/dev/null); then
             # Extract model name from response
-            model=$(echo "$models_response" | grep -o '"model":"[^"]*"' | head -1 | cut -d'"' -f4 || echo "unknown")
+            model=$(echo "$models_response" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4 || echo "unknown")
             [[ -z "$model" ]] && model="unknown"
         fi
 
@@ -252,8 +252,8 @@ cmd_status() {
 
         # Read last start args from log
         if [[ -f "$SERVER_LOG_FILE" ]]; then
-            thinking=$(tail -5 "$SERVER_LOG_FILE" 2>/dev/null | grep -o '--memory-f32' >/dev/null && echo "true" || echo "false")
-            ctx=$(tail -5 "$SERVER_LOG_FILE" 2>/dev/null | grep -o 'ctx [0-9]*' | awk '{print $2}' || echo "0")
+            thinking=$(tail -5 "$SERVER_LOG_FILE" 2>/dev/null | grep -o 'Thinking: \(true\|false\)' | head -1 | awk '{print $2}' || echo "false")
+            ctx=$(tail -5 "$SERVER_LOG_FILE" 2>/dev/null | grep -o 'Context: [0-9]*' | head -1 | awk '{print $3}' || echo "0")
         fi
 
         # Check mmproj from start log
@@ -302,6 +302,8 @@ EOF
 }
 
 cmd_start() {
+    read_config
+
     local model_name=""
     local thinking="$DEFAULT_THINKING"
     local ctx="$DEFAULT_CTX"
@@ -319,8 +321,6 @@ cmd_start() {
             *) error "Unknown option: $1" ;;
         esac
     done
-
-    read_config
 
     local use_port="${port_override:-$PORT}"
 
@@ -387,10 +387,12 @@ cmd_start() {
         info "Multi-modal projector loaded: ${mmproj_file}"
     fi
 
-    # Add thinking mode (reasoning) flag
+    # Add thinking mode flag (--control-memory-f32 enables KV cache precision needed for reasoning models)
+    # Note: True thinking/reasoning mode for Qwen3 is controlled via system prompt or chat template.
+    # This flag improves compatibility with reasoning models.
     if [[ "$thinking" == "true" ]]; then
         cmd_args+=("--memory-f32")
-        info "Thinking mode enabled"
+        info "Thinking mode enabled (memory-f32)"
     fi
 
     # Log the start command
@@ -407,7 +409,7 @@ cmd_start() {
     info "Launching llama-server in container '${CONTAINER}'..."
 
     # Start server in background inside container, redirect output to log
-    run_in_container "\"${full_cmd}\" >> ${SERVER_LOG_FILE} 2>&1 & echo \$! > ${SERVER_PID_FILE}"
+    run_in_container "${full_cmd} >> ${SERVER_LOG_FILE} 2>&1 & echo \$! > ${SERVER_PID_FILE}"
 
     # Read back the PID
     sleep 1

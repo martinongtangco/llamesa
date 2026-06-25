@@ -91,11 +91,15 @@ echo ""
 # ── Container Selection ──────────────────────────────────────────────────
 
 info "Available distrobox containers:"
-container_list=$(distrobox list 2>/dev/null | grep -oP '(?<=\().*?(?=\))' || true)
+# distrobox list outputs tabular format like:
+#   * container1 (default)
+#     container2
+# Parse by extracting the first column (container name), handling both * and space prefixes
+container_list=$(distrobox list 2>/dev/null | sed 's/^[* ]*//' | awk 'NF{print $1}' || true)
 
 if [[ -z "$container_list" ]]; then
-    # Try alternate parsing
-    container_list=$(distrobox list 2>/dev/null | awk '/^\s*\*/{print $2}' || true)
+    # Fallback: try grepping for parenthesized names (older distrobox versions)
+    container_list=$(distrobox list 2>/dev/null | grep -oP '(?<=\().*?(?=\))' || true)
 fi
 
 if [[ -n "$container_list" ]]; then

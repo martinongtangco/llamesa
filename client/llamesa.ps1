@@ -117,6 +117,7 @@ function Run-SetupWizard {
         active_server = $serverName
     }
 
+    $Script:Config = $config
     Save-Config
     Write-Host ""
     Write-Host ("{0}✓ Config saved to {1}{2}" -f $green, $Script:CONFIG_FILE, $reset)
@@ -212,7 +213,7 @@ function Get-HealthColor {
     switch ($mode) {
         "high-is-bad" {
             if ($value -lt $yellowThreshold) { return $green }
-            if ($value -lt $greenThreshold) { return $yellow }
+            if ($value -lt $greenThreshold) { return $amber }
             return $red
         }
         default {
@@ -243,7 +244,7 @@ function Show-Header {
     # Server line
     if ($Script:ActiveServerName) {
         $online = Test-ServerConnection
-        $dot = if ($online) { "{0}●{1}" -f $green } else { "{0}●{1}" -f $red }
+        $dot = if ($online) { "{0}●{1}" -f $green, $reset } else { "{0}●{1}" -f $red, $reset }
         Write-Host ("  {0}{1}{2} · {3}{4}{5}" -f $dot, $Script:ActiveServerName, $reset, $gray, $Script:ActiveServer.host, $reset)
     }
 
@@ -266,7 +267,7 @@ function Show-Header {
         if ($status.gpu_busy_percent -gt 0) { $gpuColor = $amber }
 
         $ramBar = "{0}{1} / {2} GB{3}" -f $purple, [math]::Round($status.ram_used_mb / 1024, 1), [math]::Round($status.ram_total_mb / 1024, 1), $reset
-        $vramBar = "{0}{2} / {3} GB{4}" -f $blue, $status.vram_busy_percent, $vramUsedStr, $vramTotalStr, $reset
+        $vramBar = "{0}{1} / {2} GB{3}" -f $blue, $vramUsedStr, $vramTotalStr, $reset
 
         Write-Host ("  {0}CPU {1}%{2} · {3}RAM {4} · {5}GPU {6}%{2} · {7}VRAM {8}" -f `
             $cpuColor, $status.cpu_percent, $reset, `
@@ -296,7 +297,7 @@ function Show-Menu {
     Write-Host ("  {0}/restart{1}      stop + start with same settings" -f $white, $reset)
     Write-Host ("  {0}─{1}" -f $dim, "──────────────────────────────────────────────────────", $reset)
     Write-Host ("  {0}/stats{1}        live stats + logs split view" -f $white, $reset)
-    Write-Host ("  {0}/health{2}       ping /health and /v1/models" -f $white, $reset)
+    Write-Host ("  {0}/health{1}       ping /health and /v1/models" -f $white, $reset)
     Write-Host ("  {0}/logs{1}         tail verbose server output" -f $white, $reset)
     Write-Host ("  {0}─{1}" -f $dim, "──────────────────────────────────────────────────────", $reset)
     Write-Host ("  {0}/models{1}       list downloaded models + sizes" -f $white, $reset)
@@ -644,49 +645,74 @@ function Cmd-Chat {
         $genToks          = 0
 
         try {
-            $response = Invoke-RestMethod -Uri "http://${hostAddr}:${port}/v1/chat/completions" `
-                -Method Post `
-                -ContentType "application/json" `
-                -Body ([System.Text.Encoding]::UTF8.GetBytes($body)) `
-                -TimeoutSec 120
+            # Use raw HttpClient for true SSE streaming (Invoke-RestMethod buffers the entire response)
+            $handler = New-Object System.Net.Http.HttpClientHandler
+            $client = New-Object System.Net.Http.HttpClient($handler)
+            $client.Timeout = [TimeSpan]::FromSeconds(120)
 
-            # Parse SSE response
-            $responseLines = $response -split "`n"
-            foreach ($line in $responseLines) {
-                $line = $line.Trim()
-                if ($line -like "data:*") {
-                    $jsonStr = $line.Substring(6).Trim()
-                    if ($jsonStr -eq '[DONE]') { continue }
+            $content = New-Object System.Net.Http.StringContent(
+                $body,
+                [System.Text.Encoding]::UTF8,
+                "application/json"
+            )
 
-                    try {
-                        $delta = $jsonStr | ConvertFrom-Json
+            $task = $client.PostAsync("http://${hostAddr}:${port}/v1/chat/completions", $content)
+            $task.Wait()
+            $response = $task.Result
 
-                        # Track usage
-                        if ($delta.usage) {
-                            $promptToks = $delta.usage.prompt_tokens
-                            $genToks = $delta.usage.completion_tokens
-                        }
-
-                        # Handle content
-                        $content = ""
-                        if ($delta.choices -and $delta.choices[0].delta) {
-                            $content = $delta.choices[0].delta.content
-                        }
-
-                        if ($content) {
-                            if ($inThinking) {
-                                $thinkingContent += $content
-                            } else {
-                                $assistantContent += $content
-                                Write-Host $content -NoNewline
-                            }
-                        }
-                    } catch {
-                        # Skip malformed lines
-                    }
-                }
+            if (-not $response.IsSuccessStatusCode) {
+                throw "HTTP $( $response.StatusCode )"
             }
 
+            # Read response stream as SSE
+            $streamTask = $response.Content.ReadAsStreamAsync()
+            $streamTask.Wait()
+            $stream = $streamTask.Result
+
+            $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8)
+
+            try {
+                while (-not $reader.EndOfStream) {
+                    $line = $reader.ReadLine()
+                    if ([string]::IsNullOrEmpty($line)) { continue }
+
+                    if ($line.StartsWith("data:")) {
+                        $jsonStr = $line.Substring(5).Trim()
+                        if ($jsonStr -eq '[DONE]') { break }
+
+                        try {
+                            $delta = $jsonStr | ConvertFrom-Json
+
+                            # Track usage
+                            if ($delta.usage) {
+                                $promptToks = $delta.usage.prompt_tokens
+                                $genToks = $delta.usage.completion_tokens
+                            }
+
+                            # Handle content
+                            $chunkContent = ""
+                            if ($delta.choices -and $delta.choices[0].delta) {
+                                $chunkContent = $delta.choices[0].delta.content
+                            }
+
+                            if ($chunkContent) {
+                                if ($inThinking) {
+                                    $thinkingContent += $chunkContent
+                                } else {
+                                    $assistantContent += $chunkContent
+                                    Write-Host $chunkContent -NoNewline
+                                }
+                            }
+                        } catch {
+                            # Skip malformed lines
+                        }
+                    }
+                }
+            } finally {
+                $reader.Dispose()
+            }
+
+            $client.Dispose()
             Write-Host ""
 
             $endTime = Get-Date
@@ -866,7 +892,7 @@ function Main {
         if (-not $input.Trim()) { continue }
 
         # Strip leading /
-        $cmd = $input.Trim().Replace("/", "")
+        $cmd = $input.Trim().TrimStart('/')
 
         switch ($cmd) {
             "start"   { Cmd-Start }
