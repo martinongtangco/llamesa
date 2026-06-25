@@ -1,0 +1,9 @@
+{
+  "models_dir": "/var/mnt/games/models",
+  "llama_binary": "/run/host/home/bongtangco/llama.cpp/build/bin/llama-server",
+  "distrobox_container": "rocm-r9700",
+  "default_context": 131072,
+  "default_gpu_layers": 99,
+  "default_thinking": true,
+  "port": 1234
+}

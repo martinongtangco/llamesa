@@ -1,0 +1,11 @@
+{
+  "servers": {
+    "gaming-pc": {
+      "host": "192.168.1.100",
+      "ssh_user": "bongtangco",
+      "port": 1234,
+      "llamesa_path": "~/.llamesa/llamesa.sh"
+    }
+  },
+  "active_server": "gaming-pc"
+}
