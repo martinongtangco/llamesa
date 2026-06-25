@@ -632,7 +632,9 @@ function Cmd-Chat {
         # Call API with streaming
         Write-Host ("  {0}Model: {1}" -f $amber, $reset)
 
+        $modelId = if ($Script:ServerStatus -and $Script:ServerStatus.model) { $Script:ServerStatus.model } else { "default" }
         $body = [PSCustomObject]@{
+            model    = $modelId
             messages = $messages
             stream   = $true
         } | ConvertTo-Json -Depth 5
@@ -875,10 +877,11 @@ function Main {
     while ($true) {
         Clear-Host
 
-        # Get status for header
+        # Get status for header (also cached for use in /chat)
         $status = $null
         try {
             $status = Get-ServerStatus
+            $Script:ServerStatus = $status
         } catch {
             # Ignore errors, show without stats
         }
