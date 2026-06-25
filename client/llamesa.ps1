@@ -554,8 +554,8 @@ function Cmd-Chat {
     $port = $Script:ActiveServer.port
     $hostAddr = $Script:ActiveServer.host
 
+    Clear-Host
     while ($Script:CurrentView -eq "chat") {
-        Clear-Host
 
         # Chat header
         $logo = "{0}LL{1}a{2}M{3}esa{4} chat" -f $teal, $amber, $teal, $amber, $reset
