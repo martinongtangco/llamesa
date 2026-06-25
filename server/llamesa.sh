@@ -398,12 +398,9 @@ cmd_start() {
         info "Multi-modal projector loaded: ${mmproj_file}"
     fi
 
-    # Add thinking mode flag (--control-memory-f32 enables KV cache precision needed for reasoning models)
-    # Note: True thinking/reasoning mode for Qwen3 is controlled via system prompt or chat template.
-    # This flag improves compatibility with reasoning models.
+    # Thinking mode for Qwen3 is controlled via system prompt at inference time, not a server flag.
     if [[ "$thinking" == "true" ]]; then
-        cmd_args+=("--memory-f32")
-        info "Thinking mode enabled (memory-f32)"
+        info "Thinking mode enabled (handled via chat template)"
     fi
 
     # Log the start command
