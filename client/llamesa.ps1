@@ -669,18 +669,14 @@ function Cmd-Chat {
                 "application/json"
             )
 
-            $task = $client.PostAsync("http://${hostAddr}:${port}/v1/chat/completions", $content)
-            $task.Wait()
-            $response = $task.Result
+            $response = $client.PostAsync("http://${hostAddr}:${port}/v1/chat/completions", $content).GetAwaiter().GetResult()
 
             if (-not $response.IsSuccessStatusCode) {
                 throw "HTTP $( $response.StatusCode )"
             }
 
             # Read response stream as SSE
-            $streamTask = $response.Content.ReadAsStreamAsync()
-            $streamTask.Wait()
-            $stream = $streamTask.Result
+            $stream = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
 
             $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8)
 
