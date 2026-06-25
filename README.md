@@ -2,19 +2,21 @@
 
 <div align="center">
 
-```
-███LL█╗    ████████╗███LL█╗   ██╗    ██╗███████╗████████╗
-██ LL █║    ╚══██╔══╝██ LL █║  ██║    ██║██╔════╝╚══██╔══╝
-██████║       ██║   ███████║   ██║ █╗ ██║█████╗     ██║
-██ LL █║       ██║   ██ LL █║   ██║███╗██║██╔══╝     ██║
-██  LL █║      ██║   ██  LL █║   ╚███╔███╗███████╗   ██║
-╚    █╚╝      ╚═╝   ╚    █╚╝    ╚══╝╚══╝╚══════╝   ╚═╝
-╚══════╝  ╚══════╝  ╚══════╝
-```
+<br />
 
-**`LL`** + **`M`** in teal · **`a`** + **`esa`** in amber
+<span style="font-size:48px;font-weight:bold;font-family:monospace;">
+<span style="color:#5DCAA5">LL</span><span style="color:#EF9F27">a</span><span style="color:#5DCAA5">M</span><span style="color:#EF9F27">esa</span>
+</span>
 
-*Your GPU is warm. Your models are loaded. Your terminal is ready.*
+<br /><br />
+
+<span style="display:inline-block;background:#5DCAA5;color:#0a0e14;padding:2px 10px;border-radius:6px;font-family:monospace;font-weight:bold;">LLM</span>
+&nbsp;
+<span style="color:#6b7280;font-family:monospace;">local inference control plane · v0.1</span>
+
+<br /><br />
+
+<sup><span style="color:#6b7280;">LLaMesa = LLM + "lamesa" (table in Filipino)</span></sup>
 
 </div>
 
@@ -25,6 +27,10 @@
 LLaMesa is a **terminal-based control plane** for managing a remote [llama.cpp](https://github.com/ggml-org/llama.cpp) inference server running on **Bazzite Linux**. Think of it as a cockpit for your home lab LLM rig — all from your Windows PowerShell.
 
 You run the client on Windows. It SSHs into your Bazzite machine and tells your AMD GPU what to do. No web UI, no browser tabs, just clean terminal vibes.
+
+### The name
+
+**LLaMesa** = **LL** + **a** + **M** + **esa** — a pun on LLM + *"lamesa"* (table in Filipino). Your table of models, right at your fingertips.
 
 ## Features
 
