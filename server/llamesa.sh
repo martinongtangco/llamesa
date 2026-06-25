@@ -216,7 +216,7 @@ cmd_status() {
         local models_response
         if models_response=$(curl -s --max-time 3 "http://localhost:${PORT}/v1/models" 2>/dev/null); then
             # Extract model name from response
-            model=$(echo "$models_response" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4 || echo "unknown")
+            model=$(echo "$models_response" | grep -o '"id": *"[^"]*"' | head -1 | grep -o '"[^"]*"$' | tr -d '"' || echo "unknown")
             [[ -z "$model" ]] && model="unknown"
         fi
 
