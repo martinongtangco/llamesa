@@ -75,6 +75,17 @@ run_in_container() {
     distrobox enter -T "$CONTAINER" -- bash -c "$cmd"
 }
 
+# Launch a detached daemon inside the container via podman exec -d
+run_in_container_detached() {
+    local cmd="$1"
+    local container_id
+    container_id=$(podman ps --filter "name=^${CONTAINER}$" --format "{{.ID}}" 2>/dev/null | head -1)
+    if [[ -z "$container_id" ]]; then
+        error "Container '${CONTAINER}' is not running. Start it first with distrobox enter ${CONTAINER}"
+    fi
+    podman exec -d "$container_id" bash -c "$cmd"
+}
+
 # Check if server is running
 is_server_running() {
     if [[ -f "$SERVER_PID_FILE" ]]; then
@@ -408,17 +419,17 @@ cmd_start() {
     local full_cmd="${cmd_args[*]}"
     info "Launching llama-server in container '${CONTAINER}'..."
 
-    # Start server in background inside container, redirect output to log
-    run_in_container "nohup ${full_cmd} >> ${SERVER_LOG_FILE} 2>&1 & echo \$! > ${SERVER_PID_FILE}; disown"
-
-    # Read back the PID
+    # Start server as detached daemon via podman exec -d (survives distrobox session exit)
+    run_in_container_detached "${full_cmd} >> ${SERVER_LOG_FILE} 2>&1"
     sleep 1
-    if [[ -f "$SERVER_PID_FILE" ]]; then
-        local server_pid
-        server_pid=$(cat "$SERVER_PID_FILE")
+    # Get the PID of the launched process
+    local server_pid
+    server_pid=$(distrobox enter -T "$CONTAINER" -- bash -c "pgrep -f 'llama-server.*${use_port}' | head -1" 2>/dev/null || true)
+    if [[ -n "$server_pid" ]]; then
+        echo "$server_pid" > "$SERVER_PID_FILE"
         info "Server started with PID ${server_pid}"
     else
-        warn "Could not capture server PID"
+        info "Server launched (PID unavailable)"
     fi
 
     # Wait for server to be ready
