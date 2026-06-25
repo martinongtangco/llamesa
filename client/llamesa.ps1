@@ -596,7 +596,7 @@ function Cmd-Chat {
         if (-not $input) { continue }
 
         # Commands
-        if ($input -eq "/exit") {
+        if ($input -match '^/(exit|quit|back)$') {
             break
         }
         elseif ($input -eq "/clear") {
@@ -632,7 +632,15 @@ function Cmd-Chat {
         # Call API with streaming
         Write-Host ("  {0}Model: {1}" -f $amber, $reset)
 
-        $modelId = if ($Script:ServerStatus -and $Script:ServerStatus.model) { $Script:ServerStatus.model } else { "default" }
+        # Get model ID directly from /v1/models endpoint
+        $modelId = "default"
+        try {
+            $modelsResponse = Invoke-RestMethod -Uri "http://${hostAddr}:${port}/v1/models" -TimeoutSec 5
+            if ($modelsResponse.data -and $modelsResponse.data.Count -gt 0) {
+                $modelId = $modelsResponse.data[0].id
+            }
+        } catch {}
+
         $body = [PSCustomObject]@{
             model    = $modelId
             messages = $messages
