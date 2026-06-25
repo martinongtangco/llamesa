@@ -30,9 +30,9 @@ prompt() {
     local result
 
     if [[ -n "$default" ]]; then
-        echo -n "${CYAN}${prompt_text} [${default}]${RESET} "
+        echo -n "${CYAN}${prompt_text} [${default}]${RESET} " >&2
     else
-        echo -n "${CYAN}${prompt_text}${RESET} "
+        echo -n "${CYAN}${prompt_text}${RESET} " >&2
     fi
     read -r result
 
