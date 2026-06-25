@@ -69,9 +69,26 @@ read_config() {
     PORT="${PORT:-1234}"
 }
 
+# Ensure the distrobox container is running; start it if not
+ensure_container_running() {
+    local container_id
+    container_id=$(podman ps --filter "name=^${CONTAINER}$" --format "{{.ID}}" 2>/dev/null | head -1)
+    if [[ -z "$container_id" ]]; then
+        info "Container '${CONTAINER}' is not running, starting it..."
+        distrobox enter -T "$CONTAINER" -- bash -c "echo container ready" >/dev/null 2>&1 || true
+        sleep 2
+        container_id=$(podman ps --filter "name=^${CONTAINER}$" --format "{{.ID}}" 2>/dev/null | head -1)
+        if [[ -z "$container_id" ]]; then
+            error "Failed to start container '${CONTAINER}'. Run: distrobox enter ${CONTAINER}"
+        fi
+    fi
+    echo "$container_id"
+}
+
 # Run a command inside the distrobox container
 run_in_container() {
     local cmd="$1"
+    ensure_container_running >/dev/null
     distrobox enter -T "$CONTAINER" -- bash -c "$cmd"
 }
 
@@ -79,10 +96,7 @@ run_in_container() {
 run_in_container_detached() {
     local cmd="$1"
     local container_id
-    container_id=$(podman ps --filter "name=^${CONTAINER}$" --format "{{.ID}}" 2>/dev/null | head -1)
-    if [[ -z "$container_id" ]]; then
-        error "Container '${CONTAINER}' is not running. Start it first with distrobox enter ${CONTAINER}"
-    fi
+    container_id=$(ensure_container_running)
     podman exec -d "$container_id" bash -c "$cmd"
 }
 
