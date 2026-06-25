@@ -175,9 +175,12 @@ function Get-ServerStatus {
     if (-not $raw) { return $null }
 
     try {
-        # Clean any non-JSON output
-        $jsonText = $raw -join "`n"
-        $jsonText = $jsonText -replace '^\[INFO\].*',''  # remove info lines
+        # Find the first line starting with { and collect from there — skips any [INFO] prefix lines
+        $jsonStartIndex = 0
+        for ($i = 0; $i -lt $raw.Count; $i++) {
+            if ($raw[$i] -match '^\s*\{') { $jsonStartIndex = $i; break }
+        }
+        $jsonText = $raw[$jsonStartIndex..($raw.Count - 1)] -join "`n"
         return $jsonText | ConvertFrom-Json
     } catch {
         return $null

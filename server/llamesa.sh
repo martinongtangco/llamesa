@@ -195,7 +195,7 @@ cmd_status() {
         local health_response
         if health_response=$(curl -s --max-time 3 "http://localhost:${PORT}/health" 2>/dev/null); then
             # Parse mux.LLM version or other health info
-            info "Server healthy on port ${PORT}"
+            info "Server healthy on port ${PORT}" >&2
         fi
 
         # Try to get model info from /v1/models endpoint
