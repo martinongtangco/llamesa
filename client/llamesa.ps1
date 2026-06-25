@@ -659,6 +659,8 @@ function Cmd-Chat {
 
         try {
             # Use raw HttpClient for true SSE streaming (Invoke-RestMethod buffers the entire response)
+            Write-Host ("  {0}Connecting to {1}:{2}...{3}" -f $gray, $hostAddr, $port, $reset)
+
             $handler = New-Object System.Net.Http.HttpClientHandler
             $client = New-Object System.Net.Http.HttpClient($handler)
             $client.Timeout = [TimeSpan]::FromSeconds(120)
@@ -670,6 +672,7 @@ function Cmd-Chat {
             )
 
             $response = $client.PostAsync("http://${hostAddr}:${port}/v1/chat/completions", $content).GetAwaiter().GetResult()
+            Write-Host ("  {0}HTTP {1}{2}" -f $gray, $response.StatusCode, $reset)
 
             if (-not $response.IsSuccessStatusCode) {
                 throw "HTTP $( $response.StatusCode )"
@@ -677,6 +680,7 @@ function Cmd-Chat {
 
             # Read response stream as SSE
             $stream = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+            Write-Host ("  {0}Stream opened, reading...{1}" -f $gray, $reset)
 
             $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8)
 
@@ -741,6 +745,8 @@ function Cmd-Chat {
 
         } catch {
             Write-Host ("{0}Error: {1}{2}" -f $red, $_.Exception.Message, $reset)
+            Write-Host ("{0}Detail: {1}{2}" -f $red, $_.Exception.ToString(), $reset)
+            Write-Host ("{0}Stack: {1}{2}" -f $red, $_.ScriptStackTrace, $reset)
         }
     }
 
