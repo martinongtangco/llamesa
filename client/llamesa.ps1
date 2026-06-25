@@ -895,21 +895,21 @@ function Main {
         $cmd = $input.Trim().TrimStart('/')
 
         switch ($cmd) {
-            "start"   { Cmd-Start }
-            "stop"    { Cmd-Stop }
-            "switch"  { Cmd-Switch }
-            "restart" { Cmd-Restart }
-            "stats"   { Cmd-Stats }
-            "health"  { Cmd-Health }
-            "logs"    { Cmd-Logs }
-            "models"  { Cmd-Models }
-            "download" { Cmd-Download }
-            "chat"    { Cmd-Chat }
-            "servers" { Cmd-Servers }
-            "config"  { Cmd-Config }
-            "help"    { Cmd-Help }
-            "quit"    { Write-Host ("{0}Goodbye!{1}" -f $gray, $reset); exit 0 }
-            default   { Write-Host ("{0}Unknown command: {1}. Type /help for commands.{2}" -f $red, $cmd, $reset); Start-Sleep -Seconds 1 }
+            "start"    { Cmd-Start; Read-Host "`nPress Enter to continue" }
+            "stop"     { Cmd-Stop; Read-Host "`nPress Enter to continue" }
+            "switch"   { Cmd-Switch; Read-Host "`nPress Enter to continue" }
+            "restart"  { Cmd-Restart; Read-Host "`nPress Enter to continue" }
+            "stats"    { Cmd-Stats }
+            "health"   { Cmd-Health; Read-Host "`nPress Enter to continue" }
+            "logs"     { Cmd-Logs }
+            "models"   { Cmd-Models; Read-Host "`nPress Enter to continue" }
+            "download" { Cmd-Download; Read-Host "`nPress Enter to continue" }
+            "chat"     { Cmd-Chat }
+            "servers"  { Cmd-Servers; Read-Host "`nPress Enter to continue" }
+            "config"   { Cmd-Config; Read-Host "`nPress Enter to continue" }
+            "help"     { Cmd-Help; Read-Host "`nPress Enter to continue" }
+            "quit"     { Write-Host ("{0}Goodbye!{1}" -f $gray, $reset); exit 0 }
+            default    { Write-Host ("{0}Unknown command: {1}. Type /help for commands.{2}" -f $red, $cmd, $reset); Start-Sleep -Seconds 1 }
         }
     }
 }
