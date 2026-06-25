@@ -703,17 +703,25 @@ function Cmd-Chat {
                             }
 
                             # Handle content
-                            $chunkContent = ""
                             if ($delta.choices -and $delta.choices[0].delta) {
-                                $chunkContent = $delta.choices[0].delta.content
-                            }
+                                $deltaObj = $delta.choices[0].delta
+                                # reasoning_content = thinking tokens (Qwen3)
+                                $reasoningChunk = $deltaObj.reasoning_content
+                                # content = final response tokens
+                                $contentChunk = $deltaObj.content
 
-                            if ($chunkContent) {
-                                if ($inThinking) {
-                                    $thinkingContent += $chunkContent
-                                } else {
-                                    $assistantContent += $chunkContent
-                                    Write-Host $chunkContent -NoNewline
+                                if ($reasoningChunk) {
+                                    $thinkingContent += $reasoningChunk
+                                    Write-Host $reasoningChunk -NoNewline -ForegroundColor DarkGray
+                                }
+                                if ($contentChunk) {
+                                    if (-not $assistantContent) {
+                                        # First content token after thinking — add a newline separator
+                                        Write-Host ""
+                                        Write-Host ""
+                                    }
+                                    $assistantContent += $contentChunk
+                                    Write-Host $contentChunk -NoNewline
                                 }
                             }
                         } catch {
