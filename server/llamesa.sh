@@ -253,7 +253,7 @@ cmd_status() {
         # Read last start args from log
         if [[ -f "$SERVER_LOG_FILE" ]]; then
             thinking=$(tail -5 "$SERVER_LOG_FILE" 2>/dev/null | grep -o 'Thinking: \(true\|false\)' | head -1 | awk '{print $2}' || echo "false")
-            ctx=$(tail -5 "$SERVER_LOG_FILE" 2>/dev/null | grep -o 'Context: [0-9]*' | head -1 | awk '{print $3}' || echo "0")
+            ctx=$(tail -5 "$SERVER_LOG_FILE" 2>/dev/null | grep -o 'Context: [0-9]*' | head -1 | awk '{print $2}' || echo "0")
         fi
 
         # Check mmproj from start log
