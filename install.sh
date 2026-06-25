@@ -107,7 +107,17 @@ if [[ -n "$container_list" ]]; then
     echo ""
 fi
 
-container=$(prompt "Which distrobox container has your llama.cpp build?" "")
+container_input=$(prompt "Which distrobox container has your llama.cpp build? (enter number or name)" "")
+
+# If input is a number, resolve to container name
+if [[ "$container_input" =~ ^[0-9]+$ ]]; then
+    container=$(echo "$container_list" | sed -n "${container_input}p")
+    if [[ -z "$container" ]]; then
+        error "Invalid selection: ${container_input}"
+    fi
+else
+    container="$container_input"
+fi
 
 if [[ -z "$container" ]]; then
     error "No container specified."
