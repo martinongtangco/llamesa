@@ -72,7 +72,7 @@ read_config() {
 # Run a command inside the distrobox container
 run_in_container() {
     local cmd="$1"
-    distrobox enter "$CONTAINER" -- bash -c "$cmd"
+    distrobox enter --no-tty "$CONTAINER" -- bash -c "$cmd"
 }
 
 # Check if server is running
@@ -409,7 +409,7 @@ cmd_start() {
     info "Launching llama-server in container '${CONTAINER}'..."
 
     # Start server in background inside container, redirect output to log
-    run_in_container "${full_cmd} >> ${SERVER_LOG_FILE} 2>&1 & echo \$! > ${SERVER_PID_FILE}"
+    run_in_container "nohup ${full_cmd} >> ${SERVER_LOG_FILE} 2>&1 & echo \$! > ${SERVER_PID_FILE}; disown"
 
     # Read back the PID
     sleep 1
