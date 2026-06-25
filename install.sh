@@ -91,14 +91,14 @@ echo ""
 # ── Container Selection ──────────────────────────────────────────────────
 
 info "Available distrobox containers:"
-# distrobox list outputs tabular format like:
-#   * container1 (default)
-#     container2
-# Parse by extracting the first column (container name), handling both * and space prefixes
-container_list=$(distrobox list 2>/dev/null | sed 's/^[* ]*//' | awk 'NF{print $1}' || true)
+# distrobox list (1.8+) outputs a pipe-delimited table like:
+#   ID | NAME | STATUS | IMAGE
+#   70441279a2e7 | rocm-r9700 | Up 5 hours | docker.io/...
+# Skip the header row, extract the NAME column (field 2), trim whitespace.
+container_list=$(distrobox list 2>/dev/null | tail -n +2 | awk -F'|' '{gsub(/^ +| +$/, "", $2); print $2}' | grep -v '^$' || true)
 
 if [[ -z "$container_list" ]]; then
-    # Fallback: try grepping for parenthesized names (older distrobox versions)
+    # Fallback: older distrobox versions used parenthesized names
     container_list=$(distrobox list 2>/dev/null | grep -oP '(?<=\().*?(?=\))' || true)
 fi
 
@@ -114,7 +114,7 @@ if [[ -z "$container" ]]; then
 fi
 
 # Validate container exists
-if ! distrobox list 2>/dev/null | grep -q "$container"; then
+if ! distrobox list 2>/dev/null | tail -n +2 | awk -F'|' '{gsub(/^ +| +$/, "", $2); print $2}' | grep -q "^${container}$"; then
     warn "Container '${container}' not found in distrobox list. It may still exist."
     read -p "Continue anyway? (y/N): " confirm
     if [[ "$confirm" != "y" ]] && [[ "$confirm" != "Y" ]]; then
