@@ -423,7 +423,8 @@ cmd_start() {
 
     # Wait for server to be ready
     info "Waiting for server to be ready on port ${use_port}..."
-    local max_wait=30
+    info "Large models may take 1-5 minutes to load. Use 'llamesa.sh logs' to monitor."
+    local max_wait=300
     local waited=0
     while [[ $waited -lt $max_wait ]]; do
         if curl -s --max-time 2 "http://localhost:${use_port}/health" >/dev/null 2>&1; then
@@ -431,11 +432,14 @@ cmd_start() {
             cmd_status
             return 0
         fi
+        if [[ $((waited % 30)) -eq 0 ]] && [[ $waited -gt 0 ]]; then
+            info "Still loading... (${waited}s elapsed)"
+        fi
         sleep 2
         waited=$((waited + 2))
     done
 
-    warn "Server may not have started properly. Check logs with 'llamesa.sh logs'"
+    warn "Server did not respond after ${max_wait}s. Check logs with 'llamesa.sh logs'"
     return 1
 }
 
