@@ -277,43 +277,49 @@ function Show-Header {
         $gpuBar  = New-Bar $gpu        100         12 $gpuCol
         $vramBar = New-Bar $vramUsedGb $vramTotGb  12 $blue
 
-        # Each card cell built individually then concatenated — avoids format index bugs
+        # Card inner widths (visible chars between │ and │):
+        #   small cards (CPU/RAM/GPU): 15  →  outer 17  →  top = ┌───────────────┐
+        #   VRAM card:                 20  →  outer 22  →  top = ┌────────────────────┐
+        #
+        # Each content row: │ + leading_space + padded_content + │
+        # small: 1 + 1 + 13-char-content + 1 = 16... wait that's only 16 not 17.
+        # Correct: inner 15 means │ + 15 chars + │ = 17. Content = leading_space(1) + value.PadRight(14).
+        # VRAM inner 20: │ + 20 chars + │ = 22. Content = leading_space(1) + value.PadRight(19).
+
         $b = $dim; $r = $reset
 
-        # Top border row
-        Write-Host ("  " + "${b}┌──────────────┐${r} ${b}┌──────────────┐${r} ${b}┌──────────────┐${r} ${b}┌────────────────────┐${r}")
+        # Plain-text values (no color codes) for PadRight
+        $cpuVal  = "{0}%" -f $cpu
+        $ramVal  = if ($ramTotGb -gt 0)  { "{0} / {1} GB" -f $ramUsedGb, $ramTotGb   } else { "{0} GB" -f $ramUsedGb }
+        $gpuVal  = "{0}%" -f $gpu
+        $vramVal = if ($vramTotGb -gt 0) { "{0} / {1} GB" -f $vramUsedGb, $vramTotGb } else { "{0} GB" -f $vramUsedGb }
 
-        # Label row:  │ CPU          │  (inner 14 chars = 1 space + 12 label + 1 space)
-        $lblRow = "  "
-        $lblRow += "${b}│${r} ${gray}CPU          ${r}${b}│${r} "
-        $lblRow += "${b}│${r} ${gray}RAM          ${r}${b}│${r} "
-        $lblRow += "${b}│${r} ${gray}GPU          ${r}${b}│${r} "
-        $lblRow += "${b}│${r} ${gray}VRAM                ${r}${b}│${r}"
+        # Top border — small=15 dashes, VRAM=20 dashes
+        Write-Host ("  ${b}┌───────────────┐${r} ${b}┌───────────────┐${r} ${b}┌───────────────┐${r} ${b}┌────────────────────┐${r}")
+
+        # Label row: 1 leading space + label padded to 14 (small) / 19 (VRAM)
+        $lblRow  = "  ${b}│${r} ${gray}$("CPU".PadRight(14))${r}${b}│${r} "
+        $lblRow += "${b}│${r} ${gray}$("RAM".PadRight(14))${r}${b}│${r} "
+        $lblRow += "${b}│${r} ${gray}$("GPU".PadRight(14))${r}${b}│${r} "
+        $lblRow += "${b}│${r} ${gray}$("VRAM".PadRight(19))${r}${b}│${r}"
         Write-Host $lblRow
 
-        # Value row: each cell pads its plain-text value to fill inner width
-        $cpuVal  = "{0}%" -f $cpu           # e.g. "0.7%"
-        $ramVal  = "{0} / {1} GB" -f $ramUsedGb, $ramTotGb   # e.g. "16.5 / 62.7 GB"
-        $gpuVal  = "{0}%" -f $gpu           # e.g. "0%"
-        $vramVal = "{0} / {1} GB" -f $vramUsedGb, $vramTotGb # e.g. "26.4 / 31.9 GB"
-
-        $valRow = "  "
-        $valRow += "${b}│${r} ${cpuCol}$("{0,-12}" -f $cpuVal)${r}${b}│${r} "
-        $valRow += "${b}│${r} ${ramCol}$("{0,-12}" -f $ramVal)${r}${b}│${r} "
-        $valRow += "${b}│${r} ${gpuCol}$("{0,-12}" -f $gpuVal)${r}${b}│${r} "
-        $valRow += "${b}│${r} ${vramCol}$("{0,-18}" -f $vramVal)${r}${b}│${r}"
+        # Value row: colored value padded to 14 (small) / 19 (VRAM) — PadRight on plain string, then wrap in color
+        $valRow  = "  ${b}│${r} ${cpuCol}$($cpuVal.PadRight(14))${r}${b}│${r} "
+        $valRow += "${b}│${r} ${ramCol}$($ramVal.PadRight(14))${r}${b}│${r} "
+        $valRow += "${b}│${r} ${gpuCol}$($gpuVal.PadRight(14))${r}${b}│${r} "
+        $valRow += "${b}│${r} ${vramCol}$($vramVal.PadRight(19))${r}${b}│${r}"
         Write-Host $valRow
 
-        # Bar row: bar is 12 chars; VRAM card inner is 20, so 6 extra spaces after bar
-        $barRow = "  "
-        $barRow += "${b}│${r} ${cpuBar} ${b}│${r} "
-        $barRow += "${b}│${r} ${ramBar} ${b}│${r} "
-        $barRow += "${b}│${r} ${gpuBar} ${b}│${r} "
+        # Bar row: 12-char bar + padding to fill inner (small: 2 spaces, VRAM: 7 spaces)
+        $barRow  = "  ${b}│${r} ${cpuBar}  ${b}│${r} "
+        $barRow += "${b}│${r} ${ramBar}  ${b}│${r} "
+        $barRow += "${b}│${r} ${gpuBar}  ${b}│${r} "
         $barRow += "${b}│${r} ${vramBar}       ${b}│${r}"
         Write-Host $barRow
 
-        # Bottom border row
-        Write-Host ("  " + "${b}└──────────────┘${r} ${b}└──────────────┘${r} ${b}└──────────────┘${r} ${b}└────────────────────┘${r}")
+        # Bottom border
+        Write-Host ("  ${b}└───────────────┘${r} ${b}└───────────────┘${r} ${b}└───────────────┘${r} ${b}└────────────────────┘${r}")
 
         # Model row with pill badges
         if ($status.running) {
@@ -326,11 +332,11 @@ function Show-Header {
         }
     } else {
         # Offline placeholder — same number of lines as card block so layout is stable
-        Write-Host ("  ${dim}┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌────────────────────┐${reset}")
-        Write-Host ("  ${dim}│  offline     │ │              │ │              │ │                    │${reset}")
-        Write-Host ("  ${dim}│              │ │              │ │              │ │                    │${reset}")
-        Write-Host ("  ${dim}│              │ │              │ │              │ │                    │${reset}")
-        Write-Host ("  ${dim}└──────────────┘ └──────────────┘ └──────────────┘ └────────────────────┘${reset}")
+        Write-Host ("  ${dim}┌───────────────┐ ┌───────────────┐ ┌───────────────┐ ┌────────────────────┐${reset}")
+        Write-Host ("  ${dim}│  offline      │ │               │ │               │ │                    │${reset}")
+        Write-Host ("  ${dim}│               │ │               │ │               │ │                    │${reset}")
+        Write-Host ("  ${dim}│               │ │               │ │               │ │                    │${reset}")
+        Write-Host ("  ${dim}└───────────────┘ └───────────────┘ └───────────────┘ └────────────────────┘${reset}")
         Write-Host ("  ${gray}MODEL  none${reset}")
     }
 
