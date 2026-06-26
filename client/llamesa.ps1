@@ -706,10 +706,14 @@ function Cmd-Chat {
         } catch {}
 
         $requestBody = [PSCustomObject]@{
-            model                 = $modelId
-            messages              = $messages
-            stream                = $true
-            chat_template_kwargs  = [PSCustomObject]@{ enable_thinking = $thinkingEnabled }
+            model    = $modelId
+            messages = $messages
+            stream   = $true
+        }
+        # chat_template_kwargs is Qwen3-specific; only send it when thinking is on
+        # so other models receive a plain request with no extra fields
+        if ($thinkingEnabled) {
+            $requestBody | Add-Member -NotePropertyName chat_template_kwargs -NotePropertyValue ([PSCustomObject]@{ enable_thinking = $true })
         }
         $body = $requestBody | ConvertTo-Json -Depth 5
 
