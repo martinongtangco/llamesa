@@ -884,8 +884,25 @@ function Cmd-Chat {
 
             $endTime = Get-Date
             $duration = ($endTime - $startTime).TotalSeconds
+
+            # Fallback: if the server didn't send usage, estimate from history
+            if ($genToks -eq 0 -and $assistantContent) {
+                $genToks = [Math]::Max(1, ($assistantContent.Length / 4))
+            }
+            if ($promptToks -eq 0) {
+                $promptToks = $messages.Count
+            }
+
             $tokS = if ($duration -gt 0 -and $genToks -gt 0) { [math]::Round($genToks / $duration, 1) } else { 0 }
             if ($tokS -gt 0) { $Script:LastTokS = $tokS }
+
+            # Always display token stats after a successful response
+            if ($assistantContent) {
+                Write-Host ("  {0}─{1}" -f $dim, "───────────────────────────────────────────────", $reset)
+                Write-Host ("  {0}⬡ {1} prompt · {2} gen · {3} tok/s · {4}s{5}" -f `
+                    $amber, $promptToks, $genToks, $tokS, [math]::Round($duration, 1), $reset)
+                Write-Host ""
+            }
 
             # Add assistant message to history
             $Script:ChatHistory += [PSCustomObject]@{
