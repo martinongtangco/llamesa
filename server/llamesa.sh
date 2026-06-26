@@ -337,6 +337,13 @@ cmd_start() {
         esac
     done
 
+    # Normalize thinking to JSON boolean (accept on/off/yes/no/true/false/1/0)
+    case "$thinking" in
+        on|yes|1|true)  thinking="true" ;;
+        off|no|0|false) thinking="false" ;;
+        *) thinking="false" ;;
+    esac
+
     local use_port="${port_override:-$PORT}"
 
     if [[ -z "$model_name" ]]; then

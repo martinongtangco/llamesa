@@ -348,8 +348,8 @@ function Cmd-Start {
     $selectedModel = $models[$idx].name
 
     # Ask for options
-    $thinking = Read-Host "Thinking mode? [on/off]"
-    if (-not $thinking) { $thinking = "on" }
+    $thinkingInput = Read-Host "Thinking mode? [on/off]"
+    $thinking = if ($thinkingInput -match '^(on|yes|true|1)$') { "true" } else { "false" }
 
     $ctx = Read-Host "Context size? [131072]"
     if (-not $ctx) { $ctx = "131072" }
@@ -357,7 +357,7 @@ function Cmd-Start {
     Write-Host ""
     Write-Host ("{0}Starting {1}...{2}" -f $cyan, $selectedModel, $reset)
 
-    $raw = Invoke-ServerCommand ("start --model ""{0}"" --thinking {1} --ctx {2}" -f $selectedModel, $thinking.ToLower(), $ctx) -raw
+    $raw = Invoke-ServerCommand ("start --model ""{0}"" --thinking {1} --ctx {2}" -f $selectedModel, $thinking, $ctx) -raw
     Write-Host ($raw -join "`n")
 
     # Poll until loaded
@@ -400,7 +400,7 @@ function Cmd-Restart {
 
     $session   = ($sessionJson -join "`n") | ConvertFrom-Json
     $modelName = $session.model
-    $thinking  = $session.thinking
+    $thinking  = if ($session.thinking) { "true" } else { "false" }
     $ctx       = $session.ctx
 
     Write-Host ("{0}Restarting: {1} (thinking={2}, ctx={3}){4}" -f $cyan, $modelName, $thinking, $ctx, $reset)
