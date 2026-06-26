@@ -727,8 +727,8 @@ function Cmd-Chat {
             }
         }
 
-        # Prompt
-        $input = Read-Host ("{0}›{1}" -f $cyan, $reset)
+        # Prompt — plain text so the cursor stays pinned to the bottom on resize
+        $input = Read-Host "  ›"
 
         if (-not $input) { continue }
 
@@ -1083,8 +1083,9 @@ function Main {
         Show-Menu
         Write-Host ""
 
-        # Read command — blocks until the user hits Enter
-        $input = Read-Host ("{0}›:{1}" -f $cyan, $reset)
+        # Read command — plain prompt (no ANSI codes) so PowerShell keeps the cursor
+        # pinned to the bottom of the console when the window is resized.
+        $input = Read-Host "  ›:"
 
         if (-not $input -or -not $input.Trim()) { continue }
         $cmd = $input.Trim().TrimStart('/')

@@ -251,20 +251,31 @@ cmd_status() {
         local ram_used=0
         local ram_total=0
 
-        # Get VRAM usage from rocm-smi inside container via podman exec
+        # Get VRAM + GPU utilization from rocm-smi inside container via podman exec
         local container_id
         container_id=$(podman ps --filter "name=^${CONTAINER}$" --format "{{.ID}}" 2>/dev/null | head -1 || true)
         if [[ -n "$container_id" ]]; then
-            local rocm_output
-            if rocm_output=$(podman exec "$container_id" bash -c "rocm-smi --showmeminfo vram 2>/dev/null" 2>/dev/null); then
+            # VRAM usage
+            local rocm_vram_output
+            if rocm_vram_output=$(podman exec "$container_id" bash -c "rocm-smi --showmeminfo vram 2>/dev/null" 2>/dev/null); then
                 local used_bytes total_bytes
-                used_bytes=$(echo "$rocm_output" | grep -i "VRAM Total Used Memory" | grep -o '[0-9]*$' || echo "")
-                total_bytes=$(echo "$rocm_output" | grep -i "VRAM Total Memory (B)" | grep -v "Used" | grep -o '[0-9]*$' || echo "")
+                used_bytes=$(echo "$rocm_vram_output" | grep -i "VRAM Total Used Memory" | grep -o '[0-9]*$' || echo "")
+                total_bytes=$(echo "$rocm_vram_output" | grep -i "VRAM Total Memory (B)" | grep -v "Used" | grep -o '[0-9]*$' || echo "")
                 if [[ -n "$used_bytes" ]]; then
                     vram_used=$used_bytes
                 fi
                 if [[ -n "$total_bytes" ]]; then
                     vram_total=$total_bytes
+                fi
+            fi
+
+            # GPU busy % from --showusage (Graphics Engine utilization)
+            local rocm_usage_output
+            if rocm_usage_output=$(podman exec "$container_id" bash -c "rocm-smi --showusage 2>/dev/null" 2>/dev/null); then
+                local usage_line
+                usage_line=$(echo "$rocm_usage_output" | grep -i "Graphics Engine" | tail -1 || echo "")
+                if [[ -n "$usage_line" ]]; then
+                    gpu_busy=$(echo "$usage_line" | grep -o '[0-9]*\%' | head -1 | tr -d '%' || echo "0")
                 fi
             fi
         fi
