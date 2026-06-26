@@ -441,6 +441,16 @@ cmd_start() {
     while [[ $waited -lt $max_wait ]]; do
         if curl -s --max-time 2 "http://localhost:${use_port}/health" >/dev/null 2>&1; then
             info "Server is ready!"
+            # Persist session for restart
+            cat > "${LLAMESA_DIR}/last_session.json" <<EOF
+{
+  "model": "${model_name}",
+  "thinking": ${thinking},
+  "ctx": ${ctx},
+  "gpu_layers": ${gpu_layers},
+  "port": ${use_port}
+}
+EOF
             cmd_status
             return 0
         fi
@@ -481,33 +491,28 @@ cmd_stop() {
 }
 
 cmd_restart() {
+    read_config
     info "Restarting server..."
 
-    # Capture current settings from status
-    local current_status
-    current_status=$(cmd_status 2>/dev/null || echo "{}")
+    local session_file="${LLAMESA_DIR}/last_session.json"
+    if [[ ! -f "$session_file" ]]; then
+        error "No previous session found. Use 'start --model <name>' instead."
+    fi
 
+    # Read last session settings
+    local model_name thinking ctx
+    model_name=$(grep -o '"model": *"[^"]*"' "$session_file" | grep -o '"[^"]*"$' | tr -d '"' || echo "")
+    thinking=$(grep -o '"thinking": *[^,}]*' "$session_file" | awk '{print $2}' || echo "true")
+    ctx=$(grep -o '"ctx": *[0-9]*' "$session_file" | awk '{print $2}' || echo "131072")
+
+    if [[ -z "$model_name" ]]; then
+        error "Could not read model from last session. Use 'start --model <name>' instead."
+    fi
+
+    info "Restarting with: model=${model_name} thinking=${thinking} ctx=${ctx}"
     cmd_stop
-
-    sleep 1
-
-    # Extract model file path from status, resolve to directory name for cmd_start
-    local model_file
-    model_file=$(echo "$current_status" | grep -o '"model": *"[^"]*"' | grep -o '"[^"]*"$' | tr -d '"' || echo "")
-    local model_name=""
-    if [[ -n "$model_file" ]] && [[ "$model_file" != "none" ]] && [[ "$model_file" != "unknown" ]]; then
-        # Search models_dir for a directory containing this file
-        local model_path
-        model_path=$(find "$MODELS_DIR" -name "$model_file" 2>/dev/null | head -1 || true)
-        if [[ -n "$model_path" ]]; then
-            model_name=$(basename "$(dirname "$model_path")")
-        fi
-    fi
-    if [[ -n "$model_name" ]]; then
-        cmd_start --model "$model_name" "$@"
-    else
-        error "No model detected. Use /start to start manually."
-    fi
+    sleep 3
+    cmd_start --model "$model_name" --thinking "$thinking" --ctx "$ctx"
 }
 
 cmd_logs() {
