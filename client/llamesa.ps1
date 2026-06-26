@@ -807,6 +807,14 @@ function Cmd-Chat {
             $duration = ($endTime - $startTime).TotalSeconds
             $tokS = if ($duration -gt 0) { [math]::Round($genToks / $duration, 1) } else { 0 }
 
+            # Display live token stats
+            if ($genToks -gt 0) {
+                Write-Host ("  {0}─{1}" -f $dim, "───────────────────────────────────────────────", $reset)
+                Write-Host ("  {0}⬡ {1} prompt · {2} gen · {3} tok/s · {4}s{5}" -f `
+                    $amber, $promptToks, $genToks, $tokS, [math]::Round($duration, 1), $reset)
+                Write-Host ""
+            }
+
             # Add assistant message to history
             $Script:ChatHistory += [PSCustomObject]@{
                 role        = "assistant"
