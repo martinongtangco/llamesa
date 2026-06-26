@@ -723,6 +723,7 @@ function Cmd-Chat {
         $startTime        = Get-Date
         $promptToks       = 0
         $genToks          = 0
+        $streamTokenCount = 0  # Fallback counter: count each delta chunk
 
         try {
             # Use raw HttpClient for true SSE streaming (Invoke-RestMethod buffers the entire response)
@@ -763,14 +764,16 @@ function Cmd-Chat {
                         try {
                             $delta = $jsonStr | ConvertFrom-Json
 
-                            # Track usage (only present on final chunk — safe nested access for StrictMode)
+                            # Track usage from the final chunk's usage field — safe access for StrictMode
                             $usage = $delta.PSObject.Properties['usage']?.Value
                             if ($usage) {
-                                $promptToks = $usage.PSObject.Properties['prompt_tokens']?.Value ?? 0
-                                $genToks = $usage.PSObject.Properties['completion_tokens']?.Value ?? 0
+                                $promptVal = $usage.PSObject.Properties['prompt_tokens']?.Value
+                                $genVal = $usage.PSObject.Properties['completion_tokens']?.Value
+                                if ($promptVal) { $promptToks = [int]$promptVal }
+                                if ($genVal) { $genToks = [int]$genVal }
                             }
 
-                            # Handle content
+                            # Handle content deltas
                             if ($delta.choices -and $delta.choices[0].delta) {
                                 $deltaObj = $delta.choices[0].delta
                                 # reasoning_content = thinking tokens (Qwen3) — safe access for StrictMode
@@ -780,6 +783,7 @@ function Cmd-Chat {
 
                                 if ($reasoningChunk) {
                                     $thinkingContent += $reasoningChunk
+                                    $streamTokenCount++
                                     Write-Host $reasoningChunk -NoNewline -ForegroundColor DarkGray
                                 }
                                 if ($contentChunk) {
@@ -789,6 +793,7 @@ function Cmd-Chat {
                                         Write-Host ""
                                     }
                                     $assistantContent += $contentChunk
+                                    $streamTokenCount++
                                     Write-Host $contentChunk -NoNewline
                                 }
                             }
@@ -806,10 +811,19 @@ function Cmd-Chat {
 
             $endTime = Get-Date
             $duration = ($endTime - $startTime).TotalSeconds
+
+            # Fallback: if the server didn't send usage, use our stream chunk counter
+            if ($genToks -eq 0 -and $streamTokenCount -gt 0) {
+                $genToks = $streamTokenCount
+            }
+            if ($promptToks -eq 0) {
+                $promptToks = $messages.Count
+            }
+
             $tokS = if ($duration -gt 0) { [math]::Round($genToks / $duration, 1) } else { 0 }
 
-            # Display live token stats
-            if ($genToks -gt 0) {
+            # Always display token stats after a successful response
+            if ($genToks -gt 0 -or $assistantContent) {
                 Write-Host ("  {0}─{1}" -f $dim, "───────────────────────────────────────────────", $reset)
                 Write-Host ("  {0}⬡ {1} prompt · {2} gen · {3} tok/s · {4}s{5}" -f `
                     $amber, $promptToks, $genToks, $tokS, [math]::Round($duration, 1), $reset)
