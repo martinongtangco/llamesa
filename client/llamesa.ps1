@@ -802,30 +802,26 @@ function Cmd-Chat {
         $thinkingToks     = 0
 
         try {
-            # Use raw HttpClient for true SSE streaming (Invoke-RestMethod buffers the entire response)
+            # Use HttpWebRequest for true SSE streaming (HttpClient buffers response content in .NET/PowerShell)
             Write-Host ("  {0}Connecting to {1}:{2}...{3}" -f $gray, $hostAddr, $port, $reset)
 
-            $handler = New-Object System.Net.Http.HttpClientHandler
-            $client = New-Object System.Net.Http.HttpClient($handler)
-            $client.Timeout = [TimeSpan]::FromSeconds(120)
+            $request = [System.Net.HttpWebRequest]::Create("http://${hostAddr}:${port}/v1/chat/completions")
+            $request.Method = "POST"
+            $request.ContentType = "application/json; charset=utf-8"
+            $request.Timeout = 120000
+            $request.ServicePoint.Expect100Continue = $false
 
-            $content = New-Object System.Net.Http.StringContent(
-                $body,
-                [System.Text.Encoding]::UTF8,
-                "application/json"
-            )
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($body)
+            $request.ContentLength = $bytes.Length
+            $requestStream = $request.GetRequestStream()
+            $requestStream.Write($bytes, 0, $bytes.Length)
+            $requestStream.Close()
 
-            $response = $client.PostAsync("http://${hostAddr}:${port}/v1/chat/completions", $content).GetAwaiter().GetResult()
+            $response = $request.GetResponse()
             Write-Host ("  {0}HTTP {1}{2}" -f $gray, $response.StatusCode, $reset)
-
-            if (-not $response.IsSuccessStatusCode) {
-                throw "HTTP $( $response.StatusCode )"
-            }
-
-            # Read response stream as SSE
-            $stream = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
             Write-Host ("  {0}Stream opened, reading...{1}" -f $gray, $reset)
 
+            $stream = $response.GetResponseStream()
             $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8)
             $streamStart = Get-Date
 
@@ -852,12 +848,9 @@ function Cmd-Chat {
                             }
 
                             # Handle content deltas — safe property access required under Set-StrictMode
-                            # (PSCustomObject member access throws in StrictMode when the property is absent)
                             if ($delta.choices -and $delta.choices[0].delta) {
                                 $deltaObj = $delta.choices[0].delta
-                                # reasoning_content = thinking tokens (Qwen3)
                                 $reasoningChunk = $deltaObj.PSObject.Properties['reasoning_content']?.Value
-                                # content = final response tokens
                                 $contentChunk = $deltaObj.PSObject.Properties['content']?.Value
 
                                 if ($reasoningChunk) {
@@ -867,7 +860,6 @@ function Cmd-Chat {
                                 }
                                 if ($contentChunk) {
                                     if (-not $assistantContent) {
-                                        # First content token after thinking — add a newline separator
                                         Write-Host ""
                                         Write-Host ""
                                     }
@@ -882,10 +874,10 @@ function Cmd-Chat {
                 }
             } finally {
                 $reader.Dispose()
+                $response.Close()
             }
             $streamEnd = Get-Date
 
-            $client.Dispose()
             Write-Host ""
 
             $duration = [math]::Round(($streamEnd - $streamStart).TotalSeconds, 1)
