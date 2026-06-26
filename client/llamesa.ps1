@@ -781,9 +781,10 @@ function Cmd-Chat {
         } catch {}
 
         $requestBody = [PSCustomObject]@{
-            model    = $modelId
-            messages = $messages
-            stream   = $true
+            model          = $modelId
+            messages       = $messages
+            stream         = $true
+            stream_options = [PSCustomObject]@{ include_usage = $true }
         }
         # chat_template_kwargs is Qwen3-specific; only send it when thinking is on
         # so other models receive a plain request with no extra fields
@@ -885,21 +886,18 @@ function Cmd-Chat {
             $endTime = Get-Date
             $duration = ($endTime - $startTime).TotalSeconds
 
-            # Fallback: if the server didn't send usage, estimate from visible output
-            if ($genToks -eq 0 -and $assistantContent) {
-                $genToks = [Math]::Max(1, [int]($assistantContent.Length / 4))
+            # Fallback: if the server didn't send usage (stream_options not honoured), estimate
+            if ($genToks -eq 0) {
+                # completion_tokens includes thinking; approximate from both contents
+                $genToks = [Math]::Max(1, [int](($assistantContent.Length + $thinkingContent.Length) / 4))
             }
             if ($promptToks -eq 0) {
-                # Estimate from total message content length, not message count
                 $totalMsgLen = ($messages | ForEach-Object { $_.content.Length } | Measure-Object -Sum).Sum
                 $promptToks = [Math]::Max(1, [int]($totalMsgLen / 4))
             }
 
-            # tok/s must include thinking tokens — completion_tokens only covers visible output
-            # but $duration spans the entire generation (thinking + response).
-            $thinkingToksEst = if ($thinkingContent) { [int]($thinkingContent.Length / 4) } else { 0 }
-            $totalGenToks = $genToks + $thinkingToksEst
-            $tokS = if ($duration -gt 0 -and $totalGenToks -gt 0) { [math]::Round($totalGenToks / $duration, 1) } else { 0 }
+            # completion_tokens from the server already includes thinking tokens
+            $tokS = if ($duration -gt 0 -and $genToks -gt 0) { [math]::Round($genToks / $duration, 1) } else { 0 }
             if ($tokS -gt 0) { $Script:LastTokS = $tokS }
 
             # Always display token stats after a successful response
