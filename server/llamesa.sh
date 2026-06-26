@@ -681,7 +681,7 @@ print('mmproj downloaded.')
 
 usage() {
     cat <<EOF
-LLaMesa — local inference control plane v0.1
+LLaMesa — local inference control plane v0.1.1
 
 Usage: llamesa.sh <command> [options]
 

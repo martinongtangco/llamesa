@@ -1,6 +1,6 @@
 #!/usr/bin/env pwsh
 # LLaMesa — Windows PowerShell Client
-# local inference control plane · v0.1
+# local inference control plane · v0.1.1
 # License: MIT
 
 #Requires -Version 7.0
@@ -242,7 +242,7 @@ function Show-Header {
     }
 
     Write-Host ""
-    Write-Host ("{0,-20} {1}local inference control plane · v0.1{2}" -f $logo, $dim, $reset)
+    Write-Host ("{0,-20} {1}local inference control plane · v0.1.1{2}" -f $logo, $dim, $reset)
 
     # Server line
     if ($Script:ActiveServerName) {

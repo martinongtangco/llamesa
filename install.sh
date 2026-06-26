@@ -46,7 +46,7 @@ prompt() {
 # ── Banner ───────────────────────────────────────────────────────────────
 
 echo ""
-echo -e "${BOLD}LLaMesa Installer v0.1${RESET}"
+echo -e "${BOLD}LLaMesa Installer v0.1.1${RESET}"
 echo "======================"
 echo ""
 
