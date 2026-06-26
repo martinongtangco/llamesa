@@ -1,6 +1,6 @@
 #!/usr/bin/env pwsh
 # LLaMesa — Windows PowerShell Client
-# local inference control plane · v0.1.1
+# local inference control plane · v0.1
 # License: MIT
 
 #Requires -Version 7.0
@@ -29,6 +29,7 @@ $Script:ActiveServer   = $null
 $Script:CurrentView    = "menu"  # menu, stats, chat, logs
 $Script:ChatHistory    = @()
 $Script:RefreshTimer   = $null
+$Script:LastTokS       = $null   # updated after each /chat response; shown in header badge
 
 # ── JSON Helpers ──────────────────────────────────────────────────────────
 
@@ -228,91 +229,136 @@ function Get-HealthColor {
     }
 }
 
+# ── UI: ASCII bar helper ──────────────────────────────────────────────────
+
+function New-Bar {
+    param([double]$value, [double]$max, [int]$width = 12, [string]$color)
+    $fill = if ($max -gt 0) { [Math]::Min([Math]::Round(($value / $max) * $width), $width) } else { 0 }
+    $empty = $width - $fill
+    return "{0}{1}{2}{3}" -f $color, ("▓" * $fill), ("░" * $empty), $reset
+}
+
 # ── UI: Header ────────────────────────────────────────────────────────────
 
 function Show-Header {
-    param($status = $null, [switch]$compact)
+    param($status = $null)
 
-    # Logo line
-    $logo = "{0}LL{1}a{2}M{3}esa{4}" -f $teal, $amber, $teal, $amber, $reset
+    $w = [Console]::WindowWidth
 
-    if ($compact) {
-        Write-Host ""
-        return
-    }
+    # Line 1 — logo + tagline + refresh indicator
+    $logo    = "{0}LL{1}a{2}M{3}esa{4}" -f $teal, $amber, $teal, $amber, $reset
+    $tagline = "{0}local inference control plane · v0.1{1}" -f $dim, $reset
+    $ticker  = "{0}↻ 2s{1}" -f $gray, $reset
+    Write-Host ("{0} {1}" -f $logo, $tagline)
 
-    Write-Host ""
-    Write-Host ("{0,-20} {1}local inference control plane · v0.1.1{2}" -f $logo, $dim, $reset)
-
-    # Server line
+    # Line 2 — server dot + name + host + port
     if ($Script:ActiveServerName) {
-        $online = Test-ServerConnection
-        $dot = if ($online) { "{0}●{1}" -f $green, $reset } else { "{0}●{1}" -f $red, $reset }
-        Write-Host ("  {0}{1}{2} · {3}{4}{5}" -f $dot, $Script:ActiveServerName, $reset, $gray, $Script:ActiveServer.host, $reset)
+        $dot = if ($Script:ServerOnline) { "{0}●{1}" -f $teal, $reset } else { "{0}●{1}" -f $red, $reset }
+        $port = $Script:ActiveServer.port
+        Write-Host ("  {0} {1}{2}{3} · {4}{5}{3} · {6}{7}{3}" -f `
+            $dot, $teal, $Script:ActiveServerName, $reset, `
+            $gray, $Script:ActiveServer.host, $gray, $port)
     }
 
-    # Stats line
+    # Lines 3-6 — stat cards
     if ($status) {
-        $cpuColor = $green
-        if ($status.cpu_percent -gt 20) { $cpuColor = $red }
-        elseif ($status.cpu_percent -gt 5) { $cpuColor = $amber }
+        $cpu       = [double]($status.cpu_percent)
+        $ramUsedGb = [math]::Round($status.ram_used_mb  / 1024, 1)
+        $ramTotGb  = [math]::Round($status.ram_total_mb / 1024, 1)
+        $gpu       = [double]($status.gpu_busy_percent)
+        $vramUsedGb = [math]::Round($status.vram_used_bytes / 1GB, 1)
+        $vramTotGb  = [math]::Round($status.vram_total_bytes / 1GB, 1)
 
-        $ramColor = $green
-        if ($status.ram_used_mb -gt 20480) { $ramColor = $red }
-        elseif ($status.ram_used_mb -gt 10240) { $ramColor = $amber }
+        # Value colors
+        $cpuCol  = if ($cpu -gt 20)           { $red }   elseif ($cpu -gt 5)             { $amber } else { $teal }
+        $ramCol  = if ($ramUsedGb -gt 20)     { $red }   elseif ($ramUsedGb -gt 10)      { $amber } else { $teal }
+        $gpuCol  = if ($gpu -gt 0)            { $amber } else                            { $gray }
+        $vramCol = if ($vramUsedGb -lt 5)     { $red }   elseif ($vramUsedGb -lt 15)     { $amber } else { $teal }
 
-        $vramUsedStr = Format-Bytes $status.vram_used_bytes
-        $vramTotalStr = Format-Bytes $status.vram_total_bytes
-        $vramColor = $green
-        if ($status.vram_used_bytes -lt 5GB) { $vramColor = $red }
+        $cpuBar  = New-Bar  $cpu       100          12 $cpuCol
+        $ramBar  = New-Bar  $ramUsedGb $ramTotGb    12 $purple
+        $gpuBar  = New-Bar  $gpu       100          12 $gpuCol
+        $vramBar = New-Bar  $vramUsedGb $vramTotGb  12 $blue
 
-        $gpuColor = $gray
-        if ($status.gpu_busy_percent -gt 0) { $gpuColor = $amber }
+        # Card tops
+        Write-Host ("  {0}┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌────────────────────┐{1}" -f $dim, $reset)
+        # Label row
+        Write-Host ("  {0}│{1} {2}CPU          {3}{0}│{1} {0}│{1} {2}RAM          {3}{0}│{1} {0}│{1} {2}GPU          {3}{0}│{1} {0}│{1} {2}VRAM                {3}{0}│{1}" -f $dim, $reset, $gray, $reset)
+        # Value row
+        Write-Host ("  {0}│{1} {2}{3,-13}{4}{0}│{1} {0}│{1} {2}{5,-5}{6} / {7,-5} GB{4}{0}│{1} {0}│{1} {2}{8,-13}{4}{0}│{1} {0}│{1} {2}{9,-5}{10} / {11,-5} GB    {4}{0}│{1}" -f `
+            $dim, $reset, `
+            $cpuCol,  ("{0}%" -f $cpu),    $reset, `
+            $ramCol,  $ramUsedGb,  $ramTotGb, `
+            $gpuCol,  ("{0}%" -f $gpu), `
+            $vramCol, $vramUsedGb, $vramTotGb)
+        # Bar row
+        Write-Host ("  {0}│{1} {2} {0}│{1} {0}│{1} {3} {0}│{1} {0}│{1} {4} {0}│{1} {0}│{1} {5}     {0}│{1}" -f `
+            $dim, $reset, $cpuBar, $ramBar, $gpuBar, $vramBar)
+        # Card bottoms
+        Write-Host ("  {0}└──────────────┘ └──────────────┘ └──────────────┘ └────────────────────┘{1}" -f $dim, $reset)
 
-        $ramBar = "{0}{1} / {2} GB{3}" -f $purple, [math]::Round($status.ram_used_mb / 1024, 1), [math]::Round($status.ram_total_mb / 1024, 1), $reset
-        $vramBar = "{0}{1} / {2} GB{3}" -f $blue, $vramUsedStr, $vramTotalStr, $reset
-
-        Write-Host ("  {0}CPU {1}%{2} · {3}RAM {4} · {5}GPU {6}%{2} · {7}VRAM {8}" -f `
-            $cpuColor, $status.cpu_percent, $reset, `
-            $purple, $ramBar, `
-            $gpuColor, $status.gpu_busy_percent, `
-            $blue, $vramBar)
-
-        # Model line
+        # Line 7 — model row with pill badges
         if ($status.running) {
-            $thinkingStr = if ($status.thinking) { "on" } else { "off" }
-            $modelLine = "{0}{1}{2} · ctx {3} · thinking {4}" -f `
-                $white, $status.model, $reset, $status.ctx, $thinkingStr
-            Write-Host ("  $modelLine")
+            $thinkingPill = if ($status.thinking) {
+                "{0}[thinking on]{1}" -f $teal, $reset
+            } else {
+                "{0}[thinking off]{1}" -f $gray, $reset
+            }
+            $ctxPill = if ($status.ctx -gt 0) { "{0}[ctx {1}]{2}" -f $teal, $status.ctx, $reset } else { "" }
+            $toksPill = if ($Script:LastTokS) { "{0}[{1} tok/s]{2}" -f $amber, $Script:LastTokS, $reset } else { "" }
+            Write-Host ("  {0}MODEL{1}  {2}{3}{1}  {4}  {5}  {6}" -f `
+                $gray, $reset, $white, $status.model, $ctxPill, $thinkingPill, $toksPill)
         }
+    } else {
+        # No status — blank card area placeholder
+        Write-Host ""
+        Write-Host ("  {0}(offline — no stats){1}" -f $gray, $reset)
+        Write-Host ""
+        Write-Host ""
+        Write-Host ""
+        Write-Host ""
     }
 
-    Write-Host ("  {0}─{1}" -f $dim, "──────────────────────────────────────────────────────", $reset)
+    Write-Host ("{0}{1}{2}" -f $dim, ("─" * [Math]::Max($w - 1, 20)), $reset)
 }
 
 # ── UI: Menu ──────────────────────────────────────────────────────────────
 
 function Show-Menu {
+    $w   = [Console]::WindowWidth
+    $sep = "{0}{1}{2}" -f $dim, ("─" * [Math]::Max($w - 1, 20)), $reset
+
+    function Section([string]$title) {
+        Write-Host ("{0}{1}{2}" -f $teal, $title, $reset)
+    }
+    function Row([string]$cmd, [string]$desc, [string]$hint = "") {
+        $hintStr = if ($hint) { "{0}{1}{2}" -f $gray, $hint, $reset } else { "" }
+        Write-Host ("  {0}{1,-10}{2}  {3,-38}{4}" -f $white, $cmd, $reset, $desc, $hintStr)
+    }
+
     Write-Host ""
-    Write-Host ("  {0}/start{1}        start server — pick model, thinking, context" -f $white, $reset)
-    Write-Host ("  {0}/stop{1}         graceful shutdown" -f $white, $reset)
-    Write-Host ("  {0}/switch{1}       hot-swap model" -f $white, $reset)
-    Write-Host ("  {0}/restart{1}      stop + start with same settings" -f $white, $reset)
-    Write-Host ("  {0}─{1}" -f $dim, "──────────────────────────────────────────────────────", $reset)
-    Write-Host ("  {0}/stats{1}        live stats + logs split view" -f $white, $reset)
-    Write-Host ("  {0}/health{1}       ping /health and /v1/models" -f $white, $reset)
-    Write-Host ("  {0}/logs{1}         tail verbose server output" -f $white, $reset)
-    Write-Host ("  {0}─{1}" -f $dim, "──────────────────────────────────────────────────────", $reset)
-    Write-Host ("  {0}/models{1}       list downloaded models + sizes" -f $white, $reset)
-    Write-Host ("  {0}/download{1}     download from huggingface" -f $white, $reset)
-    Write-Host ("  {0}─{1}" -f $dim, "──────────────────────────────────────────────────────", $reset)
-    Write-Host ("  {0}/chat{1}         chat with the model directly" -f $white, $reset)
-    Write-Host ("  {0}─{1}" -f $dim, "──────────────────────────────────────────────────────", $reset)
-    Write-Host ("  {0}/servers{1}      manage server profiles" -f $white, $reset)
-    Write-Host ("  {0}/config{1}       view/edit config" -f $white, $reset)
-    Write-Host ("  {0}/help{1}         show all commands" -f $white, $reset)
-    Write-Host ("  {0}/quit{1}         exit" -f $white, $reset)
+    Section "SERVER"
+    Row "/start"   "start server"                   "model · thinking · context"
+    Row "/stop"    "graceful shutdown"
+    Row "/switch"  "hot-swap model"                 "hot-swap"
+    Row "/restart" "stop + start with same settings"
     Write-Host ""
+    Section "MONITORING"
+    Row "/stats"   "live stats + logs split view"   "cpu · ram · gpu · vram"
+    Row "/health"  "ping /health and /v1/models"
+    Row "/logs"    "tail verbose server output"
+    Write-Host ""
+    Section "MODELS"
+    Row "/models"   "list downloaded models + sizes"
+    Row "/download" "download from huggingface"
+    Write-Host ""
+    Section "CHAT"
+    Row "/chat" "chat with the model directly"
+    Write-Host ""
+    Section "CONFIG"
+    Row "/servers" "manage server profiles"
+    Row "/config"  "view/edit config"
+    Row "/quit"    "exit"
 }
 
 # ── Command: /start ───────────────────────────────────────────────────────
@@ -723,7 +769,6 @@ function Cmd-Chat {
         $startTime        = Get-Date
         $promptToks       = 0
         $genToks          = 0
-        $streamTokenCount = 0  # Fallback counter: count each delta chunk
 
         try {
             # Use raw HttpClient for true SSE streaming (Invoke-RestMethod buffers the entire response)
@@ -764,26 +809,22 @@ function Cmd-Chat {
                         try {
                             $delta = $jsonStr | ConvertFrom-Json
 
-                            # Track usage from the final chunk's usage field — safe access for StrictMode
-                            $usage = $delta.PSObject.Properties['usage']?.Value
-                            if ($usage) {
-                                $promptVal = $usage.PSObject.Properties['prompt_tokens']?.Value
-                                $genVal = $usage.PSObject.Properties['completion_tokens']?.Value
-                                if ($promptVal) { $promptToks = [int]$promptVal }
-                                if ($genVal) { $genToks = [int]$genVal }
+                            # Track usage
+                            if ($delta.usage) {
+                                $promptToks = $delta.usage.prompt_tokens
+                                $genToks = $delta.usage.completion_tokens
                             }
 
-                            # Handle content deltas
+                            # Handle content
                             if ($delta.choices -and $delta.choices[0].delta) {
                                 $deltaObj = $delta.choices[0].delta
-                                # reasoning_content = thinking tokens (Qwen3) — safe access for StrictMode
-                                $reasoningChunk = $deltaObj.PSObject.Properties['reasoning_content']?.Value
-                                # content = final response tokens — safe access for StrictMode
-                                $contentChunk = $deltaObj.PSObject.Properties['content']?.Value
+                                # reasoning_content = thinking tokens (Qwen3)
+                                $reasoningChunk = $deltaObj.reasoning_content
+                                # content = final response tokens
+                                $contentChunk = $deltaObj.content
 
                                 if ($reasoningChunk) {
                                     $thinkingContent += $reasoningChunk
-                                    $streamTokenCount++
                                     Write-Host $reasoningChunk -NoNewline -ForegroundColor DarkGray
                                 }
                                 if ($contentChunk) {
@@ -793,7 +834,6 @@ function Cmd-Chat {
                                         Write-Host ""
                                     }
                                     $assistantContent += $contentChunk
-                                    $streamTokenCount++
                                     Write-Host $contentChunk -NoNewline
                                 }
                             }
@@ -811,24 +851,8 @@ function Cmd-Chat {
 
             $endTime = Get-Date
             $duration = ($endTime - $startTime).TotalSeconds
-
-            # Fallback: if the server didn't send usage, use our stream chunk counter
-            if ($genToks -eq 0 -and $streamTokenCount -gt 0) {
-                $genToks = $streamTokenCount
-            }
-            if ($promptToks -eq 0) {
-                $promptToks = $messages.Count
-            }
-
-            $tokS = if ($duration -gt 0) { [math]::Round($genToks / $duration, 1) } else { 0 }
-
-            # Always display token stats after a successful response
-            if ($genToks -gt 0 -or $assistantContent) {
-                Write-Host ("  {0}─{1}" -f $dim, "───────────────────────────────────────────────", $reset)
-                Write-Host ("  {0}⬡ {1} prompt · {2} gen · {3} tok/s · {4}s{5}" -f `
-                    $amber, $promptToks, $genToks, $tokS, [math]::Round($duration, 1), $reset)
-                Write-Host ""
-            }
+            $tokS = if ($duration -gt 0 -and $genToks -gt 0) { [math]::Round($genToks / $duration, 1) } else { 0 }
+            if ($tokS -gt 0) { $Script:LastTokS = $tokS }
 
             # Add assistant message to history
             $Script:ChatHistory += [PSCustomObject]@{
@@ -979,51 +1003,117 @@ function Get-MatchingCommands {
 
 # ── Main Loop ─────────────────────────────────────────────────────────────
 
+# How many lines the header occupies (logo+server+cards+model+separator = 10)
+$Script:HEADER_LINES = 10
+
+function Draw-Screen {
+    param($status)
+    Clear-Host
+    Show-Header -status $status
+    Show-Menu
+    # Prompt pinned to bottom
+    $promptRow = [Console]::WindowHeight - 1
+    [Console]::SetCursorPosition(0, $promptRow)
+    Write-Host ("{0}›:{1} " -f $cyan, $reset) -NoNewline
+}
+
+function Refresh-Header {
+    param($status)
+    # Overwrite header region in-place without touching menu or prompt
+    [Console]::SetCursorPosition(0, 0)
+    Show-Header -status $status
+}
+
 function Main {
     $host.UI.RawUI.WindowTitle = "LLaMesa"
-
-    # Read config (triggers setup wizard if missing)
     Read-Config
 
+    $Script:ServerOnline = $false
+    $status = $null
+
+    # Initial full draw
+    try {
+        $Script:ServerOnline = Test-ServerConnection
+        $status = Get-ServerStatus
+        $Script:ServerStatus = $status
+    } catch {}
+
+    Draw-Screen $status
+
+    $lastRefresh = [DateTime]::Now
+
     while ($true) {
-        Clear-Host
+        # Non-blocking: check if a key is available; if not, check refresh timer
+        if ([Console]::KeyAvailable) {
+            # Read full line via bottom-pinned prompt
+            $promptRow = [Console]::WindowHeight - 1
+            [Console]::SetCursorPosition(0, $promptRow)
+            # Erase the prompt line then re-draw it so Read-Host sits cleanly
+            Write-Host (" " * ([Console]::WindowWidth - 1)) -NoNewline
+            [Console]::SetCursorPosition(0, $promptRow)
+            Write-Host ("{0}›:{1} " -f $cyan, $reset) -NoNewline
+            $input = Read-Host
 
-        # Get status for header (also cached for use in /chat)
-        $status = $null
-        try {
-            $status = Get-ServerStatus
-            $Script:ServerStatus = $status
-        } catch {
-            # Ignore errors, show without stats
-        }
+            if (-not $input -or -not $input.Trim()) {
+                [Console]::SetCursorPosition(0, $promptRow)
+                Write-Host ("{0}›:{1} " -f $cyan, $reset) -NoNewline
+                continue
+            }
 
-        Show-Header -status $status
-        Show-Menu
+            $cmd = $input.Trim().TrimStart('/')
 
-        # Read input with autocomplete hint
-        $input = Read-Host ("{0}›{1}" -f $cyan, $reset)
+            # Commands that take over the screen — full redraw after return
+            $needsRedraw = $true
+            switch ($cmd) {
+                "start"    { Clear-Host; Cmd-Start;    Read-Host "`nPress Enter to continue" }
+                "stop"     { Clear-Host; Cmd-Stop;     Read-Host "`nPress Enter to continue" }
+                "switch"   { Clear-Host; Cmd-Switch;   Read-Host "`nPress Enter to continue" }
+                "restart"  { Clear-Host; Cmd-Restart;  Read-Host "`nPress Enter to continue" }
+                "stats"    { Cmd-Stats }
+                "health"   { Clear-Host; Cmd-Health;   Read-Host "`nPress Enter to continue" }
+                "logs"     { Cmd-Logs }
+                "models"   { Clear-Host; Cmd-Models;   Read-Host "`nPress Enter to continue" }
+                "download" { Clear-Host; Cmd-Download; Read-Host "`nPress Enter to continue" }
+                "chat"     { Cmd-Chat }
+                "servers"  { Clear-Host; Cmd-Servers;  Read-Host "`nPress Enter to continue" }
+                "config"   { Clear-Host; Cmd-Config;   Read-Host "`nPress Enter to continue" }
+                "help"     { Clear-Host; Cmd-Help;     Read-Host "`nPress Enter to continue" }
+                "quit"     { Clear-Host; Write-Host ("{0}Goodbye!{1}" -f $gray, $reset); exit 0 }
+                default    {
+                    $needsRedraw = $false
+                    $promptRow = [Console]::WindowHeight - 1
+                    [Console]::SetCursorPosition(0, $promptRow)
+                    Write-Host ("{0}Unknown: /{1}{2}  " -f $red, $cmd, $reset) -NoNewline
+                    Start-Sleep -Seconds 1
+                }
+            }
 
-        if (-not $input.Trim()) { continue }
-
-        # Strip leading /
-        $cmd = $input.Trim().TrimStart('/')
-
-        switch ($cmd) {
-            "start"    { Cmd-Start; Read-Host "`nPress Enter to continue" }
-            "stop"     { Cmd-Stop; Read-Host "`nPress Enter to continue" }
-            "switch"   { Cmd-Switch; Read-Host "`nPress Enter to continue" }
-            "restart"  { Cmd-Restart; Read-Host "`nPress Enter to continue" }
-            "stats"    { Cmd-Stats }
-            "health"   { Cmd-Health; Read-Host "`nPress Enter to continue" }
-            "logs"     { Cmd-Logs }
-            "models"   { Cmd-Models; Read-Host "`nPress Enter to continue" }
-            "download" { Cmd-Download; Read-Host "`nPress Enter to continue" }
-            "chat"     { Cmd-Chat }
-            "servers"  { Cmd-Servers; Read-Host "`nPress Enter to continue" }
-            "config"   { Cmd-Config; Read-Host "`nPress Enter to continue" }
-            "help"     { Cmd-Help; Read-Host "`nPress Enter to continue" }
-            "quit"     { Write-Host ("{0}Goodbye!{1}" -f $gray, $reset); exit 0 }
-            default    { Write-Host ("{0}Unknown command: {1}. Type /help for commands.{2}" -f $red, $cmd, $reset); Start-Sleep -Seconds 1 }
+            if ($needsRedraw) {
+                try {
+                    $Script:ServerOnline = Test-ServerConnection
+                    $status = Get-ServerStatus
+                    $Script:ServerStatus = $status
+                } catch {}
+                Draw-Screen $status
+                $lastRefresh = [DateTime]::Now
+            }
+        } else {
+            # Check if 2s have elapsed — refresh header in-place
+            $elapsed = ([DateTime]::Now - $lastRefresh).TotalSeconds
+            if ($elapsed -ge 2) {
+                try {
+                    $Script:ServerOnline = Test-ServerConnection
+                    $status = Get-ServerStatus
+                    $Script:ServerStatus = $status
+                } catch {}
+                Refresh-Header $status
+                # Restore prompt position after header refresh
+                $promptRow = [Console]::WindowHeight - 1
+                [Console]::SetCursorPosition(0, $promptRow)
+                Write-Host ("{0}›:{1} " -f $cyan, $reset) -NoNewline
+                $lastRefresh = [DateTime]::Now
+            }
+            Start-Sleep -Milliseconds 100
         }
     }
 }

@@ -215,9 +215,32 @@ cmd_status() {
         # Try to get model info from /v1/models endpoint
         local models_response
         if models_response=$(curl -s --max-time 3 "http://localhost:${PORT}/v1/models" 2>/dev/null); then
-            # Extract model name from response
-            model=$(echo "$models_response" | grep -o '"id": *"[^"]*"' | head -1 | grep -o '"[^"]*"$' | tr -d '"' || echo "unknown")
-            [[ -z "$model" ]] && model="unknown"
+            # Extract model filename from id field
+            local model_file
+            model_file=$(echo "$models_response" | grep -o '"id": *"[^"]*"' | head -1 | grep -o '"[^"]*"$' | tr -d '"' || echo "")
+            # Resolve filename → parent directory name (the model folder name used by start)
+            if [[ -n "$model_file" ]]; then
+                local model_path
+                model_path=$(find "$MODELS_DIR" -name "$model_file" -type f 2>/dev/null | head -1 || true)
+                if [[ -n "$model_path" ]]; then
+                    model=$(basename "$(dirname "$model_path")")
+                else
+                    model="$model_file"
+                fi
+            else
+                model="unknown"
+            fi
+            # Parse n_ctx from /v1/models response
+            local ctx_val
+            ctx_val=$(echo "$models_response" | grep -o '"n_ctx": *[0-9]*' | grep -o '[0-9]*$' | head -1 || true)
+            [[ -n "$ctx_val" ]] && ctx="$ctx_val"
+        fi
+
+        # Read thinking from last_session.json (authoritative source)
+        if [[ -f "${LLAMESA_DIR}/last_session.json" ]]; then
+            local sess_thinking
+            sess_thinking=$(grep -o '"thinking": *[^,}]*' "${LLAMESA_DIR}/last_session.json" | awk '{print $2}' | tr -d ' \r\n' || true)
+            [[ "$sess_thinking" == "true" || "$sess_thinking" == "false" ]] && thinking="$sess_thinking"
         fi
 
         # Try to get stats from /health endpoint for GPU info
@@ -265,11 +288,7 @@ cmd_status() {
             uptime_str=$(printf "%02d:%02d:%02d" $hours $minutes $seconds)
         fi
 
-        # Read last start args from log
-        if [[ -f "$SERVER_LOG_FILE" ]]; then
-            thinking=$(tail -5 "$SERVER_LOG_FILE" 2>/dev/null | grep -o 'Thinking: \(true\|false\)' | head -1 | awk '{print $2}' || echo "false")
-            ctx=$(tail -5 "$SERVER_LOG_FILE" 2>/dev/null | grep -o 'Context: [0-9]*' | head -1 | awk '{print $2}' || echo "0")
-        fi
+        # ctx and thinking are now sourced from /v1/models and last_session.json above
 
         # Check mmproj from start log
         if [[ -f "$SERVER_LOG_FILE" ]]; then
