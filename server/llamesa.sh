@@ -269,15 +269,15 @@ cmd_status() {
                 fi
             fi
 
-            # GPU busy % from --showgpuuse
-            local rocm_usage_output
-            if rocm_usage_output=$(podman exec "$container_id" bash -c "rocm-smi --showgpuuse 2>/dev/null" 2>/dev/null); then
-                local gpu_use_val
-                gpu_use_val=$(echo "$rocm_usage_output" | grep -i "GPU use" | grep -o '[0-9]*' | head -1 || echo "")
-                if [[ -n "$gpu_use_val" ]]; then
-                    gpu_busy=$gpu_use_val
-                fi
-            fi
+		# GPU busy % from rocm-smi --showmetrics (average_gfx_activity)
+		local rocm_metrics_output
+		if rocm_metrics_output=$(podman exec "$container_id" bash -c "rocm-smi --showmetrics 2>/dev/null" 2>/dev/null); then
+			local gfx_activity
+			gfx_activity=$(echo "$rocm_metrics_output" | grep -i "average_gfx_activity" | grep -o '[0-9]*$' || echo "")
+			if [[ -n "$gfx_activity" && "$gfx_activity" != "0" ]]; then
+				gpu_busy=$gfx_activity
+			fi
+		fi
         fi
 
         # CPU and RAM from standard tools
