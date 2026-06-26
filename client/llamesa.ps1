@@ -752,16 +752,9 @@ function Cmd-Chat {
             $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8)
 
             try {
-                $debugLineCount = 0
                 while (-not $reader.EndOfStream) {
                     $line = $reader.ReadLine()
-                    $debugLineCount++
                     if ([string]::IsNullOrEmpty($line)) { continue }
-
-                    # DEBUG: log first 3 lines
-                    if ($debugLineCount -le 3) {
-                        Write-Host ("  [DEBUG LINE $debugLineCount]: $line" ) -ForegroundColor Magenta
-                    }
 
                     if ($line.StartsWith("data:")) {
                         $jsonStr = $line.Substring(5).Trim()
@@ -770,8 +763,8 @@ function Cmd-Chat {
                         try {
                             $delta = $jsonStr | ConvertFrom-Json
 
-                            # Track usage
-                            if ($delta.usage) {
+                            # Track usage (only present on final chunk — use safe property access)
+                            if ($delta.PSObject.Properties['usage']) {
                                 $promptToks = $delta.usage.prompt_tokens
                                 $genToks = $delta.usage.completion_tokens
                             }
@@ -799,9 +792,7 @@ function Cmd-Chat {
                                 }
                             }
                         } catch {
-                            # DEBUG: Log parse errors
-                            Write-Host ("  [PARSE ERROR]: $($_.Exception.Message)" ) -ForegroundColor Red
-                            Write-Host ("  [PARSE LINE]: $line" ) -ForegroundColor DarkRed
+                            # Skip malformed lines
                         }
                     }
                 }
