@@ -719,8 +719,9 @@ function Cmd-Chat {
                 if ($msg.tok_s) {
                     Write-Host ""
                     Write-Host ("  {0}─{1}" -f $dim, "───────────────────────────────────────────────", $reset)
-                    Write-Host ("  {0}⬡ {1} prompt · {2} gen · {3} tok/s · {4}s{5}" -f `
-                        $amber, $msg.prompt_toks, $msg.gen_toks, $msg.tok_s, $msg.duration, $reset)
+                    $thinkingDisplay = if ($msg.thinking_toks) { "$($msg.thinking_toks) thinking · " } else { "" }
+                    Write-Host ("  {0}⬡ {1} prompt · {2}{3} gen · {4} tok/s · {5}s{6}" -f `
+                        $amber, $msg.prompt_toks, $thinkingDisplay, $msg.gen_toks, $msg.tok_s, $msg.duration, $reset)
                 }
 
                 Write-Host ""
@@ -796,9 +797,11 @@ function Cmd-Chat {
         $assistantContent = ""
         $thinkingContent  = ""
         $inThinking       = $false
-        $startTime        = Get-Date
+        $startTime        = $null
+        $firstToken       = $false
         $promptToks       = 0
         $genToks          = 0
+        $thinkingToks     = 0
 
         try {
             # Use raw HttpClient for true SSE streaming (Invoke-RestMethod buffers the entire response)
@@ -858,10 +861,13 @@ function Cmd-Chat {
                                 $contentChunk = $deltaObj.PSObject.Properties['content']?.Value
 
                                 if ($reasoningChunk) {
+                                    if (-not $firstToken) { $startTime = Get-Date; $firstToken = $true }
+                                    $thinkingToks++
                                     $thinkingContent += $reasoningChunk
                                     Write-Host $reasoningChunk -NoNewline -ForegroundColor DarkGray
                                 }
                                 if ($contentChunk) {
+                                    if (-not $firstToken) { $startTime = Get-Date; $firstToken = $true }
                                     if (-not $assistantContent) {
                                         # First content token after thinking — add a newline separator
                                         Write-Host ""
@@ -884,7 +890,7 @@ function Cmd-Chat {
             Write-Host ""
 
             $endTime = Get-Date
-            $duration = ($endTime - $startTime).TotalSeconds
+            $duration = if ($startTime) { ($endTime - $startTime).TotalSeconds } else { 0 }
 
             # Fallback: if the server didn't send usage (stream_options not honoured), estimate
             if ($genToks -eq 0) {
@@ -896,27 +902,29 @@ function Cmd-Chat {
                 $promptToks = [Math]::Max(1, [int]($totalMsgLen / 4))
             }
 
-            # completion_tokens from the server already includes thinking tokens
-            $tokS = if ($duration -gt 0 -and $genToks -gt 0) { [math]::Round($genToks / $duration, 1) } else { 0 }
+            # Total tokens generated = thinking tokens + content tokens
+            $totalToks = $thinkingToks + $genToks
+            $tokS = if ($duration -gt 0 -and $totalToks -gt 0) { [math]::Round($totalToks / $duration, 1) } else { 0 }
             if ($tokS -gt 0) { $Script:LastTokS = $tokS }
 
             # Always display token stats after a successful response
             if ($assistantContent) {
                 Write-Host ("  {0}─{1}" -f $dim, "───────────────────────────────────────────────", $reset)
-                Write-Host ("  {0}⬡ {1} prompt · {2} gen · {3} tok/s · {4}s{5}" -f `
-                    $amber, $promptToks, $genToks, $tokS, [math]::Round($duration, 1), $reset)
+                Write-Host ("  {0}⬡ {1} prompt · {2} thinking · {3} gen · {4} tok/s · {5}s{6}" -f `
+                    $amber, $promptToks, $thinkingToks, $genToks, $tokS, [math]::Round($duration, 1), $reset)
                 Write-Host ""
             }
 
             # Add assistant message to history
             $Script:ChatHistory += [PSCustomObject]@{
-                role        = "assistant"
-                content     = $assistantContent
-                thinking    = $thinkingContent
-                prompt_toks = $promptToks
-                gen_toks    = $genToks
-                tok_s       = $tokS
-                duration    = [math]::Round($duration, 1)
+                role         = "assistant"
+                content      = $assistantContent
+                thinking     = $thinkingContent
+                prompt_toks  = $promptToks
+                thinking_toks = $thinkingToks
+                gen_toks     = $genToks
+                tok_s        = $tokS
+                duration     = [math]::Round($duration, 1)
             }
 
         } catch {
