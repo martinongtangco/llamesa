@@ -601,10 +601,17 @@ function Cmd-Chat {
     $Script:CurrentView = "chat"
     $Script:ChatHistory = @()
 
-    Write-Host ("{0}Chat mode — type /exit to return, /clear to clear history{1}" -f $cyan, $reset)
-
     $port = $Script:ActiveServer.port
     $hostAddr = $Script:ActiveServer.host
+
+    # Seed thinking mode from server status; user can toggle with /think and /nothink
+    $thinkingEnabled = $false
+    if ($Script:ServerStatus -and $Script:ServerStatus.thinking) {
+        $thinkingEnabled = [bool]$Script:ServerStatus.thinking
+    }
+
+    Write-Host ("{0}Chat mode — type /exit to return, /clear to clear history{1}" -f $cyan, $reset)
+    Write-Host ("{0}Thinking mode: {1}{2}" -f $gray, $(if ($thinkingEnabled) { "on (toggle with /nothink)" } else { "off (toggle with /think)" }), $reset)
 
     Clear-Host
     while ($Script:CurrentView -eq "chat") {
@@ -659,11 +666,13 @@ function Cmd-Chat {
             continue
         }
         elseif ($input -eq "/think") {
-            Write-Host ("{0}Thinking mode enabled for next request.{1}" -f $amber, $reset)
+            $thinkingEnabled = $true
+            Write-Host ("{0}Thinking mode ON — Qwen3 will reason before responding.{1}" -f $amber, $reset)
             continue
         }
         elseif ($input -eq "/nothink") {
-            Write-Host ("{0}Thinking mode disabled for next request.{1}" -f $gray, $reset)
+            $thinkingEnabled = $false
+            Write-Host ("{0}Thinking mode OFF.{1}" -f $gray, $reset)
             continue
         }
 
@@ -696,11 +705,13 @@ function Cmd-Chat {
             }
         } catch {}
 
-        $body = [PSCustomObject]@{
-            model    = $modelId
-            messages = $messages
-            stream   = $true
-        } | ConvertTo-Json -Depth 5
+        $requestBody = [PSCustomObject]@{
+            model                 = $modelId
+            messages              = $messages
+            stream                = $true
+            chat_template_kwargs  = [PSCustomObject]@{ enable_thinking = $thinkingEnabled }
+        }
+        $body = $requestBody | ConvertTo-Json -Depth 5
 
         $assistantContent = ""
         $thinkingContent  = ""
