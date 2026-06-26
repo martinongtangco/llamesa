@@ -838,19 +838,23 @@ function Cmd-Chat {
                         try {
                             $delta = $jsonStr | ConvertFrom-Json
 
-                            # Track usage
-                            if ($delta.usage) {
-                                $promptToks = $delta.usage.prompt_tokens
-                                $genToks = $delta.usage.completion_tokens
+                            # Track usage — safe property access required under Set-StrictMode
+                            $usage = $delta.PSObject.Properties['usage']?.Value
+                            if ($usage) {
+                                $pv = $usage.PSObject.Properties['prompt_tokens']?.Value
+                                $gv = $usage.PSObject.Properties['completion_tokens']?.Value
+                                if ($pv -ne $null) { $promptToks = [int]$pv }
+                                if ($gv -ne $null) { $genToks = [int]$gv }
                             }
 
-                            # Handle content
+                            # Handle content deltas — safe property access required under Set-StrictMode
+                            # (PSCustomObject member access throws in StrictMode when the property is absent)
                             if ($delta.choices -and $delta.choices[0].delta) {
                                 $deltaObj = $delta.choices[0].delta
                                 # reasoning_content = thinking tokens (Qwen3)
-                                $reasoningChunk = $deltaObj.reasoning_content
+                                $reasoningChunk = $deltaObj.PSObject.Properties['reasoning_content']?.Value
                                 # content = final response tokens
-                                $contentChunk = $deltaObj.content
+                                $contentChunk = $deltaObj.PSObject.Properties['content']?.Value
 
                                 if ($reasoningChunk) {
                                     $thinkingContent += $reasoningChunk
