@@ -245,81 +245,96 @@ function Show-Header {
 
     $w = [Console]::WindowWidth
 
-    # Line 1 — logo + tagline + refresh indicator
+    # Line 1 — logo + tagline
     $logo    = "{0}LL{1}a{2}M{3}esa{4}" -f $teal, $amber, $teal, $amber, $reset
     $tagline = "{0}local inference control plane · v0.1{1}" -f $dim, $reset
-    $ticker  = "{0}↻ 2s{1}" -f $gray, $reset
     Write-Host ("{0} {1}" -f $logo, $tagline)
 
     # Line 2 — server dot + name + host + port
     if ($Script:ActiveServerName) {
-        $dot = if ($Script:ServerOnline) { "{0}●{1}" -f $teal, $reset } else { "{0}●{1}" -f $red, $reset }
+        $dot  = if ($Script:ServerOnline) { "{0}●{1}" -f $teal, $reset } else { "{0}●{1}" -f $red, $reset }
         $port = $Script:ActiveServer.port
-        Write-Host ("  {0} {1}{2}{3} · {4}{5}{3} · {6}{7}{3}" -f `
-            $dot, $teal, $Script:ActiveServerName, $reset, `
-            $gray, $Script:ActiveServer.host, $gray, $port)
+        Write-Host ("  {0} {1}{2}{3} · {4}{5}{3} · {4}{6}{3}" -f `
+            $dot, $teal, $Script:ActiveServerName, $reset, $gray, $Script:ActiveServer.host, $port)
     }
 
-    # Lines 3-6 — stat cards
+    # Lines 3-7 — stat cards
     if ($status) {
-        $cpu       = [double]($status.cpu_percent)
-        $ramUsedGb = [math]::Round($status.ram_used_mb  / 1024, 1)
-        $ramTotGb  = [math]::Round($status.ram_total_mb / 1024, 1)
-        $gpu       = [double]($status.gpu_busy_percent)
-        $vramUsedGb = [math]::Round($status.vram_used_bytes / 1GB, 1)
+        $cpu        = [double]($status.cpu_percent)
+        $ramUsedGb  = [math]::Round($status.ram_used_mb   / 1024, 1)
+        $ramTotGb   = [math]::Round($status.ram_total_mb  / 1024, 1)
+        $gpu        = [double]($status.gpu_busy_percent)
+        $vramUsedGb = [math]::Round($status.vram_used_bytes  / 1GB, 1)
         $vramTotGb  = [math]::Round($status.vram_total_bytes / 1GB, 1)
 
-        # Value colors
-        $cpuCol  = if ($cpu -gt 20)           { $red }   elseif ($cpu -gt 5)             { $amber } else { $teal }
-        $ramCol  = if ($ramUsedGb -gt 20)     { $red }   elseif ($ramUsedGb -gt 10)      { $amber } else { $teal }
-        $gpuCol  = if ($gpu -gt 0)            { $amber } else                            { $gray }
-        $vramCol = if ($vramUsedGb -lt 5)     { $red }   elseif ($vramUsedGb -lt 15)     { $amber } else { $teal }
+        $cpuCol  = if ($cpu -gt 20)        { $red   } elseif ($cpu -gt 5)        { $amber } else { $teal }
+        $ramCol  = if ($ramUsedGb -gt 20)  { $red   } elseif ($ramUsedGb -gt 10) { $amber } else { $teal }
+        $gpuCol  = if ($gpu -gt 0)         { $amber } else                       { $gray }
+        $vramCol = if ($vramUsedGb -lt 5)  { $red   } elseif ($vramUsedGb -lt 15){ $amber } else { $teal }
 
-        $cpuBar  = New-Bar  $cpu       100          12 $cpuCol
-        $ramBar  = New-Bar  $ramUsedGb $ramTotGb    12 $purple
-        $gpuBar  = New-Bar  $gpu       100          12 $gpuCol
-        $vramBar = New-Bar  $vramUsedGb $vramTotGb  12 $blue
+        $cpuBar  = New-Bar $cpu        100         12 $cpuCol
+        $ramBar  = New-Bar $ramUsedGb  $ramTotGb   12 $purple
+        $gpuBar  = New-Bar $gpu        100         12 $gpuCol
+        $vramBar = New-Bar $vramUsedGb $vramTotGb  12 $blue
 
-        # Card tops
-        Write-Host ("  {0}┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌────────────────────┐{1}" -f $dim, $reset)
-        # Label row
-        Write-Host ("  {0}│{1} {2}CPU          {3}{0}│{1} {0}│{1} {2}RAM          {3}{0}│{1} {0}│{1} {2}GPU          {3}{0}│{1} {0}│{1} {2}VRAM                {3}{0}│{1}" -f $dim, $reset, $gray, $reset)
-        # Value row
-        Write-Host ("  {0}│{1} {2}{3,-13}{4}{0}│{1} {0}│{1} {2}{5,-5}{6} / {7,-5} GB{4}{0}│{1} {0}│{1} {2}{8,-13}{4}{0}│{1} {0}│{1} {2}{9,-5}{10} / {11,-5} GB    {4}{0}│{1}" -f `
-            $dim, $reset, `
-            $cpuCol,  ("{0}%" -f $cpu),    $reset, `
-            $ramCol,  $ramUsedGb,  $ramTotGb, `
-            $gpuCol,  ("{0}%" -f $gpu), `
-            $vramCol, $vramUsedGb, $vramTotGb)
-        # Bar row
-        Write-Host ("  {0}│{1} {2} {0}│{1} {0}│{1} {3} {0}│{1} {0}│{1} {4} {0}│{1} {0}│{1} {5}     {0}│{1}" -f `
-            $dim, $reset, $cpuBar, $ramBar, $gpuBar, $vramBar)
-        # Card bottoms
-        Write-Host ("  {0}└──────────────┘ └──────────────┘ └──────────────┘ └────────────────────┘{1}" -f $dim, $reset)
+        # Each card cell built individually then concatenated — avoids format index bugs
+        $b = $dim; $r = $reset
 
-        # Line 7 — model row with pill badges
+        # Top border row
+        Write-Host ("  " + "${b}┌──────────────┐${r} ${b}┌──────────────┐${r} ${b}┌──────────────┐${r} ${b}┌────────────────────┐${r}")
+
+        # Label row:  │ CPU          │  (inner 14 chars = 1 space + 12 label + 1 space)
+        $lblRow = "  "
+        $lblRow += "${b}│${r} ${gray}CPU          ${r}${b}│${r} "
+        $lblRow += "${b}│${r} ${gray}RAM          ${r}${b}│${r} "
+        $lblRow += "${b}│${r} ${gray}GPU          ${r}${b}│${r} "
+        $lblRow += "${b}│${r} ${gray}VRAM                ${r}${b}│${r}"
+        Write-Host $lblRow
+
+        # Value row: each cell pads its plain-text value to fill inner width
+        $cpuVal  = "{0}%" -f $cpu           # e.g. "0.7%"
+        $ramVal  = "{0} / {1} GB" -f $ramUsedGb, $ramTotGb   # e.g. "16.5 / 62.7 GB"
+        $gpuVal  = "{0}%" -f $gpu           # e.g. "0%"
+        $vramVal = "{0} / {1} GB" -f $vramUsedGb, $vramTotGb # e.g. "26.4 / 31.9 GB"
+
+        $valRow = "  "
+        $valRow += "${b}│${r} ${cpuCol}$("{0,-12}" -f $cpuVal)${r}${b}│${r} "
+        $valRow += "${b}│${r} ${ramCol}$("{0,-12}" -f $ramVal)${r}${b}│${r} "
+        $valRow += "${b}│${r} ${gpuCol}$("{0,-12}" -f $gpuVal)${r}${b}│${r} "
+        $valRow += "${b}│${r} ${vramCol}$("{0,-18}" -f $vramVal)${r}${b}│${r}"
+        Write-Host $valRow
+
+        # Bar row: bar is 12 chars; VRAM card inner is 20, so 6 extra spaces after bar
+        $barRow = "  "
+        $barRow += "${b}│${r} ${cpuBar} ${b}│${r} "
+        $barRow += "${b}│${r} ${ramBar} ${b}│${r} "
+        $barRow += "${b}│${r} ${gpuBar} ${b}│${r} "
+        $barRow += "${b}│${r} ${vramBar}       ${b}│${r}"
+        Write-Host $barRow
+
+        # Bottom border row
+        Write-Host ("  " + "${b}└──────────────┘${r} ${b}└──────────────┘${r} ${b}└──────────────┘${r} ${b}└────────────────────┘${r}")
+
+        # Model row with pill badges
         if ($status.running) {
-            $thinkingPill = if ($status.thinking) {
-                "{0}[thinking on]{1}" -f $teal, $reset
-            } else {
-                "{0}[thinking off]{1}" -f $gray, $reset
-            }
-            $ctxPill = if ($status.ctx -gt 0) { "{0}[ctx {1}]{2}" -f $teal, $status.ctx, $reset } else { "" }
-            $toksPill = if ($Script:LastTokS) { "{0}[{1} tok/s]{2}" -f $amber, $Script:LastTokS, $reset } else { "" }
-            Write-Host ("  {0}MODEL{1}  {2}{3}{1}  {4}  {5}  {6}" -f `
-                $gray, $reset, $white, $status.model, $ctxPill, $thinkingPill, $toksPill)
+            $thinkingPill = if ($status.thinking) { "${teal}[thinking on]${r}"  } else { "${gray}[thinking off]${r}" }
+            $ctxPill      = if ($status.ctx -gt 0){ "${teal}[ctx $($status.ctx)]${r}" } else { "" }
+            $toksPill     = if ($Script:LastTokS) { "${amber}[$($Script:LastTokS) tok/s]${r}" } else { "" }
+            Write-Host ("  ${gray}MODEL${r}  ${white}$($status.model)${r}  ${ctxPill}  ${thinkingPill}  ${toksPill}")
+        } else {
+            Write-Host ("  ${gray}MODEL  none${r}")
         }
     } else {
-        # No status — blank card area placeholder
-        Write-Host ""
-        Write-Host ("  {0}(offline — no stats){1}" -f $gray, $reset)
-        Write-Host ""
-        Write-Host ""
-        Write-Host ""
-        Write-Host ""
+        # Offline placeholder — same number of lines as card block so layout is stable
+        Write-Host ("  ${dim}┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌────────────────────┐${reset}")
+        Write-Host ("  ${dim}│  offline     │ │              │ │              │ │                    │${reset}")
+        Write-Host ("  ${dim}│              │ │              │ │              │ │                    │${reset}")
+        Write-Host ("  ${dim}│              │ │              │ │              │ │                    │${reset}")
+        Write-Host ("  ${dim}└──────────────┘ └──────────────┘ └──────────────┘ └────────────────────┘${reset}")
+        Write-Host ("  ${gray}MODEL  none${reset}")
     }
 
-    Write-Host ("{0}{1}{2}" -f $dim, ("─" * [Math]::Max($w - 1, 20)), $reset)
+    Write-Host ("${dim}$("─" * [Math]::Max($w - 1, 20))${reset}")
 }
 
 # ── UI: Menu ──────────────────────────────────────────────────────────────
@@ -332,8 +347,16 @@ function Show-Menu {
         Write-Host ("{0}{1}{2}" -f $teal, $title, $reset)
     }
     function Row([string]$cmd, [string]$desc, [string]$hint = "") {
-        $hintStr = if ($hint) { "{0}{1}{2}" -f $gray, $hint, $reset } else { "" }
-        Write-Host ("  {0}{1,-10}{2}  {3,-38}{4}" -f $white, $cmd, $reset, $desc, $hintStr)
+        if ($hint) {
+            $hintStr = "${gray}${hint}${reset}"
+            # Right-align hint: pad desc to fill space up to terminal width
+            $ww = [Console]::WindowWidth
+            $plainLen = 2 + $cmd.Length + 2 + $desc.Length
+            $pad = [Math]::Max(1, $ww - $plainLen - $hint.Length - 2)
+            Write-Host ("  ${white}$("{0,-10}" -f $cmd)${reset}  ${desc}$(" " * $pad)${hintStr}")
+        } else {
+            Write-Host ("  ${white}$("{0,-10}" -f $cmd)${reset}  ${desc}")
+        }
     }
 
     Write-Host ""
