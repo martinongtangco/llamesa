@@ -1081,10 +1081,13 @@ function Main {
         Clear-Host
         Show-Header -status $status
         Show-Menu
-        Write-Host ""
 
-        # Read command — plain prompt (no ANSI codes) so PowerShell keeps the cursor
-        # pinned to the bottom of the console when the window is resized.
+        # Pin the prompt to the last row — pad with blank lines to fill remaining height
+        $usedRows = [Console]::CursorTop
+        $padLines = [Math]::Max(0, [Console]::WindowHeight - $usedRows - 2)
+        if ($padLines -gt 0) { Write-Host ("`n" * ($padLines - 1)) }
+
+        # Read command — plain prompt (no ANSI codes) so PowerShell keeps the cursor pinned
         $input = Read-Host "  ›:"
 
         if (-not $input -or -not $input.Trim()) { continue }

@@ -269,13 +269,13 @@ cmd_status() {
                 fi
             fi
 
-            # GPU busy % from --showusage (Graphics Engine utilization)
+            # GPU busy % from --showgpuuse
             local rocm_usage_output
-            if rocm_usage_output=$(podman exec "$container_id" bash -c "rocm-smi --showusage 2>/dev/null" 2>/dev/null); then
-                local usage_line
-                usage_line=$(echo "$rocm_usage_output" | grep -i "Graphics Engine" | tail -1 || echo "")
-                if [[ -n "$usage_line" ]]; then
-                    gpu_busy=$(echo "$usage_line" | grep -o '[0-9]*\%' | head -1 | tr -d '%' || echo "0")
+            if rocm_usage_output=$(podman exec "$container_id" bash -c "rocm-smi --showgpuuse 2>/dev/null" 2>/dev/null); then
+                local gpu_use_val
+                gpu_use_val=$(echo "$rocm_usage_output" | grep -i "GPU use" | grep -o '[0-9]*' | head -1 || echo "")
+                if [[ -n "$gpu_use_val" ]]; then
+                    gpu_busy=$gpu_use_val
                 fi
             fi
         fi
