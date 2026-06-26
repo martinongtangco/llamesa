@@ -384,9 +384,61 @@ function Cmd-Stop {
 # ── Command: /restart ─────────────────────────────────────────────────────
 
 function Cmd-Restart {
-    Write-Host ("{0}Restarting server...{1}" -f $cyan, $reset)
-    $raw = Invoke-ServerCommand "restart" -raw
-    Write-Host ($raw -join "`n")
+    if (-not $Script:ActiveServer) { Write-Host ("{0}No active server.{1}" -f $red, $reset); return }
+
+    $sshUser     = $Script:ActiveServer.ssh_user
+    $sshHost     = $Script:ActiveServer.host
+    $llamesaPath = $Script:ActiveServer.llamesa_path
+    $port        = $Script:ActiveServer.port
+
+    # Read saved session so we know what to restart with
+    $sessionJson = ssh -o BatchMode=yes -o ConnectTimeout=5 "${sshUser}@${sshHost}" "cat ~/.llamesa/last_session.json 2>/dev/null" 2>$null
+    if (-not $sessionJson) {
+        Write-Host ("{0}No saved session found. Use /start instead.{1}" -f $red, $reset)
+        return
+    }
+
+    $session   = ($sessionJson -join "`n") | ConvertFrom-Json
+    $modelName = $session.model
+    $thinking  = $session.thinking
+    $ctx       = $session.ctx
+
+    Write-Host ("{0}Restarting: {1} (thinking={2}, ctx={3}){4}" -f $cyan, $modelName, $thinking, $ctx, $reset)
+
+    # Stop first (blocking, quick)
+    Cmd-Stop
+    Write-Host ("{0}Waiting 3s for VRAM to clear...{1}" -f $dim, $reset)
+    Start-Sleep -Seconds 3
+
+    # Fire-and-forget: launch start detached so SSH returns immediately.
+    # nohup + & + redirected output lets the SSH session close without killing the process.
+    $startCmd = "nohup bash ${llamesaPath} start --model `"${modelName}`" --thinking ${thinking} --ctx ${ctx} >> ~/.llamesa/restart.log 2>&1 &"
+    ssh -o BatchMode=yes -o ConnectTimeout=5 "${sshUser}@${sshHost}" $startCmd 2>$null | Out-Null
+
+    # Poll /health directly over HTTP — no SSH held open during the long load wait
+    Write-Host ("{0}Waiting for model to load...{1}" -f $cyan, $reset)
+    $loaded = $false
+    for ($i = 0; $i -lt 150; $i++) {
+        Start-Sleep -Seconds 2
+        try {
+            $health = Invoke-RestMethod -Uri "http://${sshHost}:${port}/health" -TimeoutSec 3 -ErrorAction Stop
+            if ($health.status -eq "ok") {
+                $status = Get-ServerStatus
+                if ($status -and $status.vram_used_bytes -gt 1GB) {
+                    Write-Host ("{0}✓ Server restarted and model loaded!{1}" -f $green, $reset)
+                    $loaded = $true
+                    break
+                }
+            }
+        } catch {}
+        if (($i + 1) % 15 -eq 0) {
+            Write-Host ("  Still loading... ({0}s elapsed)" -f (($i + 1) * 2))
+        }
+    }
+    if (-not $loaded) {
+        Write-Host ("{0}Timed out waiting for server after restart.{1}" -f $red, $reset)
+        Write-Host ("Check logs on Bazzite: tail -f ~/.llamesa/restart.log" )
+    }
 }
 
 # ── Command: /switch ──────────────────────────────────────────────────────
