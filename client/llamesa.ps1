@@ -772,10 +772,10 @@ function Cmd-Chat {
                             # Handle content
                             if ($delta.choices -and $delta.choices[0].delta) {
                                 $deltaObj = $delta.choices[0].delta
-                                # reasoning_content = thinking tokens (Qwen3)
-                                $reasoningChunk = $deltaObj.reasoning_content
-                                # content = final response tokens
-                                $contentChunk = $deltaObj.content
+                                # reasoning_content = thinking tokens (Qwen3) — safe access for StrictMode
+                                $reasoningChunk = $deltaObj.PSObject.Properties['reasoning_content']?.Value
+                                # content = final response tokens — safe access for StrictMode
+                                $contentChunk = $deltaObj.PSObject.Properties['content']?.Value
 
                                 if ($reasoningChunk) {
                                     $thinkingContent += $reasoningChunk
