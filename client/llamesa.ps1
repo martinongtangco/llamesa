@@ -885,15 +885,21 @@ function Cmd-Chat {
             $endTime = Get-Date
             $duration = ($endTime - $startTime).TotalSeconds
 
-            # Fallback: if the server didn't send usage, estimate from history
+            # Fallback: if the server didn't send usage, estimate from visible output
             if ($genToks -eq 0 -and $assistantContent) {
-                $genToks = [Math]::Max(1, ($assistantContent.Length / 4))
+                $genToks = [Math]::Max(1, [int]($assistantContent.Length / 4))
             }
             if ($promptToks -eq 0) {
-                $promptToks = $messages.Count
+                # Estimate from total message content length, not message count
+                $totalMsgLen = ($messages | ForEach-Object { $_.content.Length } | Measure-Object -Sum).Sum
+                $promptToks = [Math]::Max(1, [int]($totalMsgLen / 4))
             }
 
-            $tokS = if ($duration -gt 0 -and $genToks -gt 0) { [math]::Round($genToks / $duration, 1) } else { 0 }
+            # tok/s must include thinking tokens — completion_tokens only covers visible output
+            # but $duration spans the entire generation (thinking + response).
+            $thinkingToksEst = if ($thinkingContent) { [int]($thinkingContent.Length / 4) } else { 0 }
+            $totalGenToks = $genToks + $thinkingToksEst
+            $tokS = if ($duration -gt 0 -and $totalGenToks -gt 0) { [math]::Round($totalGenToks / $duration, 1) } else { 0 }
             if ($tokS -gt 0) { $Script:LastTokS = $tokS }
 
             # Always display token stats after a successful response
