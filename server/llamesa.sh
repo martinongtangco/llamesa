@@ -493,7 +493,7 @@ cmd_restart() {
 
     # Extract model file path from status, resolve to directory name for cmd_start
     local model_file
-    model_file=$(echo "$current_status" | grep -o '"model":"[^"]*"' | cut -d'"' -f4 || echo "")
+    model_file=$(echo "$current_status" | grep -o '"model": *"[^"]*"' | grep -o '"[^"]*"$' | tr -d '"' || echo "")
     local model_name=""
     if [[ -n "$model_file" ]] && [[ "$model_file" != "none" ]] && [[ "$model_file" != "unknown" ]]; then
         # Search models_dir for a directory containing this file
