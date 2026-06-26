@@ -797,8 +797,6 @@ function Cmd-Chat {
         $assistantContent = ""
         $thinkingContent  = ""
         $inThinking       = $false
-        $startTime        = $null
-        $firstToken       = $false
         $promptToks       = 0
         $genToks          = 0
         $thinkingToks     = 0
@@ -829,10 +827,12 @@ function Cmd-Chat {
             Write-Host ("  {0}Stream opened, reading...{1}" -f $gray, $reset)
 
             $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8)
+            $streamStart = Get-Date
 
             try {
-                while (-not $reader.EndOfStream) {
+                while ($true) {
                     $line = $reader.ReadLine()
+                    if ($null -eq $line) { break }
                     if ([string]::IsNullOrEmpty($line)) { continue }
 
                     if ($line.StartsWith("data:")) {
@@ -861,13 +861,11 @@ function Cmd-Chat {
                                 $contentChunk = $deltaObj.PSObject.Properties['content']?.Value
 
                                 if ($reasoningChunk) {
-                                    if (-not $firstToken) { $startTime = Get-Date; $firstToken = $true }
                                     $thinkingToks++
                                     $thinkingContent += $reasoningChunk
                                     Write-Host $reasoningChunk -NoNewline -ForegroundColor DarkGray
                                 }
                                 if ($contentChunk) {
-                                    if (-not $firstToken) { $startTime = Get-Date; $firstToken = $true }
                                     if (-not $assistantContent) {
                                         # First content token after thinking — add a newline separator
                                         Write-Host ""
@@ -885,12 +883,12 @@ function Cmd-Chat {
             } finally {
                 $reader.Dispose()
             }
+            $streamEnd = Get-Date
 
             $client.Dispose()
             Write-Host ""
 
-            $endTime = Get-Date
-            $duration = if ($startTime) { ($endTime - $startTime).TotalSeconds } else { 0 }
+            $duration = [math]::Round(($streamEnd - $streamStart).TotalSeconds, 1)
 
             # Fallback: if the server didn't send usage (stream_options not honoured), estimate
             if ($genToks -eq 0) {
@@ -903,8 +901,7 @@ function Cmd-Chat {
             }
 
             # Total tokens generated = thinking tokens + content tokens
-            $totalToks = $thinkingToks + $genToks
-            $tokS = if ($duration -gt 0 -and $totalToks -gt 0) { [math]::Round($totalToks / $duration, 1) } else { 0 }
+            $tokS = if ($duration -gt 0) { [math]::Round(($thinkingToks + $genToks) / $duration, 1) } else { 0 }
             if ($tokS -gt 0) { $Script:LastTokS = $tokS }
 
             # Always display token stats after a successful response
