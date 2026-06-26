@@ -1032,118 +1032,62 @@ function Get-MatchingCommands {
 
 # ── Main Loop ─────────────────────────────────────────────────────────────
 
-# How many lines the header occupies (logo+server+cards+model+separator = 10)
-$Script:HEADER_LINES = 10
-
-function Draw-Screen {
-    param($status)
-    Clear-Host
-    Show-Header -status $status
-    Show-Menu
-    # Prompt pinned to bottom
-    $promptRow = [Console]::WindowHeight - 1
-    [Console]::SetCursorPosition(0, $promptRow)
-    Write-Host ("{0}›:{1} " -f $cyan, $reset) -NoNewline
-}
-
-function Refresh-Header {
-    param($status)
-    # Overwrite header region in-place without touching menu or prompt
-    [Console]::SetCursorPosition(0, 0)
-    Show-Header -status $status
-}
-
 function Main {
     $host.UI.RawUI.WindowTitle = "LLaMesa"
     Read-Config
 
     $Script:ServerOnline = $false
     $status = $null
-
-    # Initial full draw
-    try {
-        $Script:ServerOnline = Test-ServerConnection
-        $status = Get-ServerStatus
-        $Script:ServerStatus = $status
-    } catch {}
-
-    Draw-Screen $status
-
-    $lastRefresh = [DateTime]::Now
+    # MinValue forces an immediate status fetch on the first iteration
+    $lastRefresh = [DateTime]::MinValue
 
     while ($true) {
-        # Non-blocking: check if a key is available; if not, check refresh timer
-        if ([Console]::KeyAvailable) {
-            # Read full line via bottom-pinned prompt
-            $promptRow = [Console]::WindowHeight - 1
-            [Console]::SetCursorPosition(0, $promptRow)
-            # Erase the prompt line then re-draw it so Read-Host sits cleanly
-            Write-Host (" " * ([Console]::WindowWidth - 1)) -NoNewline
-            [Console]::SetCursorPosition(0, $promptRow)
-            Write-Host ("{0}›:{1} " -f $cyan, $reset) -NoNewline
-            $input = Read-Host
-
-            if (-not $input -or -not $input.Trim()) {
-                [Console]::SetCursorPosition(0, $promptRow)
-                Write-Host ("{0}›:{1} " -f $cyan, $reset) -NoNewline
-                continue
+        # Refresh status every 2s (or on first run / after a command)
+        $elapsed = ([DateTime]::Now - $lastRefresh).TotalSeconds
+        if ($elapsed -ge 2) {
+            try {
+                $Script:ServerOnline = Test-ServerConnection
+                $status = Get-ServerStatus
+                $Script:ServerStatus = $status
+            } catch {
+                $Script:ServerOnline = $false
+                $status = $null
             }
-
-            $cmd = $input.Trim().TrimStart('/')
-
-            # Commands that take over the screen — full redraw after return
-            $needsRedraw = $true
-            switch ($cmd) {
-                "start"    { Clear-Host; Cmd-Start;    Read-Host "`nPress Enter to continue" }
-                "stop"     { Clear-Host; Cmd-Stop;     Read-Host "`nPress Enter to continue" }
-                "switch"   { Clear-Host; Cmd-Switch;   Read-Host "`nPress Enter to continue" }
-                "restart"  { Clear-Host; Cmd-Restart;  Read-Host "`nPress Enter to continue" }
-                "stats"    { Cmd-Stats }
-                "health"   { Clear-Host; Cmd-Health;   Read-Host "`nPress Enter to continue" }
-                "logs"     { Cmd-Logs }
-                "models"   { Clear-Host; Cmd-Models;   Read-Host "`nPress Enter to continue" }
-                "download" { Clear-Host; Cmd-Download; Read-Host "`nPress Enter to continue" }
-                "chat"     { Cmd-Chat }
-                "servers"  { Clear-Host; Cmd-Servers;  Read-Host "`nPress Enter to continue" }
-                "config"   { Clear-Host; Cmd-Config;   Read-Host "`nPress Enter to continue" }
-                "help"     { Clear-Host; Cmd-Help;     Read-Host "`nPress Enter to continue" }
-                "quit"     { Clear-Host; Write-Host ("{0}Goodbye!{1}" -f $gray, $reset); exit 0 }
-                default    {
-                    $needsRedraw = $false
-                    $promptRow = [Console]::WindowHeight - 1
-                    [Console]::SetCursorPosition(0, $promptRow)
-                    Write-Host ("{0}Unknown: /{1}{2}  " -f $red, $cmd, $reset) -NoNewline
-                    Start-Sleep -Seconds 1
-                }
-            }
-
-            if ($needsRedraw) {
-                try {
-                    $Script:ServerOnline = Test-ServerConnection
-                    $status = Get-ServerStatus
-                    $Script:ServerStatus = $status
-                } catch {}
-                Draw-Screen $status
-                $lastRefresh = [DateTime]::Now
-            }
-        } else {
-            # Check if 2s have elapsed — refresh header in-place
-            $elapsed = ([DateTime]::Now - $lastRefresh).TotalSeconds
-            if ($elapsed -ge 2) {
-                try {
-                    $Script:ServerOnline = Test-ServerConnection
-                    $status = Get-ServerStatus
-                    $Script:ServerStatus = $status
-                } catch {}
-                Refresh-Header $status
-                # Restore prompt position after header refresh
-                $promptRow = [Console]::WindowHeight - 1
-                [Console]::SetCursorPosition(0, $promptRow)
-                Write-Host ("{0}›:{1} " -f $cyan, $reset) -NoNewline
-                $lastRefresh = [DateTime]::Now
-            }
-            Start-Sleep -Milliseconds 100
+            $lastRefresh = [DateTime]::Now
         }
+
+        # Full clear + redraw every loop so there's never a stale/doubled header
+        Clear-Host
+        Show-Header -status $status
+        Show-Menu
+        Write-Host ""
+
+        # Read command — blocks until the user hits Enter
+        $input = Read-Host ("{0}›:{1}" -f $cyan, $reset)
+
+        if (-not $input -or -not $input.Trim()) { continue }
+        $cmd = $input.Trim().TrimStart('/')
+
+        switch ($cmd) {
+            "start"    { Clear-Host; Cmd-Start;    Read-Host "`nPress Enter to continue" }
+            "stop"     { Clear-Host; Cmd-Stop;     Read-Host "`nPress Enter to continue" }
+            "switch"   { Clear-Host; Cmd-Switch;   Read-Host "`nPress Enter to continue" }
+            "restart"  { Clear-Host; Cmd-Restart;  Read-Host "`nPress Enter to continue" }
+            "stats"    { Cmd-Stats }
+            "health"   { Clear-Host; Cmd-Health;   Read-Host "`nPress Enter to continue" }
+            "logs"     { Cmd-Logs }
+            "models"   { Clear-Host; Cmd-Models;   Read-Host "`nPress Enter to continue" }
+            "download" { Clear-Host; Cmd-Download; Read-Host "`nPress Enter to continue" }
+            "chat"     { Cmd-Chat }
+            "servers"  { Clear-Host; Cmd-Servers;  Read-Host "`nPress Enter to continue" }
+            "config"   { Clear-Host; Cmd-Config;   Read-Host "`nPress Enter to continue" }
+            "help"     { Clear-Host; Cmd-Help;     Read-Host "`nPress Enter to continue" }
+            "quit"     { Clear-Host; Write-Host ("{0}Goodbye!{1}" -f $gray, $reset); exit 0 }
+            default    { Write-Host ("{0}Unknown command: /{1}{2}" -f $red, $cmd, $reset); Start-Sleep -Seconds 1 }
+        }
+
+        # Force immediate status re-fetch after any command
+        $lastRefresh = [DateTime]::MinValue
     }
 }
 
