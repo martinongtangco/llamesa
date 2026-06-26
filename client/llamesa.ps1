@@ -763,10 +763,11 @@ function Cmd-Chat {
                         try {
                             $delta = $jsonStr | ConvertFrom-Json
 
-                            # Track usage (only present on final chunk — use safe property access)
-                            if ($delta.PSObject.Properties['usage']) {
-                                $promptToks = $delta.usage.prompt_tokens
-                                $genToks = $delta.usage.completion_tokens
+                            # Track usage (only present on final chunk — safe nested access for StrictMode)
+                            $usage = $delta.PSObject.Properties['usage']?.Value
+                            if ($usage) {
+                                $promptToks = $usage.PSObject.Properties['prompt_tokens']?.Value ?? 0
+                                $genToks = $usage.PSObject.Properties['completion_tokens']?.Value ?? 0
                             }
 
                             # Handle content
