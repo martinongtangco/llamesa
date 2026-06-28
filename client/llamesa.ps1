@@ -26,10 +26,11 @@ $Script:LLAMESA_DIR    = Join-Path $env:USERPROFILE ".llamesa"
 $Script:CONFIG_FILE    = Join-Path $Script:LLAMESA_DIR "config.json"
 $Script:Config         = $null
 $Script:ActiveServer   = $null
-$Script:CurrentView    = "menu"  # menu, stats, chat, logs
-$Script:ChatHistory    = @()
-$Script:RefreshTimer   = $null
-$Script:LastTokS       = $null   # updated after each /chat response; shown in header badge
+$Script:CurrentView        = "menu"  # menu, chat, logs
+$Script:ChatHistory        = @()
+$Script:RefreshTimer       = $null
+$Script:LastTokS           = $null   # updated after each /chat response; shown in header badge
+$Script:LastStatusRefresh  = $null   # tracks when stat cards were last fetched
 
 # ── JSON Helpers ──────────────────────────────────────────────────────────
 
@@ -330,6 +331,24 @@ function Show-Header {
         } else {
             Write-Host ("  ${gray}MODEL  none${r}")
         }
+
+        # Last-updated timestamp
+        if ($Script:LastStatusRefresh) {
+            $elapsed = ([DateTime]::Now - $Script:LastStatusRefresh).TotalSeconds
+            if ($elapsed -lt 2) {
+                $tsStr = "just now"
+            } elseif ($elapsed -lt 60) {
+                $tsStr = "{0}s ago" -f [int]$elapsed
+            } elseif ($elapsed -lt 3600) {
+                $tsStr = "{0}m ago" -f [int]($elapsed / 60)
+            } else {
+                $tsStr = "{0}h ago" -f [int]($elapsed / 3600)
+            }
+            $stale = if ($elapsed -ge 15) { "${red}[stale]${r}" } else { "" }
+            Write-Host ("  ${dim}updated ${tsStr}${r} ${stale}")
+        } else {
+            Write-Host ("  ${dim}updated --${r}")
+        }
     } else {
         # Offline placeholder — same number of lines as card block so layout is stable
         Write-Host ("  ${dim}┌───────────────┐ ┌───────────────┐ ┌───────────────┐ ┌────────────────────┐${reset}")
@@ -338,6 +357,24 @@ function Show-Header {
         Write-Host ("  ${dim}│               │ │               │ │               │ │                    │${reset}")
         Write-Host ("  ${dim}└───────────────┘ └───────────────┘ └───────────────┘ └────────────────────┘${reset}")
         Write-Host ("  ${gray}MODEL  none${reset}")
+
+        # Last-updated timestamp (offline)
+        if ($Script:LastStatusRefresh) {
+            $elapsed = ([DateTime]::Now - $Script:LastStatusRefresh).TotalSeconds
+            if ($elapsed -lt 2) {
+                $tsStr = "just now"
+            } elseif ($elapsed -lt 60) {
+                $tsStr = "{0}s ago" -f [int]$elapsed
+            } elseif ($elapsed -lt 3600) {
+                $tsStr = "{0}m ago" -f [int]($elapsed / 60)
+            } else {
+                $tsStr = "{0}h ago" -f [int]($elapsed / 3600)
+            }
+            $stale = if ($elapsed -ge 15) { "${red}[stale]${r}" } else { "" }
+            Write-Host ("  ${dim}updated ${tsStr}${r} ${stale}")
+        } else {
+            Write-Host ("  ${dim}updated --${r}")
+        }
     }
 
     Write-Host ("${dim}$("─" * [Math]::Max($w - 1, 20))${reset}")
@@ -373,7 +410,6 @@ function Show-Menu {
     Row "/restart" "stop + start with same settings"
     Write-Host ""
     Section "MONITORING"
-    Row "/stats"   "live stats + logs split view"   "cpu · ram · gpu · vram"
     Row "/health"  "ping /health and /v1/models"
     Row "/logs"    "tail verbose server output"
     Write-Host ""
@@ -543,64 +579,6 @@ function Cmd-Models {
     }
 
     Write-Host ""
-}
-
-# ── Command: /stats ───────────────────────────────────────────────────────
-
-function Cmd-Stats {
-    $Script:CurrentView = "stats"
-    Write-Host ("{0}Live stats mode — press Q to return to menu{1}" -f $cyan, $reset)
-    Start-Sleep -Seconds 1
-
-    while ($Script:CurrentView -eq "stats") {
-        try {
-            # Clear and redraw
-            $host.UI.RawUI.WindowTitle = "LLaMesa — Stats"
-
-            # Get status
-            $status = Get-ServerStatus
-            Show-Header -status $status
-
-            Write-Host ""
-            Write-Host ("  {0}Live Stats{1}" -f $teal, $reset)
-            Write-Host ("  {0}─{1}" -f $dim, "──────────────────────────────────────────────────────", $reset)
-
-            if ($status) {
-                # Full JSON status display
-                Write-Host ("  Running:    {0}" -f $status.running)
-                Write-Host ("  Model:      {0}" -f $status.model)
-                Write-Host ("  VRAM:       {0} / {1}" -f (Format-Bytes $status.vram_used_bytes), (Format-Bytes $status.vram_total_bytes))
-                Write-Host ("  GPU Busy:   {0}%" -f $status.gpu_busy_percent)
-                Write-Host ("  CPU:        {0}%" -f $status.cpu_percent)
-                Write-Host ("  RAM:        {0} MB / {1} MB" -f $status.ram_used_mb, $status.ram_total_mb)
-                Write-Host ("  Uptime:     {0}" -f $status.uptime)
-                Write-Host ("  Port:       {0}" -f $status.port)
-            } else {
-                Write-Host ("  {0}Could not retrieve status{1}" -f $red, $reset)
-            }
-
-            Write-Host ""
-            Write-Host ("  {0}[Q] back to menu{1}" -f $gray, $reset)
-
-            # Non-blocking key check
-            if ([System.Console]::KeyAvailable) {
-                $key = [System.Console]::ReadKey($true)
-                if ($key.KeyChar -eq 'q' -or $key.KeyChar -eq 'Q') {
-                    break
-                }
-            }
-
-            Start-Sleep -Seconds 2
-            Clear-Host
-        }
-        catch {
-            Start-Sleep -Seconds 2
-        }
-    }
-
-    $Script:CurrentView = "menu"
-    $host.UI.RawUI.WindowTitle = "LLaMesa"
-    Clear-Host
 }
 
 # ── Command: /logs ────────────────────────────────────────────────────────
@@ -1021,7 +999,6 @@ function Cmd-Help {
     Write-Host ("  {0}/stop{1}         Stop the running server gracefully" -f $white, $reset)
     Write-Host ("  {0}/switch{1}       Hot-swap to a different model" -f $white, $reset)
     Write-Host ("  {0}/restart{1}      Restart server with same/new settings" -f $white, $reset)
-    Write-Host ("  {0}/stats{1}        Live stats dashboard (Q to exit)" -f $white, $reset)
     Write-Host ("  {0}/health{1}       Check server API endpoints" -f $white, $reset)
     Write-Host ("  {0}/logs{1}         Stream server logs (Ctrl+C to exit)" -f $white, $reset)
     Write-Host ("  {0}/models{1}       List all available models" -f $white, $reset)
@@ -1040,7 +1017,7 @@ function Cmd-Help {
 
 $Script:Commands = @(
     "start", "stop", "switch", "restart",
-    "stats", "health", "logs",
+    "health", "logs",
     "models", "download",
     "chat",
     "servers", "config", "help", "quit"
@@ -1071,6 +1048,7 @@ function Main {
                 $Script:ServerOnline = Test-ServerConnection
                 $status = Get-ServerStatus
                 $Script:ServerStatus = $status
+                $Script:LastStatusRefresh = [DateTime]::Now
             } catch {
                 $Script:ServerOnline = $false
                 $status = $null
@@ -1099,7 +1077,6 @@ function Main {
             "stop"     { Clear-Host; Cmd-Stop;     Read-Host "`nPress Enter to continue" }
             "switch"   { Clear-Host; Cmd-Switch;   Read-Host "`nPress Enter to continue" }
             "restart"  { Clear-Host; Cmd-Restart;  Read-Host "`nPress Enter to continue" }
-            "stats"    { Cmd-Stats }
             "health"   { Clear-Host; Cmd-Health;   Read-Host "`nPress Enter to continue" }
             "logs"     { Cmd-Logs }
             "models"   { Clear-Host; Cmd-Models;   Read-Host "`nPress Enter to continue" }
