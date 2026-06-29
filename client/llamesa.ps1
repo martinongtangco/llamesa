@@ -1,6 +1,6 @@
 #!/usr/bin/env pwsh
 # LLaMesa — Windows PowerShell Client
-# local inference control plane · v0.1
+# local inference control plane · v0.2
 # License: MIT
 
 #Requires -Version 7.0
@@ -31,6 +31,7 @@ $Script:ChatHistory        = @()
 $Script:RefreshTimer       = $null
 $Script:LastTokS           = $null   # updated after each /chat response; shown in header badge
 $Script:LastStatusRefresh  = $null   # tracks when stat cards were last fetched
+$Script:GpuStatus         = $null   # parsed GPU status array from --gpu all
 
 # ── JSON Helpers ──────────────────────────────────────────────────────────
 
@@ -173,17 +174,23 @@ function Test-ServerConnection {
 # ── Status ────────────────────────────────────────────────────────────────
 
 function Get-ServerStatus {
-    $raw = Invoke-ServerCommand "status" -raw
+    $raw = Invoke-ServerCommand "status --gpu all" -raw
     if (-not $raw) { return $null }
 
     try {
-        # Find the first line starting with { and collect from there — skips any [INFO] prefix lines
+        # Find the first line starting with [ and collect from there — skips any [INFO] prefix lines
         $jsonStartIndex = 0
         for ($i = 0; $i -lt $raw.Count; $i++) {
-            if ($raw[$i] -match '^\s*\{') { $jsonStartIndex = $i; break }
+            if ($raw[$i] -match '^\s*\[') { $jsonStartIndex = $i; break }
         }
         $jsonText = $raw[$jsonStartIndex..($raw.Count - 1)] -join "`n"
-        return $jsonText | ConvertFrom-Json
+        $result = $jsonText | ConvertFrom-Json
+        $Script:GpuStatus = $result
+        # If result is an array, return first entry for backward compat
+        if ($result -is [array]) {
+            return $result[0]
+        }
+        return $result
     } catch {
         return $null
     }
@@ -239,6 +246,46 @@ function New-Bar {
     return "{0}{1}{2}{3}" -f $color, ("▓" * $fill), ("░" * $empty), $reset
 }
 
+# ── UI: GPU Row ───────────────────────────────────────────────────────────
+
+function Show-GpuRow {
+    param($gpus)
+    if (-not $gpus) { return }
+
+    # If single entry or fallback, treat as array with one item
+    if ($gpus -isnot [array]) { $gpus = @($gpus) }
+
+    foreach ($gpu in $gpus) {
+        $gpuId = if ($gpu.gpu_id) { $gpu.gpu_id } else { 0 }
+        $gpuName = if ($gpu.gpu_name) { $gpu.gpu_name } else { "GPU${gpuId}" }
+        $vramUsedBytes = if ($gpu.vram_used_bytes) { $gpu.vram_used_bytes } else { 0 }
+        $vramTotalBytes = if ($gpu.vram_total_bytes) { $gpu.vram_total_bytes } else { 0 }
+        $gpuBusy = if ($gpu.gpu_busy_percent) { $gpu.gpu_busy_percent } else { 0 }
+        $running = if ($gpu.running) { $true } else { $false }
+
+        $vramUsedGb = [math]::Round($vramUsedBytes / 1GB, 1)
+        $vramTotalGb = [math]::Round($vramTotalBytes / 1GB, 1)
+        $filled = if ($vramTotalGb -gt 0) { [int]([math]::Min(($vramUsedGb / $vramTotalGb) * 12, 12)) } else { 0 }
+        $empty = 12 - $filled
+        $bar = ("█" * $filled) + ("░" * $empty)
+
+        # Color logic
+        $barColor = if ($vramUsedGb -lt 5 -and $running) { $red } else { $blue }
+        if (-not $running) { $barColor = $gray }
+        $busyColor = if ($gpuBusy -gt 0) { $amber } else { $gray }
+
+        $gpuLabel = "{0}GPU{1}{2}{3}" -f $teal, $gpuId, $reset, $white
+        $nameLabel = "  {0,-10}" -f $gpuName
+        $barStr = "{0} {1} {2}" -f $barColor, $bar, $reset
+        $vramStr = "{0,-5}/{1,-5} GB" -f $vramUsedGb, $vramTotalGb
+        $busyStr = "{0}{1,-4}%{2}" -f $busyColor, $gpuBusy, $reset
+
+        $statusDot = if ($running) { "{0}●{1}" -f $teal, $reset } else { "{0}●{1}" -f $red, $reset }
+
+        Write-Host ("  ${statusDot} ${gpuLabel} ${nameLabel}${barStr} ${vramStr}  ${busyStr}")
+    }
+}
+
 # ── UI: Header ────────────────────────────────────────────────────────────
 
 function Show-Header {
@@ -248,7 +295,7 @@ function Show-Header {
 
     # Line 1 — logo + tagline
     $logo    = "{0}LL{1}a{2}M{3}esa{4}" -f $teal, $amber, $teal, $amber, $reset
-    $tagline = "{0}local inference control plane · v0.1{1}" -f $dim, $reset
+    $tagline = "{0}local inference control plane · v0.2{1}" -f $dim, $reset
     Write-Host ("{0} {1}" -f $logo, $tagline)
 
     # Line 2 — server dot + name + host + port
@@ -258,6 +305,9 @@ function Show-Header {
         Write-Host ("  {0} {1}{2}{3} · {4}{5}{3} · {4}{6}{3}" -f `
             $dot, $teal, $Script:ActiveServerName, $reset, $gray, $Script:ActiveServer.host, $port)
     }
+
+    # GPU rows
+    Show-GpuRow $Script:GpuStatus
 
     # Lines 3-7 — stat cards
     if ($status) {
@@ -426,6 +476,28 @@ function Show-Menu {
     Row "/quit"    "exit"
 }
 
+# ── GPU Picker ────────────────────────────────────────────────────────────
+
+function Show-GpuPicker {
+    # If only one GPU, skip picker
+    if (-not $Script:GpuStatus -or $Script:GpuStatus.Count -le 1) {
+        return 0
+    }
+
+    Write-Host ""
+    Write-Host ("  {0}Which GPU?{1}" -f $white, $reset)
+    for ($i = 0; $i -lt $Script:GpuStatus.Count; $i++) {
+        $g = $Script:GpuStatus[$i]
+        $vram = if ($g.vram_total_bytes) { [math]::Round($g.vram_total_bytes / 1GB) } else { 0 }
+        Write-Host ("    {0}  GPU{1} {2,-12} {3} GB" -f ($i + 1).ToString(), $g.gpu_id, $g.gpu_name, $vram)
+    }
+    Write-Host ""
+    $choice = Read-Host ">"
+    $idx = [int]$choice - 1
+    if ($idx -lt 0 -or $idx -ge $Script:GpuStatus.Count) { return 0 }
+    return $Script:GpuStatus[$idx].gpu_id
+}
+
 # ── Command: /start ───────────────────────────────────────────────────────
 
 function Cmd-Start {
@@ -458,6 +530,9 @@ function Cmd-Start {
 
     $selectedModel = $models[$idx].name
 
+    # GPU picker
+    $gpuId = Show-GpuPicker
+
     # Ask for options
     $thinkingInput = Read-Host "Thinking mode? [on/off]"
     $thinking = if ($thinkingInput -match '^(on|yes|true|1)$') { "true" } else { "false" }
@@ -466,9 +541,10 @@ function Cmd-Start {
     if (-not $ctx) { $ctx = "131072" }
 
     Write-Host ""
-    Write-Host ("{0}Starting {1}...{2}" -f $cyan, $selectedModel, $reset)
+    $gpuLabel = if ($gpuId) { " on GPU${gpuId}" } else { "" }
+    Write-Host ("{0}Starting {1}{2}...{3}" -f $cyan, $selectedModel, $gpuLabel, $reset)
 
-    $raw = Invoke-ServerCommand ("start --model ""{0}"" --thinking {1} --ctx {2}" -f $selectedModel, $thinking, $ctx) -raw
+    $raw = Invoke-ServerCommand ("start --model ""{0}"" --gpu {1} --thinking {2} --ctx {3}" -f $selectedModel, $gpuId, $thinking, $ctx) -raw
     Write-Host ($raw -join "`n")
 
     # Poll until loaded
@@ -487,8 +563,36 @@ function Cmd-Start {
 # ── Command: /stop ────────────────────────────────────────────────────────
 
 function Cmd-Stop {
-    Write-Host ("{0}Stopping server...{1}" -f $cyan, $reset)
-    $raw = Invoke-ServerCommand "stop" -raw
+    # Check how many GPUs are running
+    $runningGpus = @()
+    if ($Script:GpuStatus -is [array]) {
+        $runningGpus = $Script:GpuStatus | Where-Object { $_.running -eq $true }
+    } elseif ($Script:GpuStatus -and $Script:GpuStatus.running) {
+        $runningGpus = @($Script:GpuStatus)
+    }
+
+    $gpuArg = "0"  # default
+    if ($runningGpus.Count -gt 1) {
+        Write-Host ("  {0}Stop which GPU?{1}" -f $white, $reset)
+        for ($i = 0; $i -lt $runningGpus.Count; $i++) {
+            $g = $runningGpus[$i]
+            Write-Host ("    {0}  GPU{1} {2}" -f ($i + 1).ToString(), $g.gpu_id, $g.gpu_name)
+        }
+        Write-Host ("    {0}  Both" -f ($runningGpus.Count + 1).ToString())
+        Write-Host ""
+        $choice = Read-Host ">"
+        $idx = [int]$choice
+        if ($idx -le $runningGpus.Count) {
+            $gpuArg = $runningGpus[$idx - 1].gpu_id
+        } else {
+            $gpuArg = "all"
+        }
+    } elseif ($runningGpus.Count -eq 1) {
+        $gpuArg = $runningGpus[0].gpu_id
+    }
+
+    Write-Host ("{0}Stopping GPU {1}...{2}" -f $cyan, $gpuArg, $reset)
+    $raw = Invoke-ServerCommand ("stop --gpu {0}" -f $gpuArg) -raw
     Write-Host ($raw -join "`n")
 }
 
@@ -523,7 +627,13 @@ function Cmd-Restart {
 
     # Fire-and-forget: launch start detached so SSH returns immediately.
     # nohup + & + redirected output lets the SSH session close without killing the process.
-    $startCmd = "nohup bash ${llamesaPath} start --model `"${modelName}`" --thinking ${thinking} --ctx ${ctx} >> ~/.llamesa/restart.log 2>&1 &"
+    # Get GPU id from running status
+    $gpuArg = 0
+    if ($Script:GpuStatus -is [array]) {
+        $rg = $Script:GpuStatus | Where-Object { $_.running -eq $true } | Select-Object -First 1
+        if ($rg) { $gpuArg = $rg.gpu_id }
+    }
+    $startCmd = "nohup bash ${llamesaPath} start --model `"${modelName}`" --gpu ${gpuArg} --thinking ${thinking} --ctx ${ctx} >> ~/.llamesa/restart.log 2>&1 &"
     ssh -o BatchMode=yes -o ConnectTimeout=5 "${sshUser}@${sshHost}" $startCmd 2>$null | Out-Null
 
     # Poll /health directly over HTTP — no SSH held open during the long load wait

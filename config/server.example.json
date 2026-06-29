@@ -5,5 +5,30 @@
   "default_context": 131072,
   "default_gpu_layers": 99,
   "default_thinking": true,
-  "port": 1234
+  "gpus": [
+    {
+      "id": 0,
+      "name": "R9700",
+      "port": 1234,
+      "vram_gb": 32,
+      "hip_device": 0,
+      "drm_card": 0,
+      "env": {
+        "RADV_DEBUG": "nocompute",
+        "GPU_MAX_HW_QUEUES": "1"
+      }
+    },
+    {
+      "id": 1,
+      "name": "RX9060XT",
+      "port": 1235,
+      "vram_gb": 16,
+      "hip_device": 1,
+      "drm_card": 1,
+      "env": {
+        "GGML_CUDA_NO_PEER_COPY": "1",
+        "HSA_OVERRIDE_GFX_VERSION": "12.0.1"
+      }
+    }
+  ]
 }

@@ -5,11 +5,33 @@
 
 set -euo pipefail
 
+# ── Global GPU selection ───────────────────────────────────────────────────
+# Parse --gpu before everything else so all downstream logic can use GPU_ID
+GPU_ID=0
+_gpu_val=""
+for ((_i=0; _i<${#@}; _i++)); do
+    if [[ "${!_i}" == "--gpu" ]] && (( _i + 1 < ${#@} )); then
+        _gpu_val="${!((_i+1))}"
+        break
+    fi
+done
+if [[ -n "$_gpu_val" ]]; then
+    if [[ "$_gpu_val" != "all" ]] && ! [[ "$_gpu_val" =~ ^[0-9]+$ ]]; then
+        echo "[ERROR] Invalid GPU ID: $_gpu_val. Use 0, 1, or 'all'.">&2
+        exit 1
+    fi
+    GPU_ID="$_gpu_val"
+fi
+
 # ── Paths ────────────────────────────────────────────────────────────────
 LLAMESA_DIR="${HOME}/.llamesa"
 CONFIG_FILE="${LLAMESA_DIR}/config.json"
-SERVER_PID_FILE="${LLAMESA_DIR}/server.pid"
-SERVER_LOG_FILE="${LLAMESA_DIR}/server.log"
+PID_FILE="${LLAMESA_DIR}/server-gpu${GPU_ID}.pid"
+LOG_FILE="${LLAMESA_DIR}/server-gpu${GPU_ID}.log"
+
+# Backward compat aliases — old code paths reference these names
+SERVER_PID_FILE="$PID_FILE"
+SERVER_LOG_FILE="$LOG_FILE"
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -57,7 +79,6 @@ read_config() {
     DEFAULT_CTX=$(json_get_raw "default_context")
     DEFAULT_GPU_LAYERS=$(json_get_raw "default_gpu_layers")
     DEFAULT_THINKING=$(json_get_raw "default_thinking")
-    PORT=$(json_get_raw "port")
 
     # Defaults if missing
     MODELS_DIR="${MODELS_DIR:-/var/mnt/games/models}"
@@ -66,7 +87,48 @@ read_config() {
     DEFAULT_CTX="${DEFAULT_CTX:-131072}"
     DEFAULT_GPU_LAYERS="${DEFAULT_GPU_LAYERS:-99}"
     DEFAULT_THINKING="${DEFAULT_THINKING:-true}"
-    PORT="${PORT:-1234}"
+
+    # Backward compat: if gpus array exists, use GPU-specific port; otherwise fall back to legacy port field
+    local has_gpus
+    has_gpus=$(jq -r '.gpus // empty' "$CONFIG_FILE" 2>/dev/null || true)
+    if [[ -n "$has_gpus" ]]; then
+        get_gpu_config "${GPU_ID}"
+    else
+        # Legacy single-port config
+        PORT=$(json_get_raw "port")
+        PORT="${PORT:-1234}"
+        warn "Legacy config detected — single GPU mode. Consider running install.sh to upgrade."
+        # Set GPU vars from legacy config for compatibility
+        GPU_PORT="$PORT"
+        GPU_NAME="GPU0"
+        GPU_HIP_DEVICE=0
+        GPU_DRM_CARD=0
+        GPU_ENV=""
+    fi
+}
+
+# Extract a GPU entry from config by ID. Populates GPU_PORT, GPU_NAME,
+# GPU_HIP_DEVICE, GPU_DRM_CARD, and GPU_ENV.
+get_gpu_config() {
+    local gpu_id="${1:-0}"
+    GPU_PORT=$(jq -r --argjson id "$gpu_id" '.gpus[] | select(.id == $id) | .port // 1234' "$CONFIG_FILE" 2>/dev/null)
+    GPU_NAME=$(jq -r --argjson id "$gpu_id" '.gpus[] | select(.id == $id) | .name // "GPU${id}"' "$CONFIG_FILE" 2>/dev/null)
+    GPU_HIP_DEVICE=$(jq -r --argjson id "$gpu_id" '.gpus[] | select(.id == $id) | .hip_device // $id' "$CONFIG_FILE" 2>/dev/null)
+    GPU_DRM_CARD=$(jq -r --argjson id "$gpu_id" '.gpus[] | select(.id == $id) | .drm_card // $id' "$CONFIG_FILE" 2>/dev/null)
+
+    # Build newline-separated export lines from .env object
+    GPU_ENV=$(jq -r --argjson id "$gpu_id" '.gpus[] | select(.id == $id) | .env // {} | to_entries[] | "\(.key)=\(.value)"' "$CONFIG_FILE" 2>/dev/null || true)
+
+    # Defaults
+    GPU_PORT="${GPU_PORT:-1234}"
+    GPU_NAME="${GPU_NAME:-GPU${gpu_id}}"
+    GPU_HIP_DEVICE="${GPU_HIP_DEVICE:-$gpu_id}"
+    GPU_DRM_CARD="${GPU_DRM_CARD:-$gpu_id}"
+}
+
+# GPU-aware port — used throughout the script
+gpu_port() {
+    echo "${GPU_PORT:-$PORT:-1234}"
 }
 
 # Ensure the distrobox container is running; start it if not
@@ -112,9 +174,10 @@ is_server_running() {
     fi
 
     # Fallback: check if llama-server is listening on the port
-    read_config 2>/dev/null || return 1
-    if ss -tlnp 2>/dev/null | grep -q ":${PORT:-1234}"; then
-        info "Server detected on port ${PORT:-1234} (PID file missing)"
+    local _check_port
+    _check_port=$(gpu_port)
+    if ss -tlnp 2>/dev/null | grep -q ":${_check_port}"; then
+        info "Server detected on port ${_check_port} (PID file missing)"
         return 0
     fi
 
@@ -194,127 +257,110 @@ cmd_list_models() {
 
 cmd_status() {
     read_config
+    if [[ "$GPU_ID" == "all" ]]; then
+        local gpu_count
+        gpu_count=$(jq '.gpus | length' "$CONFIG_FILE" 2>/dev/null || echo "1")
+        local -a gpu_statuses=()
+        for _gid in $(seq 0 $((gpu_count - 1))); do
+            gpu_statuses+=("$(cmd_status_single_gpu "$_gid")")
+        done
+        local total=${#gpu_statuses[@]}
+        local i=0
+        echo "["
+        for entry in "${gpu_statuses[@]}"; do
+            i=$((i + 1))
+            if [[ $i -lt $total ]]; then
+                echo "  ${entry},"
+            else
+                echo "  ${entry}"
+            fi
+        done
+        echo "]"
+        return 0
+    fi
+    cmd_status_single_gpu "${GPU_ID}"
+}
 
-    local running=false
-    local pid=""
-    local model="none"
-    local mmproj="false"
-    local thinking="false"
-    local ctx="0"
-
-    if pid=$(is_server_running 2>/dev/null); then
+cmd_status_single_gpu() {
+    local _sg_id="${1:-0}"
+    get_gpu_config "$_sg_id"
+    local running=false pid="" model="none" mmproj="false" thinking="false" ctx="0"
+    local _sg_port; _sg_port=$(gpu_port)
+    local _sg_pid_file="${LLAMESA_DIR}/server-gpu${_sg_id}.pid"
+    local _sg_log_file="${LLAMESA_DIR}/server-gpu${_sg_id}.log"
+    if [[ -f "$_sg_pid_file" ]]; then
+        pid=$(cat "$_sg_pid_file")
+        if kill -0 "$pid" 2>/dev/null; then running=true; fi
+    fi
+    if [[ "$running" == "false" ]] && ss -tlnp 2>/dev/null | grep -q ":${_sg_port}"; then
         running=true
-
-        # Try to get info from the /health endpoint
+    fi
+    if [[ "$running" == "true" ]]; then
         local health_response
-        if health_response=$(curl -s --max-time 3 "http://localhost:${PORT}/health" 2>/dev/null); then
-            # Parse mux.LLM version or other health info
-            info "Server healthy on port ${PORT}" >&2
+        if health_response=$(curl -s --max-time 3 "http://localhost:${_sg_port}/health" 2>/dev/null); then
+            info "Server healthy on port ${_sg_port} (GPU ${GPU_NAME})" >&2
         fi
-
-        # Try to get model info from /v1/models endpoint
         local models_response
-        if models_response=$(curl -s --max-time 3 "http://localhost:${PORT}/v1/models" 2>/dev/null); then
-            # Extract model filename from id field
+        if models_response=$(curl -s --max-time 3 "http://localhost:${_sg_port}/v1/models" 2>/dev/null); then
             local model_file
             model_file=$(echo "$models_response" | grep -o '"id": *"[^"]*"' | head -1 | grep -o '"[^"]*"$' | tr -d '"' || echo "")
-            # Resolve filename → parent directory name (the model folder name used by start)
             if [[ -n "$model_file" ]]; then
                 local model_path
                 model_path=$(find "$MODELS_DIR" -name "$model_file" -type f 2>/dev/null | head -1 || true)
-                if [[ -n "$model_path" ]]; then
-                    model=$(basename "$(dirname "$model_path")")
-                else
-                    model="$model_file"
-                fi
-            else
-                model="unknown"
-            fi
-            # Parse n_ctx from /v1/models response
+                if [[ -n "$model_path" ]]; then model=$(basename "$(dirname "$model_path")")
+                else model="$model_file"; fi
+            else model="unknown"; fi
             local ctx_val
             ctx_val=$(echo "$models_response" | grep -o '"n_ctx": *[0-9]*' | grep -o '[0-9]*$' | head -1 || true)
             [[ -n "$ctx_val" ]] && ctx="$ctx_val"
         fi
-
-        # Read thinking from last_session.json (authoritative source)
         if [[ -f "${LLAMESA_DIR}/last_session.json" ]]; then
             local sess_thinking
             sess_thinking=$(grep -o '"thinking": *[^,}]*' "${LLAMESA_DIR}/last_session.json" | awk '{print $2}' | tr -d ' \r\n' || true)
             [[ "$sess_thinking" == "true" || "$sess_thinking" == "false" ]] && thinking="$sess_thinking"
         fi
-
-        # Try to get stats from /health endpoint for GPU info
-        local vram_used=0
-        local vram_total=0
-        local gpu_busy=0
-        local cpu_percent=0
-        local ram_used=0
-        local ram_total=0
-
-        # Get VRAM + GPU utilization from rocm-smi inside container via podman exec
+        local vram_used=0 vram_total=0 gpu_busy=0 cpu_percent=0 ram_used=0 ram_total=0
+        local drm_path="/sys/class/drm/card${GPU_DRM_CARD}/device"
+        if [[ -d "$drm_path" ]]; then
+            vram_used=$(cat "${drm_path}/mem_info_vram_used" 2>/dev/null || echo "0")
+            vram_total=$(cat "${drm_path}/mem_info_vram_total" 2>/dev/null || echo "0")
+        else
+            warn "DRM sysfs path ${drm_path} not found - VRAM stats unavailable" >&2
+        fi
         local container_id
         container_id=$(podman ps --filter "name=^${CONTAINER}$" --format "{{.ID}}" 2>/dev/null | head -1 || true)
         if [[ -n "$container_id" ]]; then
-            # VRAM usage
-            local rocm_vram_output
-            if rocm_vram_output=$(podman exec "$container_id" bash -c "rocm-smi --showmeminfo vram 2>/dev/null" 2>/dev/null); then
-                local used_bytes total_bytes
-                used_bytes=$(echo "$rocm_vram_output" | grep -i "VRAM Total Used Memory" | grep -o '[0-9]*$' || echo "")
-                total_bytes=$(echo "$rocm_vram_output" | grep -i "VRAM Total Memory (B)" | grep -v "Used" | grep -o '[0-9]*$' || echo "")
-                if [[ -n "$used_bytes" ]]; then
-                    vram_used=$used_bytes
-                fi
-                if [[ -n "$total_bytes" ]]; then
-                    vram_total=$total_bytes
-                fi
+            local rocm_metrics_output
+            if rocm_metrics_output=$(podman exec "$container_id" bash -c "rocm-smi --showmetrics 2>/dev/null" 2>/dev/null); then
+                local gfx_activity
+                gfx_activity=$(echo "$rocm_metrics_output" | grep -i "average_gfx_activity" | grep -o '[0-9]*$' || echo "")
+                if [[ -n "$gfx_activity" && "$gfx_activity" != "0" ]]; then gpu_busy=$gfx_activity; fi
             fi
-
-		# GPU busy % from rocm-smi --showmetrics (average_gfx_activity)
-		local rocm_metrics_output
-		if rocm_metrics_output=$(podman exec "$container_id" bash -c "rocm-smi --showmetrics 2>/dev/null" 2>/dev/null); then
-			local gfx_activity
-			gfx_activity=$(echo "$rocm_metrics_output" | grep -i "average_gfx_activity" | grep -o '[0-9]*$' || echo "")
-			if [[ -n "$gfx_activity" && "$gfx_activity" != "0" ]]; then
-				gpu_busy=$gfx_activity
-			fi
-		fi
         fi
-
-        # CPU and RAM from standard tools
         cpu_percent=$(top -bn1 2>/dev/null | grep "Cpu(s)" | awk '{print $2}' | cut -d'%' -f1 || echo "0")
         ram_used=$(free -m 2>/dev/null | awk '/^Mem:/{print $3}' || echo "0")
         ram_total=$(free -m 2>/dev/null | awk '/^Mem:/{print $2}' || echo "0")
-
-        # Calculate uptime from PID
         local uptime_str="00:00:00"
         if [[ -n "$pid" ]] && [[ -d "/proc/$pid" ]]; then
-            local start_time
+            local start_time now elapsed
             start_time=$(stat -c%Y "/proc/$pid" 2>/dev/null || echo "0")
-            local now
-            now=$(date +%s)
-            local elapsed=$((now - start_time))
-            local hours=$((elapsed / 3600))
-            local minutes=$(( (elapsed % 3600) / 60 ))
-            local seconds=$((elapsed % 60))
-            uptime_str=$(printf "%02d:%02d:%02d" $hours $minutes $seconds)
+            now=$(date +%s); elapsed=$((now - start_time))
+            uptime_str=$(printf "%02d:%02d:%02d" $((elapsed/3600)) $(((elapsed%3600)/60)) $((elapsed%60)))
+        fi
+        if [[ -f "$_sg_log_file" ]]; then
+            mmproj=$(grep -q '\-\-mmproj' "$_sg_log_file" 2>/dev/null && echo "true" || echo "false")
         fi
 
-        # ctx and thinking are now sourced from /v1/models and last_session.json above
-
-        # Check mmproj from start log
-        if [[ -f "$SERVER_LOG_FILE" ]]; then
-            mmproj=$(grep -q '\-\-mmproj' "$SERVER_LOG_FILE" 2>/dev/null && echo "true" || echo "false")
-        fi
-
-        # Output JSON status
         cat <<EOF
 {
-  "running": ${running},
+  "gpu_id": ${_sg_id},
+  "gpu_name": "${GPU_NAME}",
+  "running": true,
   "model": "${model}",
   "mmproj": ${mmproj},
   "thinking": ${thinking},
   "ctx": ${ctx:-0},
-  "port": ${PORT},
+  "port": ${_sg_port},
   "uptime": "${uptime_str}",
   "vram_used_bytes": ${vram_used},
   "vram_total_bytes": ${vram_total},
@@ -325,18 +371,25 @@ cmd_status() {
 }
 EOF
     else
-        # Server not running
+        local vram_used=0 vram_total=0
+        local drm_path="/sys/class/drm/card${GPU_DRM_CARD}/device"
+        if [[ -d "$drm_path" ]]; then
+            vram_used=$(cat "${drm_path}/mem_info_vram_used" 2>/dev/null || echo "0")
+            vram_total=$(cat "${drm_path}/mem_info_vram_total" 2>/dev/null || echo "0")
+        fi
         cat <<EOF
 {
+  "gpu_id": ${_sg_id},
+  "gpu_name": "${GPU_NAME}",
   "running": false,
-  "model": "none",
+  "model": null,
   "mmproj": false,
   "thinking": false,
   "ctx": 0,
-  "port": ${PORT},
-  "uptime": "00:00:00",
-  "vram_used_bytes": 0,
-  "vram_total_bytes": 0,
+  "port": ${_sg_port},
+  "uptime": null,
+  "vram_used_bytes": ${vram_used},
+  "vram_total_bytes": ${vram_total},
   "gpu_busy_percent": 0,
   "cpu_percent": 0,
   "ram_used_mb": 0,
@@ -374,7 +427,8 @@ cmd_start() {
         *) thinking="false" ;;
     esac
 
-    local use_port="${port_override:-$PORT}"
+    local use_port="${port_override:-$GPU_PORT}"
+    export HIP_VISIBLE_DEVICES="$GPU_HIP_DEVICE"
 
     if [[ -z "$model_name" ]]; then
         error "Model name required. Use --model <name>"
@@ -457,14 +511,24 @@ cmd_start() {
     local full_cmd="${cmd_args[*]}"
     info "Launching llama-server in container '${CONTAINER}'..."
 
+    # Build env exports for the container launch
+    local env_exports="export HIP_VISIBLE_DEVICES=$GPU_HIP_DEVICE"
+    if [[ -n "$GPU_ENV" ]]; then
+        env_exports="$env_exports
+$(echo "$GPU_ENV" | sed 's/^/export /')"
+    fi
+
     # Start server as detached daemon via podman exec -d (survives distrobox session exit)
-    run_in_container_detached "${full_cmd} >> ${SERVER_LOG_FILE} 2>&1"
+    run_in_container_detached "
+$env_exports
+${full_cmd} >> ${LOG_FILE} 2>&1
+"
     sleep 1
     # Get the PID of the launched process
     local server_pid
     server_pid=$(distrobox enter -T "$CONTAINER" -- bash -c "pgrep -f 'llama-server.*${use_port}' | head -1" 2>/dev/null || true)
     if [[ -n "$server_pid" ]]; then
-        echo "$server_pid" > "$SERVER_PID_FILE"
+        echo "$server_pid" > "$PID_FILE"
         info "Server started with PID ${server_pid}"
     else
         info "Server launched (PID unavailable)"
@@ -505,26 +569,53 @@ EOF
 cmd_stop() {
     read_config
 
-    if ! is_server_running >/dev/null 2>&1; then
-        info "Server is not running."
+    if [[ "$GPU_ID" == "all" ]]; then
+        local gpu_count
+        gpu_count=$(jq '.gpus | length' "$CONFIG_FILE" 2>/dev/null || echo "1")
+        for _i in $(seq 0 $((gpu_count - 1))); do
+            info "Stopping GPU ${_i}..."
+            _do_stop "$_i"
+        done
+        info "All GPUs stopped."
         echo '{"running":false}'
         return 0
     fi
 
-    info "Stopping llama-server inside container '${CONTAINER}'..."
+    _do_stop "$GPU_ID"
+}
+
+_do_stop() {
+    local _d_id="${1:-0}"
+    local _d_pid_file="${LLAMESA_DIR}/server-gpu${_d_id}.pid"
+    local _d_running=false
+
+    if [[ -f "$_d_pid_file" ]]; then
+        local _d_pid
+        _d_pid=$(cat "$_d_pid_file")
+        if kill -0 "$_d_pid" 2>/dev/null; then _d_running=true; fi
+    fi
+
+    if [[ "$_d_running" == "false" ]]; then
+        info "GPU ${_d_id}: Server is not running."
+        return 0
+    fi
+
+    info "Stopping llama-server on GPU ${_d_id} inside container '${CONTAINER}'..."
     local container_id
     container_id=$(podman ps --filter "name=^${CONTAINER}$" --format "{{.ID}}" 2>/dev/null | head -1)
 
     if [[ -n "$container_id" ]]; then
-        podman exec "$container_id" bash -c "pkill -f 'llama-server' 2>/dev/null || true"
+        get_gpu_config "$_d_id"
+        local _d_port
+        _d_port=$(gpu_port)
+        # Kill only the instance on this GPU's port
+        podman exec "$container_id" bash -c "pkill -f 'llama-server.*--port ${_d_port}' 2>/dev/null || true"
         sleep 2
-        # Force kill if still running
-        podman exec "$container_id" bash -c "pkill -9 -f 'llama-server' 2>/dev/null || true"
+        podman exec "$container_id" bash -c "pkill -9 -f 'llama-server.*--port ${_d_port}' 2>/dev/null || true"
     fi
 
-    rm -f "$SERVER_PID_FILE"
-    info "Server stopped."
-    echo '{"running":false}'
+    rm -f "$_d_pid_file"
+    info "GPU ${_d_id}: Server stopped."
 }
 
 cmd_restart() {
