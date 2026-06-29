@@ -8,26 +8,32 @@ set -euo pipefail
 # ── Global GPU selection ───────────────────────────────────────────────────
 # Parse --gpu before everything else so all downstream logic can use GPU_ID
 GPU_ID=0
-_gpu_val=""
-for ((_i=0; _i<${#@}; _i++)); do
-    if [[ "${!_i}" == "--gpu" ]] && (( _i + 1 < ${#@} )); then
-        _gpu_val="${!((_i+1))}"
-        break
+_remaining_args=()
+_i=0
+_args=("$@")
+while [[ $_i -lt ${#_args[@]} ]]; do
+    if [[ "${_args[$_i]}" == "--gpu" ]]; then
+        _i=$(( _i + 1 ))
+        _gpu_val="${_args[$_i]:-}"
+        if [[ "$_gpu_val" != "all" ]] && ! [[ "$_gpu_val" =~ ^[0-9]+$ ]]; then
+            echo "[ERROR] Invalid GPU ID: $_gpu_val. Use 0, 1, or 'all'." >&2
+            exit 1
+        fi
+        GPU_ID="$_gpu_val"
+    else
+        _remaining_args+=("${_args[$_i]}")
     fi
+    _i=$(( _i + 1 ))
 done
-if [[ -n "$_gpu_val" ]]; then
-    if [[ "$_gpu_val" != "all" ]] && ! [[ "$_gpu_val" =~ ^[0-9]+$ ]]; then
-        echo "[ERROR] Invalid GPU ID: $_gpu_val. Use 0, 1, or 'all'.">&2
-        exit 1
-    fi
-    GPU_ID="$_gpu_val"
-fi
+set -- "${_remaining_args[@]+"${_remaining_args[@]}"}"
 
 # ── Paths ────────────────────────────────────────────────────────────────
 LLAMESA_DIR="${HOME}/.llamesa"
 CONFIG_FILE="${LLAMESA_DIR}/config.json"
-PID_FILE="${LLAMESA_DIR}/server-gpu${GPU_ID}.pid"
-LOG_FILE="${LLAMESA_DIR}/server-gpu${GPU_ID}.log"
+_pid_gpu_id="${GPU_ID}"
+[[ "$_pid_gpu_id" == "all" ]] && _pid_gpu_id=0
+PID_FILE="${LLAMESA_DIR}/server-gpu${_pid_gpu_id}.pid"
+LOG_FILE="${LLAMESA_DIR}/server-gpu${_pid_gpu_id}.log"
 
 # Backward compat aliases — old code paths reference these names
 SERVER_PID_FILE="$PID_FILE"
@@ -73,26 +79,21 @@ check_config() {
 # Read config values
 read_config() {
     check_config
-    MODELS_DIR=$(json_get "models_dir")
-    LLAMA_BINARY=$(json_get "llama_binary")
-    CONTAINER=$(json_get "distrobox_container")
-    DEFAULT_CTX=$(json_get_raw "default_context")
-    DEFAULT_GPU_LAYERS=$(json_get_raw "default_gpu_layers")
-    DEFAULT_THINKING=$(json_get_raw "default_thinking")
+    MODELS_DIR=$(jq -r '.models_dir // "/var/mnt/games/models"' "$CONFIG_FILE")
+    LLAMA_BINARY=$(jq -r '.llama_binary // ""' "$CONFIG_FILE")
+    CONTAINER=$(jq -r '.distrobox_container // "rocm-r9700"' "$CONFIG_FILE")
+    DEFAULT_CTX=$(jq -r '.default_context // 131072' "$CONFIG_FILE")
+    DEFAULT_GPU_LAYERS=$(jq -r '.default_gpu_layers // 99' "$CONFIG_FILE")
+    DEFAULT_THINKING=$(jq -r '.default_thinking // true' "$CONFIG_FILE")
 
-    # Defaults if missing
-    MODELS_DIR="${MODELS_DIR:-/var/mnt/games/models}"
-    LLAMA_BINARY="${LLAMA_BINARY:-}"
-    CONTAINER="${CONTAINER:-rocm-r9700}"
-    DEFAULT_CTX="${DEFAULT_CTX:-131072}"
-    DEFAULT_GPU_LAYERS="${DEFAULT_GPU_LAYERS:-99}"
-    DEFAULT_THINKING="${DEFAULT_THINKING:-true}"
 
     # Backward compat: if gpus array exists, use GPU-specific port; otherwise fall back to legacy port field
     local has_gpus
     has_gpus=$(jq -r '.gpus // empty' "$CONFIG_FILE" 2>/dev/null || true)
     if [[ -n "$has_gpus" ]]; then
-        get_gpu_config "${GPU_ID}"
+        local _gc_id="${GPU_ID:-0}"
+        [[ "$_gc_id" == "all" ]] && _gc_id=0
+        get_gpu_config "$_gc_id"
     else
         # Legacy single-port config
         PORT=$(json_get_raw "port")
@@ -128,7 +129,7 @@ get_gpu_config() {
 
 # GPU-aware port — used throughout the script
 gpu_port() {
-    echo "${GPU_PORT:-$PORT:-1234}"
+    echo "${GPU_PORT:-${PORT:-1234}}"
 }
 
 # Ensure the distrobox container is running; start it if not
@@ -298,7 +299,7 @@ cmd_status_single_gpu() {
     if [[ "$running" == "true" ]]; then
         local health_response
         if health_response=$(curl -s --max-time 3 "http://localhost:${_sg_port}/health" 2>/dev/null); then
-            info "Server healthy on port ${_sg_port} (GPU ${GPU_NAME})" >&2
+            info "Server healthy on port ${_sg_port} (GPU ${GPU_NAME})"
         fi
         local models_response
         if models_response=$(curl -s --max-time 3 "http://localhost:${_sg_port}/v1/models" 2>/dev/null); then
@@ -327,15 +328,10 @@ cmd_status_single_gpu() {
         else
             warn "DRM sysfs path ${drm_path} not found - VRAM stats unavailable" >&2
         fi
-        local container_id
-        container_id=$(podman ps --filter "name=^${CONTAINER}$" --format "{{.ID}}" 2>/dev/null | head -1 || true)
-        if [[ -n "$container_id" ]]; then
-            local rocm_metrics_output
-            if rocm_metrics_output=$(podman exec "$container_id" bash -c "rocm-smi --showmetrics 2>/dev/null" 2>/dev/null); then
-                local gfx_activity
-                gfx_activity=$(echo "$rocm_metrics_output" | grep -i "average_gfx_activity" | grep -o '[0-9]*$' || echo "")
-                if [[ -n "$gfx_activity" && "$gfx_activity" != "0" ]]; then gpu_busy=$gfx_activity; fi
-            fi
+        # GPU utilisation via sysfs (rocm-smi is not invoked here)
+        local gpu_busy_path="/sys/class/drm/card${GPU_DRM_CARD}/device/gpu_busy_percent"
+        if [[ -f "$gpu_busy_path" ]]; then
+            gpu_busy=$(cat "$gpu_busy_path" 2>/dev/null || echo "0")
         fi
         cpu_percent=$(top -bn1 2>/dev/null | grep "Cpu(s)" | awk '{print $2}' | cut -d'%' -f1 || echo "0")
         ram_used=$(free -m 2>/dev/null | awk '/^Mem:/{print $3}' || echo "0")
@@ -411,6 +407,7 @@ cmd_start() {
     # Parse CLI args
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            --gpu) gpu_cli_id="$2"; shift 2 ;;   # already consumed globally
             --model) model_name="$2"; shift 2 ;;
             --thinking) thinking="$2"; shift 2 ;;
             --ctx) ctx="$2"; shift 2 ;;
@@ -549,7 +546,8 @@ ${full_cmd} >> ${LOG_FILE} 2>&1
   "thinking": ${thinking},
   "ctx": ${ctx},
   "gpu_layers": ${gpu_layers},
-  "port": ${use_port}
+  "port": ${use_port},
+  "gpu_id": ${GPU_ID}
 }
 EOF
             cmd_status
@@ -638,6 +636,13 @@ cmd_restart() {
     fi
 
     info "Restarting with: model=${model_name} thinking=${thinking} ctx=${ctx}"
+    local gpu_id_saved
+    gpu_id_saved=$(jq -r '.gpu_id // 0' "$session_file")
+    GPU_ID="$gpu_id_saved"
+    PID_FILE="${LLAMESA_DIR}/server-gpu${GPU_ID}.pid"
+    LOG_FILE="${LLAMESA_DIR}/server-gpu${GPU_ID}.log"
+    SERVER_PID_FILE="$PID_FILE"
+    SERVER_LOG_FILE="$LOG_FILE"
     cmd_stop
     sleep 3
     cmd_start --model "$model_name" --thinking "$thinking" --ctx "$ctx"
@@ -805,6 +810,10 @@ usage() {
 LLaMesa — local inference control plane v0.1.1
 
 Usage: llamesa.sh <command> [options]
+
+Global options:
+  --gpu <id|all>    Target GPU by ID (0, 1, ...) or 'all' for multi-GPU ops
+                    Default: 0
 
 Commands:
   start       Start the inference server

@@ -179,10 +179,14 @@ function Get-ServerStatus {
 
     try {
         # Find the first line starting with [ and collect from there — skips any [INFO] prefix lines
-        $jsonStartIndex = 0
+        $jsonStartIndex = -1
         for ($i = 0; $i -lt $raw.Count; $i++) {
-            if ($raw[$i] -match '^\s*\[') { $jsonStartIndex = $i; break }
+            if ($raw[$i] -match '^\s*[\[{]' -and $raw[$i] -notmatch '^\s*\[(INFO|WARN|ERROR)\]') {
+                $jsonStartIndex = $i
+                break
+            }
         }
+        if ($jsonStartIndex -lt 0) { return $null }
         $jsonText = $raw[$jsonStartIndex..($raw.Count - 1)] -join "`n"
         $result = $jsonText | ConvertFrom-Json
         $Script:GpuStatus = $result
@@ -256,12 +260,12 @@ function Show-GpuRow {
     if ($gpus -isnot [array]) { $gpus = @($gpus) }
 
     foreach ($gpu in $gpus) {
-        $gpuId = if ($gpu.gpu_id) { $gpu.gpu_id } else { 0 }
-        $gpuName = if ($gpu.gpu_name) { $gpu.gpu_name } else { "GPU${gpuId}" }
-        $vramUsedBytes = if ($gpu.vram_used_bytes) { $gpu.vram_used_bytes } else { 0 }
-        $vramTotalBytes = if ($gpu.vram_total_bytes) { $gpu.vram_total_bytes } else { 0 }
-        $gpuBusy = if ($gpu.gpu_busy_percent) { $gpu.gpu_busy_percent } else { 0 }
-        $running = if ($gpu.running) { $true } else { $false }
+        $gpuId          = if ($null -ne $gpu.gpu_id)           { $gpu.gpu_id }           else { 0 }
+        $gpuName        = if ($null -ne $gpu.gpu_name)          { $gpu.gpu_name }         else { "GPU${gpuId}" }
+        $vramUsedBytes  = if ($null -ne $gpu.vram_used_bytes)   { $gpu.vram_used_bytes }  else { 0 }
+        $vramTotalBytes = if ($null -ne $gpu.vram_total_bytes)  { $gpu.vram_total_bytes } else { 0 }
+        $gpuBusy        = if ($null -ne $gpu.gpu_busy_percent)  { $gpu.gpu_busy_percent } else { 0 }
+        $running        = ($gpu.running -eq $true)
 
         $vramUsedGb = [math]::Round($vramUsedBytes / 1GB, 1)
         $vramTotalGb = [math]::Round($vramTotalBytes / 1GB, 1)
@@ -377,7 +381,14 @@ function Show-Header {
             $thinkingPill = if ($status.thinking) { "${teal}[thinking on]${r}"  } else { "${gray}[thinking off]${r}" }
             $ctxPill      = if ($status.ctx -gt 0){ "${teal}[ctx $($status.ctx)]${r}" } else { "" }
             $toksPill     = if ($Script:LastTokS) { "${amber}[$($Script:LastTokS) tok/s]${r}" } else { "" }
-            Write-Host ("  ${gray}MODEL${r}  ${white}$($status.model)${r}  ${ctxPill}  ${thinkingPill}  ${toksPill}")
+            $gpuPill = ""
+            if ($Script:GpuStatus -is [array]) {
+                $rg = $Script:GpuStatus | Where-Object { $_.running -eq $true } | Select-Object -First 1
+                if ($rg) { $gpuPill = "${gray}[GPU$($rg.gpu_id) $($rg.gpu_name)]${r}" }
+            } elseif ($Script:GpuStatus -and $Script:GpuStatus.running) {
+                $gpuPill = "${gray}[GPU$($Script:GpuStatus.gpu_id) $($Script:GpuStatus.gpu_name)]${r}"
+            }
+            Write-Host ("  ${gray}MODEL${r}  ${white}$($status.model)${r}  ${ctxPill}  ${thinkingPill}  ${toksPill}  ${gpuPill}")
         } else {
             Write-Host ("  ${gray}MODEL  none${r}")
         }
@@ -480,7 +491,7 @@ function Show-Menu {
 
 function Show-GpuPicker {
     # If only one GPU, skip picker
-    if (-not $Script:GpuStatus -or $Script:GpuStatus.Count -le 1) {
+    if (-not $Script:GpuStatus -or ($Script:GpuStatus -isnot [array]) -or $Script:GpuStatus.Count -le 1) {
         return 0
     }
 
@@ -494,7 +505,10 @@ function Show-GpuPicker {
     Write-Host ""
     $choice = Read-Host ">"
     $idx = [int]$choice - 1
-    if ($idx -lt 0 -or $idx -ge $Script:GpuStatus.Count) { return 0 }
+    if ($idx -lt 0 -or $idx -ge $Script:GpuStatus.Count) {
+        Write-Host ("{0}Invalid selection. Defaulting to GPU 0.{1}" -f $amber, $reset)
+        return 0
+    }
     return $Script:GpuStatus[$idx].gpu_id
 }
 
@@ -694,20 +708,41 @@ function Cmd-Models {
 # ── Command: /logs ────────────────────────────────────────────────────────
 
 function Cmd-Logs {
-    Write-Host ("{0}Streaming server logs... (press Ctrl+C to exit){1}" -f $cyan, $reset)
+    $sshUser     = $Script:ActiveServer.ssh_user
+    $sshHost     = $Script:ActiveServer.host
+    $llamesaPath = $Script:ActiveServer.llamesa_path
 
-    $sshUser = $Script:ActiveServer.ssh_user
-    $sshHost = $Script:ActiveServer.host
+    # Pick GPU — default 0; if a running GPU is known, use it
+    $gpuId = 0
+    if ($Script:GpuStatus -is [array]) {
+        $rg = $Script:GpuStatus | Where-Object { $_.running -eq $true } | Select-Object -First 1
+        if ($rg) { $gpuId = $rg.gpu_id }
+    } elseif ($Script:GpuStatus -and $Script:GpuStatus.running) {
+        $gpuId = $Script:GpuStatus.gpu_id
+    }
 
-    ssh "${sshUser}@${sshHost}" "tail -f ~/.llamesa/server.log"
+    ssh "${sshUser}@${sshHost}" "bash ${llamesaPath} logs --gpu ${gpuId}"
 }
 
 # ── Command: /health ──────────────────────────────────────────────────────
 
+# ── Helper: Get active GPU port ──────────────────────────────
+
+function Get-ActiveGpuPort {
+    if ($Script:GpuStatus -is [array]) {
+        $running = $Script:GpuStatus | Where-Object { $_.running -eq $true } | Select-Object -First 1
+        if ($running) { return $running.port }
+        return $Script:GpuStatus[0].port
+    } elseif ($Script:GpuStatus) {
+        return $Script:GpuStatus.port
+    }
+    return $Script:ActiveServer.port
+}
+
 function Cmd-Health {
     Write-Host ("{0}Checking server health...{1}" -f $cyan, $reset)
 
-    $port = $Script:ActiveServer.port
+    $port = Get-ActiveGpuPort
     $hostAddr = $Script:ActiveServer.host
 
     # Check /health endpoint
@@ -764,7 +799,7 @@ function Cmd-Chat {
     $Script:CurrentView = "chat"
     $Script:ChatHistory = @()
 
-    $port = $Script:ActiveServer.port
+    $port = Get-ActiveGpuPort
     $hostAddr = $Script:ActiveServer.host
 
     # Seed thinking mode from server status; user can toggle with /think and /nothink
