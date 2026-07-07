@@ -108,6 +108,30 @@ read_config() {
     fi
 }
 
+# Scan /sys/class/drm for the card whose VRAM total is closest to target_gb.
+# Uses nearest-match so kernel-reported values (e.g. 31GB for a 32GB card) still resolve correctly.
+# Falls back to fallback_card if no GPU sysfs entries found.
+_resolve_drm_card() {
+    local target_gb="${1:-0}"
+    local fallback_card="${2:-0}"
+    local card_path total_bytes gb
+    local best_card="$fallback_card"
+    local best_diff=99999
+    for card_path in /sys/class/drm/card*/device; do
+        [[ -f "${card_path}/mem_info_vram_total" ]] || continue
+        total_bytes=$(cat "${card_path}/mem_info_vram_total" 2>/dev/null || echo "0")
+        [[ "$total_bytes" -eq 0 ]] && continue
+        gb=$(( total_bytes / 1073741824 ))
+        local diff=$(( gb - target_gb ))
+        [[ $diff -lt 0 ]] && diff=$(( -diff ))
+        if [[ $diff -lt $best_diff ]]; then
+            best_diff=$diff
+            best_card=$(basename "$(dirname "$card_path")" | grep -o '[0-9]*$')
+        fi
+    done
+    echo "$best_card"
+}
+
 # Extract a GPU entry from config by ID. Populates GPU_PORT, GPU_NAME,
 # GPU_HIP_DEVICE, GPU_DRM_CARD, and GPU_ENV.
 get_gpu_config() {
@@ -115,7 +139,12 @@ get_gpu_config() {
     GPU_PORT=$(jq -r --argjson id "$gpu_id" '.gpus[] | select(.id == $id) | .port // 1234' "$CONFIG_FILE" 2>/dev/null)
     GPU_NAME=$(jq -r --argjson id "$gpu_id" '.gpus[] | select(.id == $id) | .name // "GPU${id}"' "$CONFIG_FILE" 2>/dev/null)
     GPU_HIP_DEVICE=$(jq -r --argjson id "$gpu_id" '.gpus[] | select(.id == $id) | .hip_device // $id' "$CONFIG_FILE" 2>/dev/null)
-    GPU_DRM_CARD=$(jq -r --argjson id "$gpu_id" '.gpus[] | select(.id == $id) | .drm_card // $id' "$CONFIG_FILE" 2>/dev/null)
+
+    # Resolve drm_card dynamically from VRAM size — immune to reboot reordering
+    local vram_gb config_drm_card
+    vram_gb=$(jq -r --argjson id "$gpu_id" '.gpus[] | select(.id == $id) | .vram_gb // 0' "$CONFIG_FILE" 2>/dev/null)
+    config_drm_card=$(jq -r --argjson id "$gpu_id" '.gpus[] | select(.id == $id) | .drm_card // empty' "$CONFIG_FILE" 2>/dev/null || echo "$gpu_id")
+    GPU_DRM_CARD=$(_resolve_drm_card "$vram_gb" "${config_drm_card:-$gpu_id}")
 
     # Build newline-separated export lines from .env object
     GPU_ENV=$(jq -r --argjson id "$gpu_id" '.gpus[] | select(.id == $id) | .env // {} | to_entries[] | "\(.key)=\(.value)"' "$CONFIG_FILE" 2>/dev/null || true)
@@ -124,7 +153,6 @@ get_gpu_config() {
     GPU_PORT="${GPU_PORT:-1234}"
     GPU_NAME="${GPU_NAME:-GPU${gpu_id}}"
     GPU_HIP_DEVICE="${GPU_HIP_DEVICE:-$gpu_id}"
-    GPU_DRM_CARD="${GPU_DRM_CARD:-$gpu_id}"
 }
 
 # GPU-aware port — used throughout the script
@@ -403,6 +431,7 @@ cmd_start() {
     local ctx="$DEFAULT_CTX"
     local gpu_layers="$DEFAULT_GPU_LAYERS"
     local port_override=""
+    local parallel="1"
 
     # Parse CLI args
     while [[ $# -gt 0 ]]; do
@@ -413,6 +442,11 @@ cmd_start() {
             --ctx) ctx="$2"; shift 2 ;;
             --gpu-layers) gpu_layers="$2"; shift 2 ;;
             --port) port_override="$2"; shift 2 ;;
+            --parallel) parallel="$2"
+                        if ! [[ "$parallel" =~ ^[1-4]$ ]]; then
+                            error "--parallel must be 1-4"
+                        fi
+                        shift 2 ;;
             *) error "Unknown option: $1" ;;
         esac
     done
@@ -477,6 +511,9 @@ cmd_start() {
         "--host" "0.0.0.0"
         "--log-file" "/tmp/llama-server.log"
     )
+    if [[ -n "$parallel" ]]; then
+        cmd_args+=("--parallel" "$parallel")
+    fi
 
     # Add mmproj if found
     local mmproj_file=""
@@ -547,7 +584,8 @@ ${full_cmd} >> ${LOG_FILE} 2>&1
   "ctx": ${ctx},
   "gpu_layers": ${gpu_layers},
   "port": ${use_port},
-  "gpu_id": ${GPU_ID}
+  "gpu_id": ${GPU_ID},
+  "parallel": ${parallel:-1}
 }
 EOF
             cmd_status
@@ -635,17 +673,23 @@ cmd_restart() {
         error "Could not read model from last session. Use 'start --model <name>' instead."
     fi
 
-    info "Restarting with: model=${model_name} thinking=${thinking} ctx=${ctx}"
-    local gpu_id_saved
+    local gpu_id_saved parallel_saved
     gpu_id_saved=$(jq -r '.gpu_id // 0' "$session_file")
+    parallel_saved=$(jq -r '.parallel // empty' "$session_file")
     GPU_ID="$gpu_id_saved"
     PID_FILE="${LLAMESA_DIR}/server-gpu${GPU_ID}.pid"
     LOG_FILE="${LLAMESA_DIR}/server-gpu${GPU_ID}.log"
     SERVER_PID_FILE="$PID_FILE"
     SERVER_LOG_FILE="$LOG_FILE"
+
+    info "Restarting with: model=${model_name} thinking=${thinking} ctx=${ctx} parallel=${parallel_saved:-auto}"
     cmd_stop
     sleep 3
-    cmd_start --model "$model_name" --thinking "$thinking" --ctx "$ctx"
+    if [[ -n "$parallel_saved" ]]; then
+        cmd_start --model "$model_name" --thinking "$thinking" --ctx "$ctx" --parallel "$parallel_saved"
+    else
+        cmd_start --model "$model_name" --thinking "$thinking" --ctx "$ctx"
+    fi
 }
 
 cmd_logs() {
@@ -821,6 +865,7 @@ Commands:
     --thinking <bool>   Enable thinking mode (default: ${DEFAULT_THINKING:-true})
     --ctx <n>           Context size (default: ${DEFAULT_CTX:-131072})
     --gpu-layers <n>    GPU layers (default: ${DEFAULT_GPU_LAYERS:-99})
+    --parallel <n>      Parallel slots / concurrent requests (default: 1, max: 4)
     --port <n>          Override port
 
   stop        Stop the inference server

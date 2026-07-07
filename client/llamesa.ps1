@@ -455,7 +455,7 @@ function Show-Menu {
             $hintStr = "${gray}${hint}${reset}"
             # Right-align hint: pad desc to fill space up to terminal width
             $ww = [Console]::WindowWidth
-            $plainLen = 2 + $cmd.Length + 2 + $desc.Length
+            $plainLen = 2 + 10 + 2 + $desc.Length
             $pad = [Math]::Max(1, $ww - $plainLen - $hint.Length - 2)
             Write-Host ("  ${white}$("{0,-10}" -f $cmd)${reset}  ${desc}$(" " * $pad)${hintStr}")
         } else {
@@ -554,11 +554,16 @@ function Cmd-Start {
     $ctx = Read-Host "Context size? [131072]"
     if (-not $ctx) { $ctx = "131072" }
 
+    $parallelInput = Read-Host "Parallel slots? [1-4, default: 1]"
+    if (-not $parallelInput) { $parallelInput = "1" }
+    $parallelInput = [math]::Max(1, [math]::Min(4, [int]$parallelInput))
+    $parallelArg = "--parallel $parallelInput"
+
     Write-Host ""
     $gpuLabel = if ($gpuId) { " on GPU${gpuId}" } else { "" }
     Write-Host ("{0}Starting {1}{2}...{3}" -f $cyan, $selectedModel, $gpuLabel, $reset)
 
-    $raw = Invoke-ServerCommand ("start --model ""{0}"" --gpu {1} --thinking {2} --ctx {3}" -f $selectedModel, $gpuId, $thinking, $ctx) -raw
+    $raw = Invoke-ServerCommand ("start --model ""{0}"" --gpu {1} --thinking {2} --ctx {3} {4}" -f $selectedModel, $gpuId, $thinking, $ctx, $parallelArg).Trim() -raw
     Write-Host ($raw -join "`n")
 
     # Poll until loaded
