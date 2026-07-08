@@ -32,6 +32,7 @@ $Script:RefreshTimer       = $null
 $Script:LastTokS           = $null   # updated after each /chat response; shown in header badge
 $Script:LastStatusRefresh  = $null   # tracks when stat cards were last fetched
 $Script:GpuStatus         = $null   # parsed GPU status array from --gpu all
+$Script:ActiveMode       = "single" # single, big, dual — tracks which kind of server was last started (local state only, never written to config)
 
 # ── JSON Helpers ──────────────────────────────────────────────────────────
 
@@ -195,6 +196,26 @@ function Get-ServerStatus {
             return $result[0]
         }
         return $result
+    } catch {
+        return $null
+    }
+}
+
+function Get-BigStatus {
+    $raw = Invoke-ServerCommand "status-big" -raw
+    if (-not $raw) { return $null }
+
+    try {
+        $jsonStartIndex = -1
+        for ($i = 0; $i -lt $raw.Count; $i++) {
+            if ($raw[$i] -match '^\s*[\[{]' -and $raw[$i] -notmatch '^\s*\[(INFO|WARN|ERROR)\]') {
+                $jsonStartIndex = $i
+                break
+            }
+        }
+        if ($jsonStartIndex -lt 0) { return $null }
+        $jsonText = $raw[$jsonStartIndex..($raw.Count - 1)] -join "`n"
+        return $jsonText | ConvertFrom-Json
     } catch {
         return $null
     }
@@ -441,6 +462,266 @@ function Show-Header {
     Write-Host ("${dim}$("─" * [Math]::Max($w - 1, 20))${reset}")
 }
 
+# ── UI: Big-mode header (Vulkan combined-VRAM) ───────────────────────────
+# Fully independent of Show-Header above — never calls or modifies it.
+# Which of the two renders is dispatched by Show-ActiveHeader below, based on
+# $Script:ActiveMode — not by a branch inside Show-Header itself.
+
+function Show-HeaderBig {
+    param($status = $null)
+
+    $w = [Console]::WindowWidth
+
+    # Line 1 — logo + tagline
+    $logo    = "{0}LL{1}a{2}M{3}esa{4}" -f $teal, $amber, $teal, $amber, $reset
+    $tagline = "{0}local inference control plane · v0.2 · Vulkan combined-VRAM{1}" -f $dim, $reset
+    Write-Host ("{0} {1}" -f $logo, $tagline)
+
+    # Line 2 — server dot + name + host + port
+    if ($Script:ActiveServerName) {
+        $dot  = if ($Script:ServerOnline) { "{0}●{1}" -f $teal, $reset } else { "{0}●{1}" -f $red, $reset }
+        $port = if ($status -and $status.port) { $status.port } else { $Script:ActiveServer.port }
+        Write-Host ("  {0} {1}{2}{3} · {4}{5}{3} · {4}{6}{3}" -f `
+            $dot, $teal, $Script:ActiveServerName, $reset, $gray, $Script:ActiveServer.host, $port)
+    }
+
+    # Per-device mini-bars, side-by-side, sourced from status-big's devices[]
+    if ($status -and $status.devices) {
+        foreach ($dev in $status.devices) {
+            $vramUsedGb  = [math]::Round($dev.vram_used_bytes  / 1GB, 1)
+            $vramTotalGb = [math]::Round($dev.vram_total_bytes / 1GB, 1)
+            $filled = if ($vramTotalGb -gt 0) { [int]([math]::Min(($vramUsedGb / $vramTotalGb) * 12, 12)) } else { 0 }
+            $empty  = 12 - $filled
+            $bar    = ("█" * $filled) + ("░" * $empty)
+            $barColor  = if ($status.running) { $blue } else { $gray }
+            $busyColor = if ($dev.gpu_busy_percent -gt 0) { $amber } else { $gray }
+
+            $devLabel = "{0}{1,-10}{2}" -f $teal, $dev.id, $reset
+            $barStr   = "{0} {1} {2}" -f $barColor, $bar, $reset
+            $vramStr  = "{0,-5}/{1,-5} GB" -f $vramUsedGb, $vramTotalGb
+            $busyStr  = "{0}{1,-4}%{2}" -f $busyColor, $dev.gpu_busy_percent, $reset
+
+            Write-Host ("  ${devLabel} ${barStr} ${vramStr}  ${busyStr}")
+        }
+    } else {
+        Write-Host ("  {0}no device data{1}" -f $gray, $reset)
+    }
+
+    # CPU/RAM stat cards — host-level, single instance (one process spans both GPUs)
+    if ($status) {
+        $cpu       = [double]($status.cpu_percent)
+        $ramUsedGb = [math]::Round($status.ram_used_mb  / 1024, 1)
+        $ramTotGb  = [math]::Round($status.ram_total_mb / 1024, 1)
+
+        $cpuCol = if ($cpu -gt 20)       { $red }   elseif ($cpu -gt 5)        { $amber } else { $teal }
+        $ramCol = if ($ramUsedGb -gt 20) { $red }   elseif ($ramUsedGb -gt 10) { $amber } else { $teal }
+
+        $cpuBar = New-Bar $cpu       100        12 $cpuCol
+        $ramBar = New-Bar $ramUsedGb $ramTotGb  12 $purple
+
+        $b = $dim; $r = $reset
+        $cpuVal = "{0}%" -f $cpu
+        $ramVal = if ($ramTotGb -gt 0) { "{0} / {1} GB" -f $ramUsedGb, $ramTotGb } else { "{0} GB" -f $ramUsedGb }
+
+        Write-Host ("  ${b}┌───────────────┐${r} ${b}┌───────────────┐${r}")
+        Write-Host ("  ${b}│${r} ${gray}$("CPU".PadRight(14))${r}${b}│${r} ${b}│${r} ${gray}$("RAM".PadRight(14))${r}${b}│${r}")
+        Write-Host ("  ${b}│${r} ${cpuCol}$($cpuVal.PadRight(14))${r}${b}│${r} ${b}│${r} ${ramCol}$($ramVal.PadRight(14))${r}${b}│${r}")
+        Write-Host ("  ${b}│${r} ${cpuBar}  ${b}│${r} ${b}│${r} ${ramBar}  ${b}│${r}")
+        Write-Host ("  ${b}└───────────────┘${r} ${b}└───────────────┘${r}")
+
+        if ($status.running) {
+            $thinkingPill = if ($status.thinking) { "${teal}[thinking on]${reset}" } else { "${gray}[thinking off]${reset}" }
+            $ctxPill      = if ($status.ctx -gt 0) { "${teal}[ctx $($status.ctx)]${reset}" } else { "" }
+            $toksPill     = if ($Script:LastTokS)  { "${amber}[$($Script:LastTokS) tok/s]${reset}" } else { "" }
+            Write-Host ("  ${gray}MODEL${reset}  ${white}$($status.model)${reset}  ${ctxPill}  ${thinkingPill}  ${toksPill}  ${gray}[vulkan · both GPUs]${reset}")
+        } else {
+            Write-Host ("  ${gray}MODEL  none${reset}")
+        }
+
+        if ($Script:LastStatusRefresh) {
+            $elapsed = ([DateTime]::Now - $Script:LastStatusRefresh).TotalSeconds
+            if ($elapsed -lt 2) { $tsStr = "just now" }
+            elseif ($elapsed -lt 60) { $tsStr = "{0}s ago" -f [int]$elapsed }
+            elseif ($elapsed -lt 3600) { $tsStr = "{0}m ago" -f [int]($elapsed / 60) }
+            else { $tsStr = "{0}h ago" -f [int]($elapsed / 3600) }
+            $stale = if ($elapsed -ge 15) { "${red}[stale]${reset}" } else { "" }
+            Write-Host ("  ${dim}updated ${tsStr}${reset} ${stale}")
+        } else {
+            Write-Host ("  ${dim}updated --${reset}")
+        }
+    } else {
+        Write-Host ("  {0}┌───────────────┐ ┌───────────────┐{1}" -f $dim, $reset)
+        Write-Host ("  {0}│  offline      │ │               │{1}" -f $dim, $reset)
+        Write-Host ("  {0}│               │ │               │{1}" -f $dim, $reset)
+        Write-Host ("  {0}└───────────────┘ └───────────────┘{1}" -f $dim, $reset)
+        Write-Host ("  {0}MODEL  none{1}" -f $gray, $reset)
+        Write-Host ("  {0}updated --{1}" -f $dim, $reset)
+    }
+
+    Write-Host ("${dim}$("─" * [Math]::Max($w - 1, 20))${reset}")
+}
+
+# ── UI: Dual-mode header (two independent ROCm instances) ────────────────
+# Fully independent of Show-Header/Show-HeaderBig above — never calls or
+# modifies them. Dispatched by Show-ActiveHeader based on $Script:ActiveMode.
+
+function Show-DualInstanceRow {
+    param($inst)
+
+    $running    = ($inst.running -eq $true)
+    $gpuId      = $inst.gpu_id
+    $cpu        = if ($null -ne $inst.cpu_percent)       { [double]$inst.cpu_percent } else { 0 }
+    $ramUsedGb  = if ($null -ne $inst.ram_used_mb)       { [math]::Round($inst.ram_used_mb  / 1024, 1) } else { 0 }
+    $ramTotGb   = if ($null -ne $inst.ram_total_mb)      { [math]::Round($inst.ram_total_mb / 1024, 1) } else { 0 }
+    $gpuBusy    = if ($null -ne $inst.gpu_busy_percent)  { [double]$inst.gpu_busy_percent } else { 0 }
+    $vramUsedGb = if ($null -ne $inst.vram_used_bytes)   { [math]::Round($inst.vram_used_bytes  / 1GB, 1) } else { 0 }
+    $vramTotGb  = if ($null -ne $inst.vram_total_bytes)  { [math]::Round($inst.vram_total_bytes / 1GB, 1) } else { 0 }
+
+    $cpuCol  = if ($cpu -gt 20)        { $red   } elseif ($cpu -gt 5)         { $amber } else { $teal }
+    $ramCol  = if ($ramUsedGb -gt 20)  { $red   } elseif ($ramUsedGb -gt 10)  { $amber } else { $teal }
+    $gpuCol  = if ($gpuBusy -gt 0)     { $amber } else                        { $gray }
+    $vramCol = if ($vramUsedGb -lt 5)  { $red   } elseif ($vramUsedGb -lt 15) { $amber } else { $teal }
+
+    $cpuBar  = New-Bar $cpu        100         12 $cpuCol
+    $ramBar  = New-Bar $ramUsedGb  $ramTotGb   12 $purple
+    $gpuBar  = New-Bar $gpuBusy    100         12 $gpuCol
+    $vramBar = New-Bar $vramUsedGb $vramTotGb  12 $blue
+
+    $b = $dim; $r = $reset
+    $cpuVal  = "{0}%" -f $cpu
+    $ramVal  = if ($ramTotGb -gt 0)  { "{0} / {1} GB" -f $ramUsedGb, $ramTotGb   } else { "{0} GB" -f $ramUsedGb }
+    $gpuVal  = "{0}%" -f $gpuBusy
+    $vramVal = if ($vramTotGb -gt 0) { "{0} / {1} GB" -f $vramUsedGb, $vramTotGb } else { "{0} GB" -f $vramUsedGb }
+
+    $dotColor = if ($running) { $teal } else { $red }
+    Write-Host ("  {0}●{1} {2}{3}{4}" -f $dotColor, $r, $teal, $gpuId, $r)
+
+    Write-Host ("  ${b}┌───────────────┐${r} ${b}┌───────────────┐${r} ${b}┌───────────────┐${r} ${b}┌────────────────────┐${r}")
+
+    $lblRow  = "  ${b}│${r} ${gray}$("CPU".PadRight(14))${r}${b}│${r} "
+    $lblRow += "${b}│${r} ${gray}$("RAM".PadRight(14))${r}${b}│${r} "
+    $lblRow += "${b}│${r} ${gray}$("GPU".PadRight(14))${r}${b}│${r} "
+    $lblRow += "${b}│${r} ${gray}$("VRAM".PadRight(19))${r}${b}│${r}"
+    Write-Host $lblRow
+
+    $valRow  = "  ${b}│${r} ${cpuCol}$($cpuVal.PadRight(14))${r}${b}│${r} "
+    $valRow += "${b}│${r} ${ramCol}$($ramVal.PadRight(14))${r}${b}│${r} "
+    $valRow += "${b}│${r} ${gpuCol}$($gpuVal.PadRight(14))${r}${b}│${r} "
+    $valRow += "${b}│${r} ${vramCol}$($vramVal.PadRight(19))${r}${b}│${r}"
+    Write-Host $valRow
+
+    $barRow  = "  ${b}│${r} ${cpuBar}  ${b}│${r} "
+    $barRow += "${b}│${r} ${ramBar}  ${b}│${r} "
+    $barRow += "${b}│${r} ${gpuBar}  ${b}│${r} "
+    $barRow += "${b}│${r} ${vramBar}       ${b}│${r}"
+    Write-Host $barRow
+
+    Write-Host ("  ${b}└───────────────┘${r} ${b}└───────────────┘${r} ${b}└───────────────┘${r} ${b}└────────────────────┘${r}")
+
+    if ($running) {
+        $thinkingPill = if ($inst.thinking) { "${teal}[thinking on]${r}" } else { "${gray}[thinking off]${r}" }
+        $ctxPill      = if ($inst.ctx -gt 0) { "${teal}[ctx $($inst.ctx)]${r}" } else { "" }
+        Write-Host ("  ${gray}MODEL${r}  ${white}$($inst.model)${r}  ${ctxPill}  ${thinkingPill}")
+    } else {
+        Write-Host ("  ${gray}MODEL  none${r}")
+    }
+    Write-Host ""
+}
+
+function Show-HeaderDual {
+    param($status = $null)
+
+    $w = [Console]::WindowWidth
+
+    $logo    = "{0}LL{1}a{2}M{3}esa{4}" -f $teal, $amber, $teal, $amber, $reset
+    $tagline = "{0}local inference control plane · v0.2 · dual independent servers{1}" -f $dim, $reset
+    Write-Host ("{0} {1}" -f $logo, $tagline)
+
+    if ($Script:ActiveServerName) {
+        $dot = if ($Script:ServerOnline) { "{0}●{1}" -f $teal, $reset } else { "{0}●{1}" -f $red, $reset }
+        Write-Host ("  {0} {1}{2}{3} · {4}{5}{3}" -f `
+            $dot, $teal, $Script:ActiveServerName, $reset, $gray, $Script:ActiveServer.host)
+    }
+
+    $instances = @()
+    if ($status -is [array]) { $instances = $status }
+    elseif ($status) { $instances = @($status) }
+
+    if ($instances.Count -eq 0) {
+        Write-Host ("  {0}no dual instance data{1}" -f $gray, $reset)
+    } else {
+        foreach ($inst in $instances) {
+            Show-DualInstanceRow $inst
+        }
+    }
+
+    if ($Script:LastStatusRefresh) {
+        $elapsed = ([DateTime]::Now - $Script:LastStatusRefresh).TotalSeconds
+        if ($elapsed -lt 2) { $tsStr = "just now" }
+        elseif ($elapsed -lt 60) { $tsStr = "{0}s ago" -f [int]$elapsed }
+        elseif ($elapsed -lt 3600) { $tsStr = "{0}m ago" -f [int]($elapsed / 60) }
+        else { $tsStr = "{0}h ago" -f [int]($elapsed / 3600) }
+        $stale = if ($elapsed -ge 15) { "${red}[stale]${reset}" } else { "" }
+        Write-Host ("  ${dim}updated ${tsStr}${reset} ${stale}")
+    } else {
+        Write-Host ("  ${dim}updated --${reset}")
+    }
+
+    Write-Host ("${dim}$("─" * [Math]::Max($w - 1, 20))${reset}")
+}
+
+# ── UI: Header/status dispatch (mode-aware) ──────────────────────────────
+# Decides which header renderer and status source to use based on
+# $Script:ActiveMode. Neither Show-Header nor Get-ServerStatus is branched
+# internally — the mode switch lives entirely in these two new functions.
+
+function Show-ActiveHeader {
+    param($status = $null)
+    if ($Script:ActiveMode -eq "big") {
+        Show-HeaderBig -status $status
+    } elseif ($Script:ActiveMode -eq "dual") {
+        Show-HeaderDual -status $status
+    } else {
+        Show-Header -status $status
+    }
+}
+
+function Get-ActiveStatus {
+    if ($Script:ActiveMode -eq "big") {
+        return Get-BigStatus
+    }
+    if ($Script:ActiveMode -eq "dual") {
+        return Get-DualStatus
+    }
+    return Get-ServerStatus
+}
+
+# One-time check at client startup: $Script:ActiveMode is local, in-memory state
+# that only gets set when *this session* runs /start-big or /start-dual. If a
+# -big/-dual server was already started by an earlier session (or over SSH
+# directly), a fresh client launch would otherwise default to "single" and
+# /chat would try the wrong port. This adopts whichever mode is actually
+# running server-side, so relaunching the client doesn't require reloading
+# an already-running model.
+function Detect-ActiveMode {
+    $big = Get-BigStatus
+    if ($big -and $big.running) {
+        $Script:ActiveMode = "big"
+        return
+    }
+
+    $dual = Get-DualStatus
+    $dualInstances = @()
+    if ($dual -is [array]) { $dualInstances = $dual }
+    elseif ($dual) { $dualInstances = @($dual) }
+    if (@($dualInstances | Where-Object { $_.running -eq $true }).Count -gt 0) {
+        $Script:ActiveMode = "dual"
+        return
+    }
+
+    $Script:ActiveMode = "single"
+}
+
 # ── UI: Menu ──────────────────────────────────────────────────────────────
 
 function Show-Menu {
@@ -469,6 +750,14 @@ function Show-Menu {
     Row "/stop"    "graceful shutdown"
     Row "/switch"  "hot-swap model"                 "hot-swap"
     Row "/restart" "stop + start with same settings"
+    Write-Host ""
+    Section "MULTI-GPU"
+    Row "/start-big"    "start combined-VRAM server (Vulkan, both GPUs)"
+    Row "/stop-big"     "stop combined-VRAM server"
+    Row "/restart-big"  "restart combined-VRAM server"                "re-selects model"
+    Row "/start-dual"   "start two independent servers (one per GPU)"
+    Row "/stop-dual"    "stop dual instance(s)"
+    Row "/restart-dual" "restart dual instance(s)"                    "remembers model(s)"
     Write-Host ""
     Section "MONITORING"
     Row "/health"  "ping /health and /v1/models"
@@ -687,6 +976,306 @@ function Cmd-Switch {
     Cmd-Start  # same flow as start but stops first (handled by server)
 }
 
+# ── Commands: /start-big /stop-big /restart-big ──────────────────────────
+# Fully independent of Cmd-Start/Cmd-Stop/Cmd-Restart above — these never call
+# or modify any of them.
+
+# Unlike Invoke-ServerCommand -raw (which discards the SSH session's stderr —
+# fine for v1, whose polling windows are short), -big/-dual commands fail fast
+# with an error written only to stderr (never stdout, per the server's JSON
+# discipline). This variant merges stderr into the captured output and reports
+# the exit code, so callers can detect failure before entering a wait loop.
+function Invoke-ServerCommandChecked {
+    param([string]$command)
+
+    if (-not $Script:ActiveServer) {
+        Write-Error "No active server configured."
+        return [PSCustomObject]@{ Output = @(); ExitCode = 1 }
+    }
+
+    $sshUser = $Script:ActiveServer.ssh_user
+    $sshHost = $Script:ActiveServer.host
+    $llamesaPath = $Script:ActiveServer.llamesa_path
+    $fullCommand = "bash ${llamesaPath} ${command} 2>&1"
+
+    try {
+        $result = ssh -o BatchMode=yes -o ConnectTimeout=5 "${sshUser}@${sshHost}" $fullCommand
+        return [PSCustomObject]@{ Output = $result; ExitCode = $LASTEXITCODE }
+    } catch {
+        return [PSCustomObject]@{ Output = @("SSH failed: $_"); ExitCode = 1 }
+    }
+}
+
+function Prompt-BigModelOptions {
+    $models = Get-ModelList
+
+    if (-not $models -or $models.Count -eq 0) {
+        Write-Host ("{0}No models found.{1}" -f $red, $reset)
+        return $null
+    }
+
+    Write-Host ""
+    Write-Host ("  {0}Select model (Vulkan combined-VRAM):{1}" -f $white, $reset)
+    for ($i = 0; $i -lt $models.Count; $i++) {
+        $m = $models[$i]
+        $size = Format-Bytes $m.size_bytes
+        $visionTag = if ($m.has_mmproj) { " {0}[vision]{1}" -f $amber, $reset } else { "" }
+        Write-Host ("    {0}  {1,-30} {2,-12}{3}" -f ($i + 1).ToString(), $m.name, $size, $visionTag)
+    }
+
+    Write-Host ""
+    $choice = Read-Host ">"
+    $idx = [int]$choice - 1
+    if ($idx -lt 0 -or $idx -ge $models.Count) {
+        Write-Host ("{0}Invalid selection.{1}" -f $red, $reset)
+        return $null
+    }
+    $selectedModel = $models[$idx].name
+
+    $thinkingInput = Read-Host "Thinking mode? [on/off]"
+    $thinking = if ($thinkingInput -match '^(on|yes|true|1)$') { "true" } else { "false" }
+
+    $ctx = Read-Host "Context size? [131072]"
+    if (-not $ctx) { $ctx = "131072" }
+
+    return [PSCustomObject]@{ model = $selectedModel; thinking = $thinking; ctx = $ctx }
+}
+
+function Wait-BigLoaded {
+    Write-Host ("{0}Waiting for model to load...{1}" -f $cyan, $reset)
+    for ($i = 0; $i -lt 150; $i++) {
+        Start-Sleep -Seconds 2
+        $bigStatus = Get-BigStatus
+        if ($bigStatus -and $bigStatus.running) {
+            Write-Host ("{0}✓ Model loaded!{1}" -f $green, $reset)
+            return
+        }
+        if (($i + 1) % 15 -eq 0) {
+            Write-Host ("  Loading... ({0}s elapsed)" -f (($i + 1) * 2))
+        }
+    }
+    Write-Host ("{0}Timed out waiting for the Vulkan server to load.{1}" -f $red, $reset)
+}
+
+function Cmd-StartBig {
+    Write-Host ("{0}Fetching available models...{1}" -f $cyan, $reset)
+    $opts = Prompt-BigModelOptions
+    if (-not $opts) { return }
+
+    Write-Host ""
+    Write-Host ("{0}Starting {1} (Vulkan combined-VRAM)...{2}" -f $cyan, $opts.model, $reset)
+    $result = Invoke-ServerCommandChecked ("start-big --model ""{0}"" --thinking {1} --ctx {2}" -f $opts.model, $opts.thinking, $opts.ctx)
+    Write-Host ($result.Output -join "`n")
+
+    if ($result.ExitCode -ne 0) {
+        Write-Host ("{0}start-big failed — see error above.{1}" -f $red, $reset)
+        return
+    }
+
+    $Script:ActiveMode = "big"
+    Wait-BigLoaded
+}
+
+function Cmd-StopBig {
+    Write-Host ("{0}Stopping Vulkan combined-VRAM server...{1}" -f $cyan, $reset)
+    $result = Invoke-ServerCommandChecked "stop-big"
+    Write-Host ($result.Output -join "`n")
+    if ($result.ExitCode -eq 0 -and $Script:ActiveMode -eq "big") { $Script:ActiveMode = "single" }
+}
+
+function Cmd-RestartBig {
+    Write-Host ("{0}restart-big does not remember the last model — select it again.{1}" -f $gray, $reset)
+    $opts = Prompt-BigModelOptions
+    if (-not $opts) { return }
+
+    Write-Host ""
+    Write-Host ("{0}Restarting with {1} (Vulkan combined-VRAM)...{2}" -f $cyan, $opts.model, $reset)
+    $result = Invoke-ServerCommandChecked ("restart-big --model ""{0}"" --thinking {1} --ctx {2}" -f $opts.model, $opts.thinking, $opts.ctx)
+    Write-Host ($result.Output -join "`n")
+
+    if ($result.ExitCode -ne 0) {
+        Write-Host ("{0}restart-big failed — see error above.{1}" -f $red, $reset)
+        return
+    }
+
+    $Script:ActiveMode = "big"
+    Wait-BigLoaded
+}
+
+# ── Commands: /start-dual /stop-dual /restart-dual ────────────────────────
+# Fully independent of Cmd-Start/Cmd-Stop/Cmd-Restart and of the -big commands
+# above — these never call or modify any of them.
+
+function Get-DualStatus {
+    param([string]$gpu = "")
+    $cmdStr = if ($gpu) { "status-dual --gpu $gpu" } else { "status-dual" }
+    $raw = Invoke-ServerCommand $cmdStr -raw
+    if (-not $raw) { return $null }
+
+    try {
+        $jsonStartIndex = -1
+        for ($i = 0; $i -lt $raw.Count; $i++) {
+            if ($raw[$i] -match '^\s*[\[{]' -and $raw[$i] -notmatch '^\s*\[(INFO|WARN|ERROR)\]') {
+                $jsonStartIndex = $i
+                break
+            }
+        }
+        if ($jsonStartIndex -lt 0) { return $null }
+        $jsonText = $raw[$jsonStartIndex..($raw.Count - 1)] -join "`n"
+        return $jsonText | ConvertFrom-Json
+    } catch {
+        return $null
+    }
+}
+
+function Cmd-StartDual {
+    Write-Host ("{0}Fetching available models...{1}" -f $cyan, $reset)
+    $models = Get-ModelList
+
+    if (-not $models -or $models.Count -eq 0) {
+        Write-Host ("{0}No models found.{1}" -f $red, $reset)
+        return
+    }
+
+    function Select-DualModel([string]$label) {
+        Write-Host ""
+        Write-Host ("  {0}Select model for {1}:{2}" -f $white, $label, $reset)
+        for ($i = 0; $i -lt $models.Count; $i++) {
+            $m = $models[$i]
+            $size = Format-Bytes $m.size_bytes
+            $visionTag = if ($m.has_mmproj) { " {0}[vision]{1}" -f $amber, $reset } else { "" }
+            Write-Host ("    {0}  {1,-30} {2,-12}{3}" -f ($i + 1).ToString(), $m.name, $size, $visionTag)
+        }
+        Write-Host ""
+        $choice = Read-Host ">"
+        $idx = [int]$choice - 1
+        if ($idx -lt 0 -or $idx -ge $models.Count) { return $null }
+        return $models[$idx].name
+    }
+
+    $modelR9700 = Select-DualModel "R9700"
+    if (-not $modelR9700) { Write-Host ("{0}Invalid selection.{1}" -f $red, $reset); return }
+
+    $modelRx9060xt = Select-DualModel "RX 9060 XT"
+    if (-not $modelRx9060xt) { Write-Host ("{0}Invalid selection.{1}" -f $red, $reset); return }
+
+    $thinkingInput = Read-Host "Thinking mode? [on/off]"
+    $thinking = if ($thinkingInput -match '^(on|yes|true|1)$') { "true" } else { "false" }
+
+    $ctx = Read-Host "Context size? [131072]"
+    if (-not $ctx) { $ctx = "131072" }
+
+    Write-Host ""
+    Write-Host ("{0}Starting dual instances: R9700={1}, RX9060XT={2}...{3}" -f $cyan, $modelR9700, $modelRx9060xt, $reset)
+
+    $result = Invoke-ServerCommandChecked ("start-dual --model-r9700 ""{0}"" --model-rx9060xt ""{1}"" --thinking {2} --ctx {3}" -f $modelR9700, $modelRx9060xt, $thinking, $ctx)
+    Write-Host ($result.Output -join "`n")
+
+    if ($result.ExitCode -ne 0) {
+        Write-Host ("{0}start-dual failed — see error above.{1}" -f $red, $reset)
+        return
+    }
+
+    $Script:ActiveMode = "dual"
+
+    Write-Host ("{0}Waiting for both instances to load...{1}" -f $cyan, $reset)
+    for ($i = 0; $i -lt 150; $i++) {
+        Start-Sleep -Seconds 2
+        $dualStatus = Get-DualStatus
+        if ($dualStatus -is [array] -and (@($dualStatus | Where-Object { $_.running -eq $true })).Count -eq 2) {
+            Write-Host ("{0}✓ Both models loaded!{1}" -f $green, $reset)
+            break
+        }
+        if (($i + 1) % 15 -eq 0) { Write-Host ("  Loading... ({0}s elapsed)" -f (($i + 1) * 2)) }
+    }
+}
+
+function Cmd-StopDual {
+    $dualStatus = Get-DualStatus
+    $runningInstances = @()
+    if ($dualStatus -is [array]) {
+        $runningInstances = @($dualStatus | Where-Object { $_.running -eq $true })
+    }
+
+    $gpuArg = ""
+    if ($runningInstances.Count -gt 1) {
+        Write-Host ("  {0}Stop which instance?{1}" -f $white, $reset)
+        for ($i = 0; $i -lt $runningInstances.Count; $i++) {
+            Write-Host ("    {0}  {1}" -f ($i + 1).ToString(), $runningInstances[$i].gpu_id)
+        }
+        Write-Host ("    {0}  Both" -f ($runningInstances.Count + 1).ToString())
+        Write-Host ""
+        $choice = Read-Host ">"
+        $idx = [int]$choice
+        if ($idx -ge 1 -and $idx -le $runningInstances.Count) {
+            $gpuArg = $runningInstances[$idx - 1].gpu_id
+        }
+    } elseif ($runningInstances.Count -eq 1) {
+        $gpuArg = $runningInstances[0].gpu_id
+    }
+
+    $cmdStr = if ($gpuArg) { "stop-dual --gpu $gpuArg" } else { "stop-dual" }
+    $scopeLabel = if ($gpuArg) { $gpuArg } else { "both" }
+    Write-Host ("{0}Stopping dual instance(s) ({1})...{2}" -f $cyan, $scopeLabel, $reset)
+    $result = Invoke-ServerCommandChecked $cmdStr
+    Write-Host ($result.Output -join "`n")
+
+    if ($result.ExitCode -eq 0 -and -not $gpuArg -and $Script:ActiveMode -eq "dual") {
+        $Script:ActiveMode = "single"
+    }
+}
+
+function Cmd-RestartDual {
+    $dualStatus = Get-DualStatus
+    $knownInstances = @()
+    if ($dualStatus -is [array]) { $knownInstances = $dualStatus }
+
+    $gpuArg = ""
+    if ($knownInstances.Count -gt 1) {
+        Write-Host ("  {0}Restart which instance?{1}" -f $white, $reset)
+        for ($i = 0; $i -lt $knownInstances.Count; $i++) {
+            Write-Host ("    {0}  {1}" -f ($i + 1).ToString(), $knownInstances[$i].gpu_id)
+        }
+        Write-Host ("    {0}  Both" -f ($knownInstances.Count + 1).ToString())
+        Write-Host ""
+        $choice = Read-Host ">"
+        $idx = [int]$choice
+        if ($idx -ge 1 -and $idx -le $knownInstances.Count) {
+            $gpuArg = $knownInstances[$idx - 1].gpu_id
+        }
+    }
+
+    $cmdStr = if ($gpuArg) { "restart-dual --gpu $gpuArg" } else { "restart-dual" }
+    $scopeLabel = if ($gpuArg) { $gpuArg } else { "both" }
+    Write-Host ("{0}Restarting dual instance(s) ({1}) with remembered model(s)...{2}" -f $cyan, $scopeLabel, $reset)
+    $result = Invoke-ServerCommandChecked $cmdStr
+    Write-Host ($result.Output -join "`n")
+
+    if ($result.ExitCode -ne 0) {
+        Write-Host ("{0}restart-dual failed — see error above.{1}" -f $red, $reset)
+        return
+    }
+
+    $Script:ActiveMode = "dual"
+
+    Write-Host ("{0}Waiting for instance(s) to load...{1}" -f $cyan, $reset)
+    for ($i = 0; $i -lt 150; $i++) {
+        Start-Sleep -Seconds 2
+        $s = Get-DualStatus -gpu $gpuArg
+        $ready = $false
+        if ($gpuArg) {
+            $ready = ($s -and $s.running -eq $true)
+        } else {
+            $ready = ($s -is [array] -and (@($s | Where-Object { $_.running -eq $true })).Count -eq 2)
+        }
+        if ($ready) {
+            Write-Host ("{0}✓ Loaded!{1}" -f $green, $reset)
+            break
+        }
+        if (($i + 1) % 15 -eq 0) { Write-Host ("  Loading... ({0}s elapsed)" -f (($i + 1) * 2)) }
+    }
+}
+
 # ── Command: /models ──────────────────────────────────────────────────────
 
 function Cmd-Models {
@@ -804,12 +1393,69 @@ function Cmd-Chat {
     $Script:CurrentView = "chat"
     $Script:ChatHistory = @()
 
-    $port = Get-ActiveGpuPort
+    # -big sessions: one model, one endpoint, but still on a different port
+    # (1236 by default) than the v1 single-GPU path Get-ActiveGpuPort resolves.
+    $bigPort = $null
+    $bigThinking = $null
+    if ($Script:ActiveMode -eq "big") {
+        $bigStatus = Get-BigStatus
+        if (-not $bigStatus -or -not $bigStatus.running) {
+            Write-Host ("{0}No running -big instance to chat with.{1}" -f $red, $reset)
+            $Script:CurrentView = "menu"
+            return
+        }
+        $bigPort = $bigStatus.port
+        $bigThinking = [bool]$bigStatus.thinking
+    }
+
+    # -dual sessions: pick which GPU's endpoint to chat against. Single/-big
+    # sessions are unaffected — this block only runs when a dual session is
+    # active, and only determines $dualPort/$dualThinking used just below.
+    $dualPort = $null
+    $dualThinking = $null
+    if ($Script:ActiveMode -eq "dual") {
+        $dualStatus = Get-DualStatus
+        $dualInstances = @()
+        if ($dualStatus -is [array]) { $dualInstances = $dualStatus }
+        elseif ($dualStatus) { $dualInstances = @($dualStatus) }
+
+        $runningInstances = @($dualInstances | Where-Object { $_.running -eq $true })
+        if ($runningInstances.Count -eq 0) {
+            Write-Host ("{0}No running dual instances to chat with.{1}" -f $red, $reset)
+            $Script:CurrentView = "menu"
+            return
+        } elseif ($runningInstances.Count -eq 1) {
+            $dualPort = $runningInstances[0].port
+            $dualThinking = [bool]$runningInstances[0].thinking
+        } else {
+            Write-Host ("  {0}Which GPU?{1}" -f $white, $reset)
+            for ($i = 0; $i -lt $runningInstances.Count; $i++) {
+                $inst = $runningInstances[$i]
+                Write-Host ("    {0}  {1,-10} {2}" -f ($i + 1).ToString(), $inst.gpu_id, $inst.model)
+            }
+            Write-Host ""
+            $choice = Read-Host ">"
+            $idx = [int]$choice - 1
+            if ($idx -lt 0 -or $idx -ge $runningInstances.Count) {
+                Write-Host ("{0}Invalid selection.{1}" -f $red, $reset)
+                $Script:CurrentView = "menu"
+                return
+            }
+            $dualPort = $runningInstances[$idx].port
+            $dualThinking = [bool]$runningInstances[$idx].thinking
+        }
+    }
+
+    $port = if ($dualPort) { $dualPort } elseif ($bigPort) { $bigPort } else { Get-ActiveGpuPort }
     $hostAddr = $Script:ActiveServer.host
 
     # Seed thinking mode from server status; user can toggle with /think and /nothink
     $thinkingEnabled = $false
-    if ($Script:ServerStatus -and $Script:ServerStatus.thinking) {
+    if ($null -ne $dualThinking) {
+        $thinkingEnabled = $dualThinking
+    } elseif ($null -ne $bigThinking) {
+        $thinkingEnabled = $bigThinking
+    } elseif ($Script:ServerStatus -and $Script:ServerStatus.thinking) {
         $thinkingEnabled = [bool]$Script:ServerStatus.thinking
     }
 
@@ -915,11 +1561,11 @@ function Cmd-Chat {
             stream         = $true
             stream_options = [PSCustomObject]@{ include_usage = $true }
         }
-        # chat_template_kwargs is Qwen3-specific; only send it when thinking is on
-        # so other models receive a plain request with no extra fields
-        if ($thinkingEnabled) {
-            $requestBody | Add-Member -NotePropertyName chat_template_kwargs -NotePropertyValue ([PSCustomObject]@{ enable_thinking = $true })
-        }
+        # Always send enable_thinking explicitly (true or false) rather than omitting
+        # it when off — some chat templates (e.g. Qwen3.6) default to thinking-on when
+        # the kwarg is absent, so omission failed to actually turn thinking off for them.
+        # Unrecognized template kwargs are harmlessly ignored by templates that don't use them.
+        $requestBody | Add-Member -NotePropertyName chat_template_kwargs -NotePropertyValue ([PSCustomObject]@{ enable_thinking = $thinkingEnabled })
         $body = $requestBody | ConvertTo-Json -Depth 5
 
         $assistantContent = ""
@@ -1149,6 +1795,12 @@ function Cmd-Help {
     Write-Host ("  {0}/stop{1}         Stop the running server gracefully" -f $white, $reset)
     Write-Host ("  {0}/switch{1}       Hot-swap to a different model" -f $white, $reset)
     Write-Host ("  {0}/restart{1}      Restart server with same/new settings" -f $white, $reset)
+    Write-Host ("  {0}/start-big{1}    Start combined-VRAM server (Vulkan, both GPUs)" -f $white, $reset)
+    Write-Host ("  {0}/stop-big{1}     Stop the combined-VRAM server" -f $white, $reset)
+    Write-Host ("  {0}/restart-big{1}  Restart the combined-VRAM server (re-selects model)" -f $white, $reset)
+    Write-Host ("  {0}/start-dual{1}   Start two independent servers, one per GPU (ROCm)" -f $white, $reset)
+    Write-Host ("  {0}/stop-dual{1}    Stop dual instance(s) (prompts which, if both running)" -f $white, $reset)
+    Write-Host ("  {0}/restart-dual{1} Restart dual instance(s) with remembered model(s)" -f $white, $reset)
     Write-Host ("  {0}/health{1}       Check server API endpoints" -f $white, $reset)
     Write-Host ("  {0}/logs{1}         Stream server logs (Ctrl+C to exit)" -f $white, $reset)
     Write-Host ("  {0}/models{1}       List all available models" -f $white, $reset)
@@ -1167,6 +1819,8 @@ function Cmd-Help {
 
 $Script:Commands = @(
     "start", "stop", "switch", "restart",
+    "start-big", "stop-big", "restart-big",
+    "start-dual", "stop-dual", "restart-dual",
     "health", "logs",
     "models", "download",
     "chat",
@@ -1184,6 +1838,7 @@ function Get-MatchingCommands {
 function Main {
     $host.UI.RawUI.WindowTitle = "LLaMesa"
     Read-Config
+    Detect-ActiveMode
 
     $Script:ServerOnline = $false
     $status = $null
@@ -1196,7 +1851,7 @@ function Main {
         if ($elapsed -ge 2) {
             try {
                 $Script:ServerOnline = Test-ServerConnection
-                $status = Get-ServerStatus
+                $status = Get-ActiveStatus
                 $Script:ServerStatus = $status
                 $Script:LastStatusRefresh = [DateTime]::Now
             } catch {
@@ -1208,7 +1863,7 @@ function Main {
 
         # Full clear + redraw every loop so there's never a stale/doubled header
         Clear-Host
-        Show-Header -status $status
+        Show-ActiveHeader -status $status
         Show-Menu
 
         # Pin the prompt to the last row — pad with blank lines to fill remaining height
@@ -1227,6 +1882,12 @@ function Main {
             "stop"     { Clear-Host; Cmd-Stop;     Read-Host "`nPress Enter to continue" }
             "switch"   { Clear-Host; Cmd-Switch;   Read-Host "`nPress Enter to continue" }
             "restart"  { Clear-Host; Cmd-Restart;  Read-Host "`nPress Enter to continue" }
+            "start-big"   { Clear-Host; Cmd-StartBig;   Read-Host "`nPress Enter to continue" }
+            "stop-big"    { Clear-Host; Cmd-StopBig;    Read-Host "`nPress Enter to continue" }
+            "restart-big" { Clear-Host; Cmd-RestartBig; Read-Host "`nPress Enter to continue" }
+            "start-dual"   { Clear-Host; Cmd-StartDual;   Read-Host "`nPress Enter to continue" }
+            "stop-dual"    { Clear-Host; Cmd-StopDual;    Read-Host "`nPress Enter to continue" }
+            "restart-dual" { Clear-Host; Cmd-RestartDual; Read-Host "`nPress Enter to continue" }
             "health"   { Clear-Host; Cmd-Health;   Read-Host "`nPress Enter to continue" }
             "logs"     { Cmd-Logs }
             "models"   { Clear-Host; Cmd-Models;   Read-Host "`nPress Enter to continue" }
