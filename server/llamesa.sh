@@ -1295,17 +1295,19 @@ cmd_logs_big() {
 # the -big commands above — these never call or modify any of them.
 
 # Internal helper: launch one -dual instance for a given GPU key (r9700 | rx9060xt)
-# Resolve which Vulkan device INDEX (0, 1, ...) corresponds to a GPU by
-# matching `llama-server --list-devices` output against a target VRAM size.
-# Mirrors _resolve_drm_card's nearest-match approach — Vulkan enumeration order
-# is not guaranteed stable across process launches on this hardware.
+# Resolve which GPU device INDEX (0, 1, ...) corresponds to a GPU by matching
+# `llama-server --list-devices` output against a target VRAM size. Backend-
+# agnostic — matches "Vulkan0"/"Vulkan1" (Vulkan builds) or "ROCm0"/"ROCm1"
+# (ROCm/HIP builds) alike, since -dual's per-GPU llama_binary can be either.
+# Mirrors _resolve_drm_card's nearest-match approach — device enumeration
+# order is not guaranteed stable across process launches on this hardware.
 #
 # Used with `-sm none -mg <index>` rather than `--device <name>`: testing found
 # --device pinning never achieved real GPU VRAM offload (always fell back to
 # system RAM, no error), while -sm none -mg <index> — leaving both devices
 # visible and explicitly selecting one for compute — was confirmed working
 # (stable, real VRAM usage, on the R9700). See docs/dual-gpu.md Known Limitations.
-_resolve_vulkan_device_index() {
+_resolve_device_index() {
     local binary="$1"
     local target_gb="${2:-0}"
     local list_output
@@ -1313,7 +1315,7 @@ _resolve_vulkan_device_index() {
 
     local best_index="" best_diff=99999
     while IFS= read -r line; do
-        if [[ "$line" =~ Vulkan([0-9]+):.*\(([0-9]+)\ MiB, ]]; then
+        if [[ "$line" =~ [A-Za-z]+([0-9]+):.*\(([0-9]+)\ MiB, ]]; then
             local dev_idx="${BASH_REMATCH[1]}"
             local mib="${BASH_REMATCH[2]}"
             local gb=$(( mib / 1024 ))
@@ -1358,7 +1360,7 @@ _start_dual_instance() {
     fi
 
     info "[${gpu_key}] Starting server with model: ${model_file}"
-    info "[${gpu_key}] Pinned to Vulkan main-gpu index: ${device_index}"
+    info "[${gpu_key}] Pinned to main-gpu index: ${device_index}"
 
     # This llama.cpp build's -fit system (default on) picks the right layer
     # split for a single pinned device on its own; a hardcoded numeric
@@ -1618,8 +1620,8 @@ cmd_start_dual() {
     fi
 
     local r9700_device rx9060xt_device
-    r9700_device=$(_resolve_vulkan_device_index "$R9700_BINARY" 32)
-    rx9060xt_device=$(_resolve_vulkan_device_index "$RX9060XT_BINARY" 16)
+    r9700_device=$(_resolve_device_index "$R9700_BINARY" 32)
+    rx9060xt_device=$(_resolve_device_index "$RX9060XT_BINARY" 16)
     if [[ -z "$r9700_device" ]]; then
         error "Could not resolve a Vulkan device for r9700 via --list-devices. Check dual_gpu.r9700.llama_binary and that both GPUs are visible to Vulkan (vulkaninfo --summary)."
     fi
@@ -1688,7 +1690,7 @@ cmd_restart_dual() {
             _stop_dual_instance "r9700" "$R9700_PORT"
             sleep 3
             local r9700_device
-            r9700_device=$(_resolve_vulkan_device_index "$R9700_BINARY" 32)
+            r9700_device=$(_resolve_device_index "$R9700_BINARY" 32)
             [[ -z "$r9700_device" ]] && error "Could not resolve a Vulkan device for r9700 via --list-devices."
             _start_dual_instance "r9700" "$R9700_PORT" "$R9700_BINARY" "$R9700_ENV" "$model_r9700" "$ctx" "$r9700_device"
             _wait_dual_instance "r9700" "$R9700_PORT"
@@ -1701,7 +1703,7 @@ cmd_restart_dual() {
             _stop_dual_instance "rx9060xt" "$RX9060XT_PORT"
             sleep 3
             local rx9060xt_device
-            rx9060xt_device=$(_resolve_vulkan_device_index "$RX9060XT_BINARY" 16)
+            rx9060xt_device=$(_resolve_device_index "$RX9060XT_BINARY" 16)
             [[ -z "$rx9060xt_device" ]] && error "Could not resolve a Vulkan device for rx9060xt via --list-devices."
             _start_dual_instance "rx9060xt" "$RX9060XT_PORT" "$RX9060XT_BINARY" "$RX9060XT_ENV" "$model_rx9060xt" "$ctx" "$rx9060xt_device"
             _wait_dual_instance "rx9060xt" "$RX9060XT_PORT"
@@ -1715,8 +1717,8 @@ cmd_restart_dual() {
             _stop_dual_instance "rx9060xt" "$RX9060XT_PORT"
             sleep 3
             local both_r9700_device both_rx9060xt_device
-            both_r9700_device=$(_resolve_vulkan_device_index "$R9700_BINARY" 32)
-            both_rx9060xt_device=$(_resolve_vulkan_device_index "$RX9060XT_BINARY" 16)
+            both_r9700_device=$(_resolve_device_index "$R9700_BINARY" 32)
+            both_rx9060xt_device=$(_resolve_device_index "$RX9060XT_BINARY" 16)
             [[ -z "$both_r9700_device" ]] && error "Could not resolve a Vulkan device for r9700 via --list-devices."
             [[ -z "$both_rx9060xt_device" ]] && error "Could not resolve a Vulkan device for rx9060xt via --list-devices."
             _start_dual_instance "r9700" "$R9700_PORT" "$R9700_BINARY" "$R9700_ENV" "$model_r9700" "$ctx" "$both_r9700_device"
