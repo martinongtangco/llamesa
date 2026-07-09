@@ -443,14 +443,19 @@ cmd_status() {
 cmd_status_single_gpu() {
     local _sg_id="${1:-0}"
     get_gpu_config "$_sg_id"
-    local running=false pid="" model="none" mmproj="false" thinking="false" ctx="0"
+    local running=false pid_verified=false pid="" model="none" mmproj="false" thinking="false" ctx="0"
     local _sg_port; _sg_port=$(gpu_port)
     local _sg_pid_file="${LLAMESA_DIR}/server-gpu${_sg_id}.pid"
     local _sg_log_file="${LLAMESA_DIR}/server-gpu${_sg_id}.log"
     if [[ -f "$_sg_pid_file" ]]; then
         pid=$(cat "$_sg_pid_file")
-        if kill -0 "$pid" 2>/dev/null; then running=true; fi
+        if kill -0 "$pid" 2>/dev/null; then running=true; pid_verified=true; fi
     fi
+    # Port-listening fallback: something is answering on this port, but since
+    # our own PID file didn't confirm it, we can't tell whether it's actually
+    # our tracked process or an unrelated one that happens to share the port
+    # (e.g. -dual configured to reuse a v1 GPU port). pid_verified stays false
+    # in that case, so session-file bookkeeping (thinking) below isn't trusted.
     if [[ "$running" == "false" ]] && ss -tlnp 2>/dev/null | grep -q ":${_sg_port}"; then
         running=true
     fi
@@ -473,7 +478,7 @@ cmd_status_single_gpu() {
             ctx_val=$(echo "$models_response" | grep -o '"n_ctx": *[0-9]*' | grep -o '[0-9]*$' | head -1 || true)
             [[ -n "$ctx_val" ]] && ctx="$ctx_val"
         fi
-        if [[ -f "${LLAMESA_DIR}/last_session.json" ]]; then
+        if [[ "$pid_verified" == "true" ]] && [[ -f "${LLAMESA_DIR}/last_session.json" ]]; then
             local sess_thinking
             sess_thinking=$(grep -o '"thinking": *[^,}]*' "${LLAMESA_DIR}/last_session.json" | awk '{print $2}' | tr -d ' \r\n' || true)
             [[ "$sess_thinking" == "true" || "$sess_thinking" == "false" ]] && thinking="$sess_thinking"
@@ -1151,11 +1156,16 @@ cmd_status_big() {
     read_base_config
     read_vulkan_config
 
-    local running=false pid=""
+    local running=false pid_verified=false pid=""
     if [[ -f "$BIG_PID_FILE" ]]; then
         pid=$(cat "$BIG_PID_FILE")
-        if kill -0 "$pid" 2>/dev/null; then running=true; fi
+        if kill -0 "$pid" 2>/dev/null; then running=true; pid_verified=true; fi
     fi
+    # Port-listening fallback: something is answering on this port, but since
+    # our own PID file didn't confirm it, we can't tell whether it's actually
+    # this -big instance or an unrelated process sharing the port. pid_verified
+    # stays false in that case, so BIG_SESSION_FILE's thinking below isn't
+    # trusted — see the identical pattern in _status_dual_instance.
     if [[ "$running" == "false" ]] && ss -tlnp 2>/dev/null | grep -q ":${VULKAN_PORT}"; then
         running=true
     fi
@@ -1195,7 +1205,7 @@ EOF
         [[ -n "$ctx_val" ]] && ctx="$ctx_val"
     fi
 
-    if [[ -f "$BIG_SESSION_FILE" ]]; then
+    if [[ "$pid_verified" == "true" ]] && [[ -f "$BIG_SESSION_FILE" ]]; then
         local sess_thinking
         sess_thinking=$(jq -r '.thinking // empty' "$BIG_SESSION_FILE" 2>/dev/null || true)
         [[ "$sess_thinking" == "true" || "$sess_thinking" == "false" ]] && thinking="$sess_thinking"
@@ -1474,12 +1484,19 @@ _status_dual_instance() {
     local gpu_key="$1" port="$2"
     local pid_file="${LLAMESA_DIR}/dual-${gpu_key}.pid"
     local log_file="${LLAMESA_DIR}/dual-${gpu_key}.log"
-    local running=false pid="" model="none" mmproj="false" thinking="false" ctx="0"
+    local running=false pid_verified=false pid="" model="none" mmproj="false" thinking="false" ctx="0"
 
     if [[ -f "$pid_file" ]]; then
         pid=$(cat "$pid_file")
-        if kill -0 "$pid" 2>/dev/null; then running=true; fi
+        if kill -0 "$pid" 2>/dev/null; then running=true; pid_verified=true; fi
     fi
+    # Port-listening fallback: something is answering on this port, but since
+    # our own PID file didn't confirm it, we can't tell whether it's actually
+    # this dual instance or an unrelated process sharing the port (e.g. v1's
+    # /start reusing dual_gpu.r9700's configured port). pid_verified stays
+    # false in that case, so DUAL_SESSION_FILE's thinking below isn't trusted
+    # — it would otherwise silently apply a stale/unrelated dual session's
+    # thinking setting to whatever process actually answered.
     if [[ "$running" == "false" ]] && ss -tlnp 2>/dev/null | grep -q ":${port}"; then
         running=true
     fi
@@ -1520,10 +1537,24 @@ _status_dual_instance() {
             ctx_val=$(echo "$models_response" | grep -o '"n_ctx": *[0-9]*' | grep -o '[0-9]*$' | head -1 || true)
             [[ -n "$ctx_val" ]] && ctx="$ctx_val"
         fi
-        if [[ -f "$DUAL_SESSION_FILE" ]]; then
+        if [[ "$pid_verified" == "true" ]] && [[ -f "$DUAL_SESSION_FILE" ]]; then
             local sess_thinking
             sess_thinking=$(jq -r '.thinking // empty' "$DUAL_SESSION_FILE" 2>/dev/null || true)
             [[ "$sess_thinking" == "true" || "$sess_thinking" == "false" ]] && thinking="$sess_thinking"
+        elif [[ "$pid_verified" == "false" ]] && [[ -f "${LLAMESA_DIR}/last_session.json" ]]; then
+            # Not our tracked dual instance (no PID-file match), but if this
+            # port matches a configured v1 GPU port, what's actually answering
+            # is almost certainly that v1 process (dual_gpu.<gpu>.port reuses
+            # a v1 gpus[].port by convention on this hardware) — so
+            # last_session.json, not DUAL_SESSION_FILE, is the correct source
+            # of truth for thinking here.
+            local v1_port_match
+            v1_port_match=$(jq -r --arg p "$port" '.gpus[]? | select((.port|tostring) == $p) | .port' "$CONFIG_FILE" 2>/dev/null | head -1 || true)
+            if [[ -n "$v1_port_match" ]]; then
+                local sess_thinking
+                sess_thinking=$(grep -o '"thinking": *[^,}]*' "${LLAMESA_DIR}/last_session.json" | awk '{print $2}' | tr -d ' \r\n' || true)
+                [[ "$sess_thinking" == "true" || "$sess_thinking" == "false" ]] && thinking="$sess_thinking"
+            fi
         fi
         if [[ -f "$log_file" ]]; then
             mmproj=$(grep -q '\-\-mmproj' "$log_file" 2>/dev/null && echo "true" || echo "false")
