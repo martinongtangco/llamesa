@@ -1707,12 +1707,35 @@ function Cmd-Servers {
     Write-Host ""
     Write-Host ("  {0}Configured Servers:{1}" -f $teal, $reset)
     Write-Host ""
+    Write-Host ("      {0,-15} {1,-20} {2,-15} {3}" -f "NAME", "HOST", "SSH USER", "PORT")
 
     $i = 1
     foreach ($prop in $Script:Config.servers.PSObject.Properties) {
         $s = $prop.Value
-        $marker = if ($prop.Name -eq $Script:Config.active_server) { "{0}←{1}" -f $green, $reset } else { " " }
-        Write-Host ("    {0} {1,-15} {2,-20} {3}" -f $marker, $prop.Name, $s.host, $s.ssh_user)
+        $isActive = ($prop.Name -eq $Script:Config.active_server)
+        $marker = if ($isActive) { "{0}←{1}" -f $green, $reset } else { " " }
+
+        # Base configured port always shown; for the active server, if a
+        # -dual or -big session is actually running, show its live port(s)
+        # instead — a single "port" field is misleading once a box is
+        # running multiple instances on multiple ports at once.
+        $portLabel = if ($s.port) { "$($s.port)" } else { "-" }
+        if ($isActive -and $Script:ActiveMode -eq "dual") {
+            $dualStatus = Get-DualStatus
+            $instances = @()
+            if ($dualStatus -is [array]) { $instances = $dualStatus } elseif ($dualStatus) { $instances = @($dualStatus) }
+            $running = @($instances | Where-Object { $_.running -eq $true -and $_.port })
+            if ($running.Count -gt 0) {
+                $portLabel = ($running | ForEach-Object { "$($_.gpu_id):$($_.port)" }) -join ", "
+            }
+        } elseif ($isActive -and $Script:ActiveMode -eq "big") {
+            $bigStatus = Get-BigStatus
+            if ($bigStatus -and $bigStatus.running -and $bigStatus.port) {
+                $portLabel = "big:$($bigStatus.port)"
+            }
+        }
+
+        Write-Host ("    {0} {1,-15} {2,-20} {3,-15} {4}" -f $marker, $prop.Name, $s.host, $s.ssh_user, $portLabel)
         $i++
     }
 
