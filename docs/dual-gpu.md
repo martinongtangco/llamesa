@@ -8,19 +8,19 @@ base commands work.
 > **Read [Known Limitations](#known-limitations) before relying on either mode.**
 > `-dual` is confirmed fully working on both GPUs, now that it runs on a dedicated ROCm
 > build (see [Two backends](#two-backends-why-dual-is-rocm-and-big-is-vulkan) below).
-> `-big` still reliably offloads to GPU only for models that fit on the R9700 alone — its
-> actual cross-GPU split (the point of `-big`) does not hold for larger models, and stays
-> on the original Vulkan build. This doc describes what's confirmed to work today, not an
-> aspirational design.
+> `-big` is confirmed working for genuine cross-GPU splits too, **as long as it's started
+> from a clean VRAM state on both cards** — see [Known Limitations](#known-limitations) for
+> what "clean" means and why this caveat exists. This doc describes what's confirmed to
+> work today, not an aspirational design.
 
 | | `-dual` | `-big` |
 |---|---|---|
 | Backend | **ROCm/HIP** (dedicated build, see below) | Vulkan |
 | Processes | Two independent `llama-server` processes | One process spanning both GPUs |
 | VRAM | Each model limited to its own GPU's VRAM | Combined VRAM (~48GB on R9700 + RX 9060 XT) |
-| Use when | Running two separate models at once (e.g. a chat model + a coder model) | One model too large for either GPU alone, and it fits under ~32GB |
+| Use when | Running two separate models at once (e.g. a chat model + a coder model) | One model too large for either GPU alone |
 | Config block | `dual_gpu` | `vulkan_split` |
-| Status | **Confirmed working**, both GPUs | Confirmed working only up to ~32GB; larger models silently overflow to RAM instead of the 2nd GPU |
+| Status | **Confirmed working**, both GPUs | **Confirmed working**, genuine cross-GPU splits up to ~48GB combined, *from a clean VRAM starting state* |
 
 ---
 
@@ -206,48 +206,62 @@ regardless of whether the fix is merged — it's not a concern for `-dual`, only
 someone experiments with ROCm split-mode flags directly (see
 [Troubleshooting](#troubleshooting)).
 
-### `-big`: cross-GPU split does not reliably hold
+### `-big`: cross-GPU split works reliably from a clean VRAM state
 
-`-big` **does** achieve genuine GPU VRAM offload for models that fit on the R9700 alone —
-confirmed with Qwen3.6-27B fully resident on GPU (17.8GB used, 0 system-RAM fallback,
-stable indefinitely). That part works well, and stays on Vulkan (see
-[Two backends](#two-backends-why-dual-is-rocm-and-big-is-vulkan) above for why moving this
-to ROCm would not help).
+Earlier testing concluded `-big`'s cross-GPU split was fundamentally broken: for models
+needing both GPUs, the split would start correctly (both GPUs briefly showing real,
+proportional VRAM usage) but the RX 9060 XT's portion would silently evict to system RAM
+by the time loading finished, every time, with no error in the log. That was documented
+here as an open, unresolved upstream mystery — ruled out `-fit` heuristics, ruled out
+MoE-specific CPU-preference behavior, found no matching upstream issue after a deep
+research pass.
 
-For models that need *both* GPUs (tested: Qwen3.6-35B-A3B at Q8, ~38.5GB, and
-Meta-Llama-3.1-70B-Instruct Q3_K_L, ~37GB), the split starts correctly — early in loading,
-both GPUs show real VRAM usage proportional to `tensor-split` — but the RX 9060 XT's
-portion silently evicts to system RAM by the time loading finishes, every time, with no
-error or warning anywhere in the log. Tested both with `-fit` on (default) and explicitly
-`--fit off` with a manually-forced `--tensor-split`/`-ngl 999` — identical result either
-way, which rules out `-fit`'s heuristics as the sole cause. Also ruled out "MoE-specific
-behavior" (llama.cpp intentionally prefers CPU over a 2nd GPU for MoE overflow, per
-upstream discussion #22183) — disproven because the dense Llama-3.1-70B test showed the
-identical pattern, and that model has no MoE layers to trigger that logic.
+**Re-tested from a clean VRAM state, and it now holds reliably.** Four separate models,
+each started only after confirming both GPUs showed near-zero VRAM used (`free -h` flat,
+no stray `llama-server` processes, sysfs VRAM readings low on both cards):
 
-No confirmed matching upstream issue after a deep research pass — several near-miss
-candidates were checked and ruled out via `gh issue view`, not just search snippets:
-[#15974](https://github.com/ggml-org/llama.cpp/issues/15974) ("Tensor split on vulkan
-broken") is closed/fixed by PR #16039 and describes a different scenario (an iGPU + an
-NVIDIA eGPU over Thunderbolt, not two discrete same-vendor GPUs).
-[#22592](https://github.com/ggml-org/llama.cpp/issues/22592) and
-[#21801](https://github.com/ggml-org/llama.cpp/issues/21801) document real `-fit`
-immaturity but were ruled out as the sole cause here, since disabling `-fit` didn't change
-the outcome. This remains an open mystery — don't take the absence of a citation as
-confirmation it's unreported, just that nothing found so far matches. Worth re-checking
-upstream issues periodically in case this gets reported/fixed.
+| Model | Architecture | Combined VRAM | R9700 | RX 9060 XT | Ctx | Speed |
+|---|---|---|---|---|---|---|
+| Qwen3.6-27B | dense, 27B | 35.2GiB | 23.7GiB | 11.5GiB | 131072 | ~26-27 tok/s |
+| Qwen3.6-35B-A3B Q8 | MoE, 35B (~3B active) | 40.8GiB | 28.1GiB | 12.7GiB | 131072 | 99.9 tok/s |
+| Meta-Llama-3.1-70B-Instruct Q3_K_L | dense, 70B | 47.4GiB | 31.7GiB | 15.7GiB | 50176 | ~7.8 tok/s |
+| Qwen2.5-72B-Instruct Q3_K_S | dense, 72B | 47.5GiB | 31.7GiB | 15.8GiB | 32768 | ~7.9 tok/s |
 
-**Bottom line:** `-big` is reliable only for models ≤32GB (fits on the R9700 alone). For
-bigger models, expect overflow to land in system RAM rather than the RX 9060 XT — check
-`free -h` / `status-big`'s per-device `devices[]` array before assuming a large model is
-actually using both cards.
+All four are genuine cross-GPU splits (none fit on the R9700's 32GB alone), all held a
+real, stable 2:1-ish proportional split matching `tensor-split`, all showed 0 system-RAM
+fallback (`free -h` stayed flat, no swap growth), and all ran real generations
+successfully. The last two are extremely tight (under 1GiB combined headroom out of
+~47.8GiB total) but still didn't evict — this is right at the edge of what the hardware
+can hold, not a lot of safety margin, but it's real GPU memory doing real work, not a
+silent RAM fallback.
+
+**Revised theory:** the original failures were very likely caused by leftover/orphaned
+VRAM occupying the RX 9060 XT at test time — the same class of leak documented in this
+session's investigation (a killed `-dual`/`-big` process can leave VRAM allocated on the
+driver side without a live process to account for it; see the operational lesson at the
+bottom of this section). A dirty starting state on the RX 9060 XT would have silently
+shrunk its real free VRAM, causing the split to appear to "evict" when it was actually
+just running out of genuinely free room — indistinguishable from a driver bug unless you
+check GPU VRAM state independently of `llamesa.sh`'s own tracking before each test, which
+the original testing didn't consistently do. **This is inferred from a change in testing
+discipline, not from any code fix** — no llama.cpp/Vulkan-side change was made. Confidence
+is reasonably high (4/4 clean passes across both a MoE and dense architecture, including
+the two exact models that failed before) but not certain; if a future test evicts again,
+check VRAM state on both cards *before* concluding the old bug is back.
+
+**Bottom line:** before starting `-big` for a model that needs both GPUs, verify both
+cards are actually near-empty first — `free -h` alone isn't enough, since a VRAM leak
+doesn't show up in system RAM. Check `status-big`'s `devices[]` array or GPU VRAM sysfs
+directly. If either card already has significant VRAM in use with no corresponding running
+process, clean that up (see [Related safety measure](#related-safety-measure)) before
+trusting a `-big` test result either way.
 
 ### Related safety measure
 
-Because `-big`'s overflow manifests as *silent* CPU/RAM fallback rather than an error
-(and because stacking multiple test processes without full cleanup can exhaust RAM
-regardless of backend), a large model — or several stacked at once — can quietly consume
-all system RAM and trigger a kernel OOM event. This happened once during testing and
+If a model genuinely doesn't fit even after a clean-VRAM `-big` start (or if multiple test
+processes stack up without full cleanup, regardless of backend), it can still fall back to
+system RAM the old way and quietly consume all of it, triggering a kernel OOM event. This
+happened once during testing and
 required a hard reboot. `-big`, `-dual`, and v1's `start` all refuse to launch a model
 whose file size doesn't leave enough available system RAM headroom (`check_ram_safety` in
 `server/llamesa.sh`), as a backstop against repeating that. **This guard only protects
@@ -278,9 +292,12 @@ that instance specifically. Each instance is a fully separate process/log/PID fi
 (`~/.llamesa/dual-r9700.*` and `~/.llamesa/dual-rx9060xt.*`), so a failure on one never
 affects the other.
 
-**A model appears loaded/responsive but VRAM looks empty** — for `-big`, expected for
-models over ~32GB (see [Known Limitations](#known-limitations)); check `free -h` for
-elevated RAM as confirmation. For `-dual` on the ROCm binary this should not happen — if
+**A model appears loaded/responsive but VRAM looks empty on `-big`** — no longer expected
+behavior for models that need both GPUs (see [Known Limitations](#known-limitations); this
+was the old documented failure mode, now believed fixed by starting from a clean VRAM
+state). Check `free -h` for elevated RAM as confirmation of a real fallback, and check
+both GPUs' VRAM sysfs to rule out one of them already being dirty from a leftover process
+before assuming the split itself is broken again. For `-dual` on the ROCm binary this should not happen — if
 placement failed, the process should have crashed rather than silently falling back (that's
 the whole point of using ROCm here). If you see this on `-dual`, something is
 misconfigured — double check `dual_gpu.<gpu>.llama_binary` actually points at the ROCm
@@ -294,9 +311,13 @@ recurrent/Mamba-SSM models during prompt-cache restore. `-dual` avoids this enti
 design — `-sm none`, one GPU per process — so this only matters if you're manually testing
 the ROCm binary outside of `llamesa.sh`.
 
-**Before/after every `-dual` test**: check `ps aux | grep llama-server` and `free -h` to
-confirm full cleanup from the previous run before starting the next — stacking multiple
-test processes without confirming cleanup is what caused the kernel OOM/hard-reboot
-mentioned above. If a background `stop-dual`/`stop-big` SSH command appears to hang, the
-remote command has sometimes still completed fine — verify via a fresh SSH connection
-checking `ps aux`/`free -h` rather than assuming failure or retrying blindly.
+**Before/after every `-dual` or `-big` test**: check `ps aux | grep llama-server` and
+`free -h` to confirm full cleanup from the previous run before starting the next —
+stacking multiple test processes without confirming cleanup is what caused the kernel
+OOM/hard-reboot mentioned above. For `-big` specifically, also check each GPU's VRAM sysfs
+directly (`/sys/class/drm/card<N>/device/mem_info_vram_used`) — `free -h` only shows
+system RAM and won't reveal a GPU with leftover VRAM from a killed process, which is
+believed to have caused the original (now-resolved) cross-GPU split failures. If a
+background `stop-dual`/`stop-big` SSH command appears to hang, the remote command has
+sometimes still completed fine — verify via a fresh SSH connection checking
+`ps aux`/`free -h` rather than assuming failure or retrying blindly.
