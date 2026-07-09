@@ -37,20 +37,13 @@
     "dual_gpu": {
       "r9700": {
         "port": 1234,
-        "llama_binary": "/run/host/home/bongtangco/llama.cpp/build/bin/llama-server",
-        "env": {
-          "RADV_DEBUG": "nocompute",
-          "GPU_MAX_HW_QUEUES": "1"
-        }
+        "llama_binary": "/run/host/home/bongtangco/llama.cpp-rocm/build-rocm/bin/llama-server",
+        "env": {}
       },
       "rx9060xt": {
         "port": 1235,
-        "llama_binary": "/run/host/home/bongtangco/llama.cpp/build/bin/llama-server",
-        "env": {
-          "HIP_VISIBLE_DEVICES": "1",
-          "GGML_CUDA_NO_PEER_COPY": "1",
-          "HSA_OVERRIDE_GFX_VERSION": "12.0.1"
-        }
+        "llama_binary": "/run/host/home/bongtangco/llama.cpp-rocm/build-rocm/bin/llama-server",
+        "env": {}
       }
     },
     "vulkan_split": {
