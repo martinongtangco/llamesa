@@ -435,6 +435,59 @@ cmd_list_models() {
     fi
 }
 
+# Reads a model's native max context length directly from its GGUF metadata,
+# via llama.cpp's bundled gguf-py — no extra install; it ships as a plain
+# Python package alongside any llama.cpp checkout. Used by the client to
+# suggest the model's real max instead of the server's generic
+# default_context. Best-effort: emits {"context_length": null} instead of
+# erroring when gguf-py can't be located or reading fails, so the client can
+# just fall back to default_context.
+cmd_model_context() {
+    read_config
+
+    local model_path=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --path) model_path="$2"; shift 2 ;;
+            *) error "Unknown option: $1" ;;
+        esac
+    done
+    [[ -z "$model_path" ]] && error "Model path required. Use --path <file>"
+
+    if [[ ! -f "$model_path" ]] || ! command -v python3 >/dev/null 2>&1; then
+        echo '{"context_length":null}'
+        return 0
+    fi
+
+    # gguf-py lives as a sibling of the configured llama.cpp checkout's
+    # build/bin/ — derive it from llama_binary rather than hardcoding a path.
+    # This runs at the host level, so strip a distrobox /run/host prefix if
+    # llama_binary is expressed as an in-container path.
+    local host_binary="${LLAMA_BINARY#/run/host}"
+    local gguf_py_dir
+    gguf_py_dir="$(dirname "$(dirname "$(dirname "$host_binary")")")/gguf-py"
+
+    if [[ ! -d "$gguf_py_dir" ]]; then
+        echo '{"context_length":null}'
+        return 0
+    fi
+
+    PYTHONPATH="$gguf_py_dir" python3 -c "
+import json
+try:
+    import gguf
+    r = gguf.GGUFReader('${model_path}')
+    ctx = None
+    for k, f in r.fields.items():
+        if k.endswith('.context_length'):
+            ctx = int(f.parts[f.data[0]][0])
+            break
+    print(json.dumps({'context_length': ctx}))
+except Exception:
+    print(json.dumps({'context_length': None}))
+"
+}
+
 cmd_status() {
     read_config
     if [[ "$GPU_ID" == "all" ]]; then
@@ -1870,6 +1923,8 @@ Commands:
   restart     Restart with current or new settings
   status      Show server status as JSON
   list-models List available models as JSON
+  model-context Read a model's native max context length from its GGUF metadata
+    --path <file>       Full path to the .gguf file (from list-models' "path" field)
   logs        Stream server logs
   download    Download a model from HuggingFace
     --repo <id>         HuggingFace repo ID (required)
@@ -1925,6 +1980,7 @@ main() {
         restart)     cmd_restart "$@" ;;
         status)      cmd_status "$@" ;;
         list-models) cmd_list_models "$@" ;;
+        model-context) cmd_model_context "$@" ;;
         logs)        cmd_logs "$@" ;;
         download)    cmd_download "$@" ;;
         start-big)   cmd_start_big "$@" ;;

@@ -224,6 +224,11 @@ function Test-ServerConnection {
 function Get-ServerStatus {
     $raw = Invoke-ServerCommand "status --gpu all" -raw
     if (-not $raw) { return $null }
+    # PowerShell collapses a single-line SSH capture from [string[]] to a
+    # plain [string] — without this, $raw[0] below would index the first
+    # *character* of that line instead of the line itself, truncating any
+    # command whose JSON output happens to come back on exactly one line.
+    $raw = @($raw) -split "`r?`n"
 
     try {
         # Find the first line starting with [ and collect from there — skips any [INFO] prefix lines
@@ -251,6 +256,7 @@ function Get-ServerStatus {
 function Get-BigStatus {
     $raw = Invoke-ServerCommand "status-big" -raw
     if (-not $raw) { return $null }
+    $raw = @($raw) -split "`r?`n"   # see Get-ServerStatus — normalize a possible single-line collapse
 
     try {
         $jsonStartIndex = -1
@@ -956,6 +962,7 @@ function Get-DualStatus {
     $cmdStr = if ($gpu) { "status-dual --gpu $gpu" } else { "status-dual" }
     $raw = Invoke-ServerCommand $cmdStr -raw
     if (-not $raw) { return $null }
+    $raw = @($raw) -split "`r?`n"   # see Get-ServerStatus — normalize a possible single-line collapse
 
     try {
         $jsonStartIndex = -1
@@ -1000,7 +1007,44 @@ function Format-ModelLabel {
 # server falls back to its own configured default_context — the operator's
 # intended max — rather than the client guessing/hardcoding a number that
 # could be stale relative to what's actually configured on the box.
+# Reads a model's native max context length straight from its GGUF metadata
+# (via the server's model-context command — llama.cpp's bundled gguf-py,
+# no extra install). Returns $null on any failure (gguf-py not found, parse
+# error, etc.) so callers can fall back to the server's configured default.
+function Get-ModelContextLength {
+    param([string]$path)
+    if (-not $path) { return $null }
+    $raw = Invoke-ServerCommand ("model-context --path ""{0}""" -f $path) -raw
+    if (-not $raw) { return $null }
+    $raw = @($raw) -split "`r?`n"   # see Get-ServerStatus — normalize a possible single-line collapse
+    try {
+        $jsonStartIndex = -1
+        for ($i = 0; $i -lt $raw.Count; $i++) {
+            if ($raw[$i] -match '^\s*[\[{]' -and $raw[$i] -notmatch '^\s*\[(INFO|WARN|ERROR)\]') {
+                $jsonStartIndex = $i
+                break
+            }
+        }
+        if ($jsonStartIndex -lt 0) { return $null }
+        $jsonText = $raw[$jsonStartIndex..($raw.Count - 1)] -join "`n"
+        $result = $jsonText | ConvertFrom-Json
+        if ($result.context_length) { return [int]$result.context_length }
+        return $null
+    } catch {
+        return $null
+    }
+}
+
 function Read-CtxArg {
+    param([Nullable[int]]$SuggestedMax = $null)
+
+    if ($SuggestedMax) {
+        Write-Host ("  {0}Context size — model's max is {1}. Press enter to use it, or type a smaller value.{2}" -f $gray, $SuggestedMax, $reset)
+        $ctx = Read-Host "Context size"
+        if (-not $ctx) { return "--ctx $SuggestedMax" }
+        return "--ctx $ctx"
+    }
+
     Write-Host ("  {0}Context size — leave blank to use the server's configured max, or enter a smaller value.{1}" -f $gray, $reset)
     $ctx = Read-Host "Context size"
     if ($ctx) { return "--ctx $ctx" }
@@ -1048,7 +1092,22 @@ function Cmd-Start {
     if (-not $thinkChoice) { Write-Host ("{0}Cancelled.{1}" -f $gray, $reset); return }
     $thinking = if ($thinkChoice -eq "on") { "true" } else { "false" }
 
-    $ctxArg = Read-CtxArg
+    # Offer the model's own native max as the default rather than a generic
+    # server-configured one — for two models sharing one --ctx value (dual
+    # mode), that's the smaller of the two so neither is asked to exceed
+    # what it actually supports.
+    Write-Host ("{0}Checking model's max context...{1}" -f $gray, $reset)
+    $ctxSuggestion = $null
+    if ($selected.Count -eq 1) {
+        $ctxSuggestion = Get-ModelContextLength $selected[0].path
+    } elseif ($selected.Count -eq 2) {
+        $ctxA = Get-ModelContextLength $selected[0].path
+        $ctxB = Get-ModelContextLength $selected[1].path
+        if ($ctxA -and $ctxB) { $ctxSuggestion = [Math]::Min($ctxA, $ctxB) }
+        elseif ($ctxA) { $ctxSuggestion = $ctxA }
+        elseif ($ctxB) { $ctxSuggestion = $ctxB }
+    }
+    $ctxArg = Read-CtxArg -SuggestedMax $ctxSuggestion
 
     if ($selected.Count -eq 1 -and $gpuCount -le 1) {
         $parallelInput = Read-Host "Parallel slots? [1-4, default: 1]"
@@ -1275,7 +1334,8 @@ function Restart-BigMode {
     if (-not $thinkChoice) { Write-Host ("{0}Cancelled.{1}" -f $gray, $reset); return }
     $thinking = if ($thinkChoice -eq "on") { "true" } else { "false" }
 
-    $ctxArg = Read-CtxArg
+    Write-Host ("{0}Checking model's max context...{1}" -f $gray, $reset)
+    $ctxArg = Read-CtxArg -SuggestedMax (Get-ModelContextLength $model.path)
 
     Write-Host ""
     Write-Host ("{0}Restarting with {1} (combined VRAM)...{2}" -f $cyan, $model.name, $reset)
