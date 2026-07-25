@@ -19,6 +19,7 @@ $dim    = "`e[38;2;42;42;42m"     # dim separators
 $white  = "`e[38;2;224;224;224m"  # #E0E0E0 — primary text
 $cyan   = "`e[38;2;55;200;221m"   # accent
 $green  = "`e[38;2;93;202;165m"   # alias for teal
+$pink   = "`e[38;2;220;120;180m"  # status bar model name
 $reset  = "`e[0m"
 
 # ── Config ────────────────────────────────────────────────────────────────
@@ -35,6 +36,50 @@ $Script:ChatPort           = $null   # resolved chat endpoint port; re-resolved 
 $Script:ChatModeSnapshot   = $null   # ActiveMode at the time ChatPort was resolved
 $Script:ThinkingEnabled    = $false  # toggled with /think, /nothink; seeded from server status on first resolve
 $Script:ThinkingSeeded     = $false
+$Script:RenderBuffer       = [System.Collections.Generic.List[string]]::new()
+$Script:PrevFrameLines     = 0
+
+# ── Buffered Rendering ────────────────────────────────────────────────────
+# Draw-Screen (and everything it calls) writes lines into $Script:RenderBuffer
+# via Out-Line instead of calling Write-Host directly. Render-Frame then
+# flushes the whole frame in one pass, overwriting the previous frame in
+# place (via ANSI "erase to end of line") instead of Clear-Host — Clear-Host
+# followed by a fresh repaint is what caused the visible flicker on every
+# keystroke while the palette was open. Only the main idle-redraw path uses
+# this; one-off command output (Cmd-Start, chat streaming, etc.) still uses
+# plain Write-Host and scrolls normally, unaffected.
+
+function Out-Line {
+    param([string]$text = "")
+    # Split on embedded newlines (e.g. multi-line chat responses) so the
+    # buffer's line count always matches real terminal rows — otherwise
+    # Render-Frame would under-count how many rows a frame actually used.
+    foreach ($part in ($text -split "\r?\n")) {
+        $Script:RenderBuffer.Add($part)
+    }
+}
+
+function Render-Frame {
+    $top = [Console]::WindowTop
+    [Console]::SetCursorPosition(0, $top)
+
+    foreach ($line in $Script:RenderBuffer) {
+        [Console]::Out.Write($line)
+        [Console]::Out.Write("`e[K")   # erase to end of line — clears leftover chars regardless of ANSI codes in $line
+        [Console]::Out.Write("`r`n")
+    }
+
+    # Clear any rows left over from a previous, taller frame
+    if ($Script:PrevFrameLines -gt $Script:RenderBuffer.Count) {
+        for ($i = $Script:RenderBuffer.Count; $i -lt $Script:PrevFrameLines; $i++) {
+            [Console]::Out.Write("`e[K`r`n")
+        }
+        [Console]::SetCursorPosition(0, $top + $Script:RenderBuffer.Count)
+    }
+
+    $Script:PrevFrameLines = $Script:RenderBuffer.Count
+    $Script:RenderBuffer.Clear()
+}
 
 # ── JSON Helpers ──────────────────────────────────────────────────────────
 
@@ -437,7 +482,7 @@ function Show-GpuRow {
 
         $statusDot = if ($running) { "{0}●{1}" -f $teal, $reset } else { "{0}●{1}" -f $red, $reset }
 
-        Write-Host ("  ${statusDot} ${gpuLabel} ${nameLabel}${barStr} ${vramStr}  ${busyStr}")
+        Out-Line ("  ${statusDot} ${gpuLabel} ${nameLabel}${barStr} ${vramStr}  ${busyStr}")
     }
 }
 
@@ -451,13 +496,13 @@ function Show-Header {
     # Line 1 — logo + tagline
     $logo    = "{0}LL{1}a{2}M{3}esa{4}" -f $teal, $amber, $teal, $amber, $reset
     $tagline = "{0}local inference control plane · v0.2{1}" -f $dim, $reset
-    Write-Host ("{0} {1}" -f $logo, $tagline)
+    Out-Line ("{0} {1}" -f $logo, $tagline)
 
     # Line 2 — server dot + name + host + port
     if ($Script:ActiveServerName) {
         $dot  = if ($Script:ServerOnline) { "{0}●{1}" -f $teal, $reset } else { "{0}●{1}" -f $red, $reset }
         $port = $Script:ActiveServer.port
-        Write-Host ("  {0} {1}{2}{3} · {4}{5}{3} · {4}{6}{3}" -f `
+        Out-Line ("  {0} {1}{2}{3} · {4}{5}{3} · {4}{6}{3}" -f `
             $dot, $teal, $Script:ActiveServerName, $reset, $gray, $Script:ActiveServer.host, $port)
     }
 
@@ -502,31 +547,31 @@ function Show-Header {
 
         # Card order: VRAM, GPU, RAM, CPU — "loaded memory to gpus" first, CPU last.
         # Top border — VRAM=20 dashes, small=15 dashes
-        Write-Host ("  ${b}┌────────────────────┐${r} ${b}┌───────────────┐${r} ${b}┌───────────────┐${r} ${b}┌───────────────┐${r}")
+        Out-Line ("  ${b}┌────────────────────┐${r} ${b}┌───────────────┐${r} ${b}┌───────────────┐${r} ${b}┌───────────────┐${r}")
 
         # Label row: 1 leading space + label padded to 19 (VRAM) / 14 (small)
         $lblRow  = "  ${b}│${r} ${gray}$("VRAM".PadRight(19))${r}${b}│${r} "
         $lblRow += "${b}│${r} ${gray}$("GPU".PadRight(14))${r}${b}│${r} "
         $lblRow += "${b}│${r} ${gray}$("RAM".PadRight(14))${r}${b}│${r} "
         $lblRow += "${b}│${r} ${gray}$("CPU".PadRight(14))${r}${b}│${r}"
-        Write-Host $lblRow
+        Out-Line $lblRow
 
         # Value row: colored value padded to 19 (VRAM) / 14 (small) — PadRight on plain string, then wrap in color
         $valRow  = "  ${b}│${r} ${vramCol}$($vramVal.PadRight(19))${r}${b}│${r} "
         $valRow += "${b}│${r} ${gpuCol}$($gpuVal.PadRight(14))${r}${b}│${r} "
         $valRow += "${b}│${r} ${ramCol}$($ramVal.PadRight(14))${r}${b}│${r} "
         $valRow += "${b}│${r} ${cpuCol}$($cpuVal.PadRight(14))${r}${b}│${r}"
-        Write-Host $valRow
+        Out-Line $valRow
 
         # Bar row: 12-char bar + padding to fill inner (VRAM: 7 spaces, small: 2 spaces)
         $barRow  = "  ${b}│${r} ${vramBar}       ${b}│${r} "
         $barRow += "${b}│${r} ${gpuBar}  ${b}│${r} "
         $barRow += "${b}│${r} ${ramBar}  ${b}│${r} "
         $barRow += "${b}│${r} ${cpuBar}  ${b}│${r}"
-        Write-Host $barRow
+        Out-Line $barRow
 
         # Bottom border
-        Write-Host ("  ${b}└────────────────────┘${r} ${b}└───────────────┘${r} ${b}└───────────────┘${r} ${b}└───────────────┘${r}")
+        Out-Line ("  ${b}└────────────────────┘${r} ${b}└───────────────┘${r} ${b}└───────────────┘${r} ${b}└───────────────┘${r}")
 
         # Model row with pill badges
         if ($status.running) {
@@ -540,9 +585,9 @@ function Show-Header {
             } elseif ($Script:GpuStatus -and $Script:GpuStatus.running) {
                 $gpuPill = "${gray}[GPU$($Script:GpuStatus.gpu_id) $($Script:GpuStatus.gpu_name)]${r}"
             }
-            Write-Host ("  ${gray}MODEL${r}  ${white}$($status.model)${r}  ${ctxPill}  ${thinkingPill}  ${toksPill}  ${gpuPill}")
+            Out-Line ("  ${gray}MODEL${r}  ${white}$($status.model)${r}  ${ctxPill}  ${thinkingPill}  ${toksPill}  ${gpuPill}")
         } else {
-            Write-Host ("  ${gray}MODEL  none${r}")
+            Out-Line ("  ${gray}MODEL  none${r}")
         }
 
         # Last-updated timestamp
@@ -558,18 +603,18 @@ function Show-Header {
                 $tsStr = "{0}h ago" -f [int]($elapsed / 3600)
             }
             $stale = if ($elapsed -ge 15) { "${red}[stale]${r}" } else { "" }
-            Write-Host ("  ${dim}updated ${tsStr}${r} ${stale}")
+            Out-Line ("  ${dim}updated ${tsStr}${r} ${stale}")
         } else {
-            Write-Host ("  ${dim}updated --${r}")
+            Out-Line ("  ${dim}updated --${r}")
         }
     } else {
         # Offline placeholder — same number of lines as card block so layout is stable
-        Write-Host ("  ${dim}┌────────────────────┐ ┌───────────────┐ ┌───────────────┐ ┌───────────────┐${reset}")
-        Write-Host ("  ${dim}│  offline           │ │               │ │               │ │               │${reset}")
-        Write-Host ("  ${dim}│                    │ │               │ │               │ │               │${reset}")
-        Write-Host ("  ${dim}│                    │ │               │ │               │ │               │${reset}")
-        Write-Host ("  ${dim}└────────────────────┘ └───────────────┘ └───────────────┘ └───────────────┘${reset}")
-        Write-Host ("  ${gray}MODEL  none${reset}")
+        Out-Line ("  ${dim}┌────────────────────┐ ┌───────────────┐ ┌───────────────┐ ┌───────────────┐${reset}")
+        Out-Line ("  ${dim}│  offline           │ │               │ │               │ │               │${reset}")
+        Out-Line ("  ${dim}│                    │ │               │ │               │ │               │${reset}")
+        Out-Line ("  ${dim}│                    │ │               │ │               │ │               │${reset}")
+        Out-Line ("  ${dim}└────────────────────┘ └───────────────┘ └───────────────┘ └───────────────┘${reset}")
+        Out-Line ("  ${gray}MODEL  none${reset}")
 
         # Last-updated timestamp (offline)
         if ($Script:LastStatusRefresh) {
@@ -584,13 +629,13 @@ function Show-Header {
                 $tsStr = "{0}h ago" -f [int]($elapsed / 3600)
             }
             $stale = if ($elapsed -ge 15) { "${red}[stale]${r}" } else { "" }
-            Write-Host ("  ${dim}updated ${tsStr}${r} ${stale}")
+            Out-Line ("  ${dim}updated ${tsStr}${r} ${stale}")
         } else {
-            Write-Host ("  ${dim}updated --${r}")
+            Out-Line ("  ${dim}updated --${r}")
         }
     }
 
-    Write-Host ("${dim}$("─" * [Math]::Max($w - 1, 20))${reset}")
+    Out-Line ("${dim}$("─" * [Math]::Max($w - 1, 20))${reset}")
 }
 
 # ── UI: Big-mode header (Vulkan combined-VRAM) ───────────────────────────
@@ -606,13 +651,13 @@ function Show-HeaderBig {
     # Line 1 — logo + tagline
     $logo    = "{0}LL{1}a{2}M{3}esa{4}" -f $teal, $amber, $teal, $amber, $reset
     $tagline = "{0}local inference control plane · v0.2 · Vulkan combined-VRAM{1}" -f $dim, $reset
-    Write-Host ("{0} {1}" -f $logo, $tagline)
+    Out-Line ("{0} {1}" -f $logo, $tagline)
 
     # Line 2 — server dot + name + host + port
     if ($Script:ActiveServerName) {
         $dot  = if ($Script:ServerOnline) { "{0}●{1}" -f $teal, $reset } else { "{0}●{1}" -f $red, $reset }
         $port = if ($status -and $status.port) { $status.port } else { $Script:ActiveServer.port }
-        Write-Host ("  {0} {1}{2}{3} · {4}{5}{3} · {4}{6}{3}" -f `
+        Out-Line ("  {0} {1}{2}{3} · {4}{5}{3} · {4}{6}{3}" -f `
             $dot, $teal, $Script:ActiveServerName, $reset, $gray, $Script:ActiveServer.host, $port)
     }
 
@@ -632,10 +677,10 @@ function Show-HeaderBig {
             $vramStr  = "{0,-5}/{1,-5} GB" -f $vramUsedGb, $vramTotalGb
             $busyStr  = "{0}{1,-4}%{2}" -f $busyColor, $dev.gpu_busy_percent, $reset
 
-            Write-Host ("  ${devLabel} ${barStr} ${vramStr}  ${busyStr}")
+            Out-Line ("  ${devLabel} ${barStr} ${vramStr}  ${busyStr}")
         }
     } else {
-        Write-Host ("  {0}no device data{1}" -f $gray, $reset)
+        Out-Line ("  {0}no device data{1}" -f $gray, $reset)
     }
 
     # CPU/RAM stat cards — host-level, single instance (one process spans both GPUs)
@@ -655,19 +700,19 @@ function Show-HeaderBig {
         $ramVal = if ($ramTotGb -gt 0) { "{0} / {1} GB" -f $ramUsedGb, $ramTotGb } else { "{0} GB" -f $ramUsedGb }
 
         # Card order: RAM, CPU — GPU/VRAM already covered by the per-device bars above.
-        Write-Host ("  ${b}┌───────────────┐${r} ${b}┌───────────────┐${r}")
-        Write-Host ("  ${b}│${r} ${gray}$("RAM".PadRight(14))${r}${b}│${r} ${b}│${r} ${gray}$("CPU".PadRight(14))${r}${b}│${r}")
-        Write-Host ("  ${b}│${r} ${ramCol}$($ramVal.PadRight(14))${r}${b}│${r} ${b}│${r} ${cpuCol}$($cpuVal.PadRight(14))${r}${b}│${r}")
-        Write-Host ("  ${b}│${r} ${ramBar}  ${b}│${r} ${b}│${r} ${cpuBar}  ${b}│${r}")
-        Write-Host ("  ${b}└───────────────┘${r} ${b}└───────────────┘${r}")
+        Out-Line ("  ${b}┌───────────────┐${r} ${b}┌───────────────┐${r}")
+        Out-Line ("  ${b}│${r} ${gray}$("RAM".PadRight(14))${r}${b}│${r} ${b}│${r} ${gray}$("CPU".PadRight(14))${r}${b}│${r}")
+        Out-Line ("  ${b}│${r} ${ramCol}$($ramVal.PadRight(14))${r}${b}│${r} ${b}│${r} ${cpuCol}$($cpuVal.PadRight(14))${r}${b}│${r}")
+        Out-Line ("  ${b}│${r} ${ramBar}  ${b}│${r} ${b}│${r} ${cpuBar}  ${b}│${r}")
+        Out-Line ("  ${b}└───────────────┘${r} ${b}└───────────────┘${r}")
 
         if ($status.running) {
             $thinkingPill = if ($status.thinking) { "${teal}[thinking on]${reset}" } else { "${gray}[thinking off]${reset}" }
             $ctxPill      = if ($status.ctx -gt 0) { "${teal}[ctx $($status.ctx)]${reset}" } else { "" }
             $toksPill     = if ($Script:LastTokS)  { "${amber}[$($Script:LastTokS) tok/s]${reset}" } else { "" }
-            Write-Host ("  ${gray}MODEL${reset}  ${white}$($status.model)${reset}  ${ctxPill}  ${thinkingPill}  ${toksPill}  ${gray}[vulkan · both GPUs]${reset}")
+            Out-Line ("  ${gray}MODEL${reset}  ${white}$($status.model)${reset}  ${ctxPill}  ${thinkingPill}  ${toksPill}  ${gray}[vulkan · both GPUs]${reset}")
         } else {
-            Write-Host ("  ${gray}MODEL  none${reset}")
+            Out-Line ("  ${gray}MODEL  none${reset}")
         }
 
         if ($Script:LastStatusRefresh) {
@@ -677,20 +722,20 @@ function Show-HeaderBig {
             elseif ($elapsed -lt 3600) { $tsStr = "{0}m ago" -f [int]($elapsed / 60) }
             else { $tsStr = "{0}h ago" -f [int]($elapsed / 3600) }
             $stale = if ($elapsed -ge 15) { "${red}[stale]${reset}" } else { "" }
-            Write-Host ("  ${dim}updated ${tsStr}${reset} ${stale}")
+            Out-Line ("  ${dim}updated ${tsStr}${reset} ${stale}")
         } else {
-            Write-Host ("  ${dim}updated --${reset}")
+            Out-Line ("  ${dim}updated --${reset}")
         }
     } else {
-        Write-Host ("  {0}┌───────────────┐ ┌───────────────┐{1}" -f $dim, $reset)
-        Write-Host ("  {0}│  offline      │ │               │{1}" -f $dim, $reset)
-        Write-Host ("  {0}│               │ │               │{1}" -f $dim, $reset)
-        Write-Host ("  {0}└───────────────┘ └───────────────┘{1}" -f $dim, $reset)
-        Write-Host ("  {0}MODEL  none{1}" -f $gray, $reset)
-        Write-Host ("  {0}updated --{1}" -f $dim, $reset)
+        Out-Line ("  {0}┌───────────────┐ ┌───────────────┐{1}" -f $dim, $reset)
+        Out-Line ("  {0}│  offline      │ │               │{1}" -f $dim, $reset)
+        Out-Line ("  {0}│               │ │               │{1}" -f $dim, $reset)
+        Out-Line ("  {0}└───────────────┘ └───────────────┘{1}" -f $dim, $reset)
+        Out-Line ("  {0}MODEL  none{1}" -f $gray, $reset)
+        Out-Line ("  {0}updated --{1}" -f $dim, $reset)
     }
 
-    Write-Host ("${dim}$("─" * [Math]::Max($w - 1, 20))${reset}")
+    Out-Line ("${dim}$("─" * [Math]::Max($w - 1, 20))${reset}")
 }
 
 # ── UI: Dual-mode header (two independent ROCm instances) ────────────────
@@ -726,39 +771,39 @@ function Show-DualInstanceRow {
     $vramVal = if ($vramTotGb -gt 0) { "{0} / {1} GB" -f $vramUsedGb, $vramTotGb } else { "{0} GB" -f $vramUsedGb }
 
     $dotColor = if ($running) { $teal } else { $red }
-    Write-Host ("  {0}●{1} {2}{3}{4}" -f $dotColor, $r, $teal, $gpuId, $r)
+    Out-Line ("  {0}●{1} {2}{3}{4}" -f $dotColor, $r, $teal, $gpuId, $r)
 
     # Card order: VRAM, GPU, RAM, CPU — "loaded memory to gpus" first, CPU last.
-    Write-Host ("  ${b}┌────────────────────┐${r} ${b}┌───────────────┐${r} ${b}┌───────────────┐${r} ${b}┌───────────────┐${r}")
+    Out-Line ("  ${b}┌────────────────────┐${r} ${b}┌───────────────┐${r} ${b}┌───────────────┐${r} ${b}┌───────────────┐${r}")
 
     $lblRow  = "  ${b}│${r} ${gray}$("VRAM".PadRight(19))${r}${b}│${r} "
     $lblRow += "${b}│${r} ${gray}$("GPU".PadRight(14))${r}${b}│${r} "
     $lblRow += "${b}│${r} ${gray}$("RAM".PadRight(14))${r}${b}│${r} "
     $lblRow += "${b}│${r} ${gray}$("CPU".PadRight(14))${r}${b}│${r}"
-    Write-Host $lblRow
+    Out-Line $lblRow
 
     $valRow  = "  ${b}│${r} ${vramCol}$($vramVal.PadRight(19))${r}${b}│${r} "
     $valRow += "${b}│${r} ${gpuCol}$($gpuVal.PadRight(14))${r}${b}│${r} "
     $valRow += "${b}│${r} ${ramCol}$($ramVal.PadRight(14))${r}${b}│${r} "
     $valRow += "${b}│${r} ${cpuCol}$($cpuVal.PadRight(14))${r}${b}│${r}"
-    Write-Host $valRow
+    Out-Line $valRow
 
     $barRow  = "  ${b}│${r} ${vramBar}       ${b}│${r} "
     $barRow += "${b}│${r} ${gpuBar}  ${b}│${r} "
     $barRow += "${b}│${r} ${ramBar}  ${b}│${r} "
     $barRow += "${b}│${r} ${cpuBar}  ${b}│${r}"
-    Write-Host $barRow
+    Out-Line $barRow
 
-    Write-Host ("  ${b}└────────────────────┘${r} ${b}└───────────────┘${r} ${b}└───────────────┘${r} ${b}└───────────────┘${r}")
+    Out-Line ("  ${b}└────────────────────┘${r} ${b}└───────────────┘${r} ${b}└───────────────┘${r} ${b}└───────────────┘${r}")
 
     if ($running) {
         $thinkingPill = if ($inst.thinking) { "${teal}[thinking on]${r}" } else { "${gray}[thinking off]${r}" }
         $ctxPill      = if ($inst.ctx -gt 0) { "${teal}[ctx $($inst.ctx)]${r}" } else { "" }
-        Write-Host ("  ${gray}MODEL${r}  ${white}$($inst.model)${r}  ${ctxPill}  ${thinkingPill}")
+        Out-Line ("  ${gray}MODEL${r}  ${white}$($inst.model)${r}  ${ctxPill}  ${thinkingPill}")
     } else {
-        Write-Host ("  ${gray}MODEL  none${r}")
+        Out-Line ("  ${gray}MODEL  none${r}")
     }
-    Write-Host ""
+    Out-Line ""
 }
 
 function Show-HeaderDual {
@@ -768,11 +813,11 @@ function Show-HeaderDual {
 
     $logo    = "{0}LL{1}a{2}M{3}esa{4}" -f $teal, $amber, $teal, $amber, $reset
     $tagline = "{0}local inference control plane · v0.2 · dual independent servers{1}" -f $dim, $reset
-    Write-Host ("{0} {1}" -f $logo, $tagline)
+    Out-Line ("{0} {1}" -f $logo, $tagline)
 
     if ($Script:ActiveServerName) {
         $dot = if ($Script:ServerOnline) { "{0}●{1}" -f $teal, $reset } else { "{0}●{1}" -f $red, $reset }
-        Write-Host ("  {0} {1}{2}{3} · {4}{5}{3}" -f `
+        Out-Line ("  {0} {1}{2}{3} · {4}{5}{3}" -f `
             $dot, $teal, $Script:ActiveServerName, $reset, $gray, $Script:ActiveServer.host)
     }
 
@@ -781,7 +826,7 @@ function Show-HeaderDual {
     elseif ($status) { $instances = @($status) }
 
     if ($instances.Count -eq 0) {
-        Write-Host ("  {0}no dual instance data{1}" -f $gray, $reset)
+        Out-Line ("  {0}no dual instance data{1}" -f $gray, $reset)
     } else {
         foreach ($inst in $instances) {
             Show-DualInstanceRow $inst
@@ -795,12 +840,12 @@ function Show-HeaderDual {
         elseif ($elapsed -lt 3600) { $tsStr = "{0}m ago" -f [int]($elapsed / 60) }
         else { $tsStr = "{0}h ago" -f [int]($elapsed / 3600) }
         $stale = if ($elapsed -ge 15) { "${red}[stale]${reset}" } else { "" }
-        Write-Host ("  ${dim}updated ${tsStr}${reset} ${stale}")
+        Out-Line ("  ${dim}updated ${tsStr}${reset} ${stale}")
     } else {
-        Write-Host ("  ${dim}updated --${reset}")
+        Out-Line ("  ${dim}updated --${reset}")
     }
 
-    Write-Host ("${dim}$("─" * [Math]::Max($w - 1, 20))${reset}")
+    Out-Line ("${dim}$("─" * [Math]::Max($w - 1, 20))${reset}")
 }
 
 # ── UI: Header/status dispatch (mode-aware) ──────────────────────────────
@@ -1461,30 +1506,30 @@ function Resolve-ChatEndpoint {
 function Show-ChatHistory {
     foreach ($msg in $Script:ChatHistory) {
         if ($msg.role -eq "user") {
-            Write-Host ("  {0}You:{1}" -f $cyan, $reset)
-            Write-Host ("  {0}{1}{2}" -f $white, $msg.content, $reset)
-            Write-Host ""
+            Out-Line ("  {0}You:{1}" -f $cyan, $reset)
+            Out-Line ("  {0}{1}{2}" -f $white, $msg.content, $reset)
+            Out-Line ""
         }
         elseif ($msg.role -eq "assistant") {
-            Write-Host ("  {0}Model:{1}" -f $amber, $reset)
+            Out-Line ("  {0}Model:{1}" -f $amber, $reset)
 
             if ($msg.thinking) {
-                Write-Host ("  {0}⟨thinking⟩{1}" -f $gray, $reset)
-                Write-Host ("  {0}{1}{2}" -f $gray, $msg.thinking, $reset)
-                Write-Host ("  {0}⟨/thinking⟩{1}" -f $gray, $reset)
+                Out-Line ("  {0}⟨thinking⟩{1}" -f $gray, $reset)
+                Out-Line ("  {0}{1}{2}" -f $gray, $msg.thinking, $reset)
+                Out-Line ("  {0}⟨/thinking⟩{1}" -f $gray, $reset)
             }
 
-            Write-Host ("  {0}{1}{2}" -f $white, $msg.content, $reset)
+            Out-Line ("  {0}{1}{2}" -f $white, $msg.content, $reset)
 
             if ($msg.tok_s) {
-                Write-Host ""
-                Write-Host ("  {0}─{1}" -f $dim, "───────────────────────────────────────────────", $reset)
+                Out-Line ""
+                Out-Line ("  {0}─{1}" -f $dim, "───────────────────────────────────────────────", $reset)
                 $thinkingDisplay = if ($msg.thinking_toks) { "$($msg.thinking_toks) thinking · " } else { "" }
-                Write-Host ("  {0}⬡ {1} prompt · {2}{3} gen · {4} tok/s · {5}s{6}" -f `
+                Out-Line ("  {0}⬡ {1} prompt · {2}{3} gen · {4} tok/s · {5}s{6}" -f `
                     $amber, $msg.prompt_toks, $thinkingDisplay, $msg.gen_toks, $msg.tok_s, $msg.duration, $reset)
             }
 
-            Write-Host ""
+            Out-Line ""
         }
     }
 }
@@ -1795,19 +1840,19 @@ function Cmd-Config {
 # typing a full command name (e.g. "/start" + Enter) dispatches to.
 
 $Script:PaletteCommands = @(
-    [PSCustomObject]@{ Name = "start";    Section = "SERVER";     Desc = "start server — model(s), thinking, context" }
-    [PSCustomObject]@{ Name = "stop";     Section = "SERVER";     Desc = "stop what's running" }
-    [PSCustomObject]@{ Name = "restart";  Section = "SERVER";     Desc = "stop + start with same settings" }
-    [PSCustomObject]@{ Name = "health";   Section = "MONITORING"; Desc = "ping /health and /v1/models" }
-    [PSCustomObject]@{ Name = "logs";     Section = "MONITORING"; Desc = "tail verbose server output" }
-    [PSCustomObject]@{ Name = "models";   Section = "MODELS";     Desc = "list downloaded models + sizes" }
-    [PSCustomObject]@{ Name = "download"; Section = "MODELS";     Desc = "download from huggingface" }
-    [PSCustomObject]@{ Name = "clear";    Section = "CHAT";       Desc = "clear chat history" }
-    [PSCustomObject]@{ Name = "think";    Section = "CHAT";       Desc = "enable thinking mode" }
-    [PSCustomObject]@{ Name = "nothink";  Section = "CHAT";       Desc = "disable thinking mode" }
-    [PSCustomObject]@{ Name = "servers";  Section = "CONFIG";     Desc = "manage server profiles" }
-    [PSCustomObject]@{ Name = "config";   Section = "CONFIG";     Desc = "view/edit config" }
-    [PSCustomObject]@{ Name = "quit";     Section = "CONFIG";     Desc = "exit LLaMesa" }
+    [PSCustomObject]@{ Name = "start";    Desc = "start server — model(s), thinking, context" }
+    [PSCustomObject]@{ Name = "stop";     Desc = "stop what's running" }
+    [PSCustomObject]@{ Name = "restart";  Desc = "stop + start with same settings" }
+    [PSCustomObject]@{ Name = "health";   Desc = "ping /health and /v1/models" }
+    [PSCustomObject]@{ Name = "logs";     Desc = "tail verbose server output" }
+    [PSCustomObject]@{ Name = "models";   Desc = "list downloaded models + sizes" }
+    [PSCustomObject]@{ Name = "download"; Desc = "download from huggingface" }
+    [PSCustomObject]@{ Name = "clear";    Desc = "clear chat history" }
+    [PSCustomObject]@{ Name = "think";    Desc = "enable thinking mode" }
+    [PSCustomObject]@{ Name = "nothink";  Desc = "disable thinking mode" }
+    [PSCustomObject]@{ Name = "servers";  Desc = "manage server profiles" }
+    [PSCustomObject]@{ Name = "config";   Desc = "view/edit config" }
+    [PSCustomObject]@{ Name = "quit";     Desc = "exit LLaMesa" }
 )
 
 function Invoke-PaletteCommand {
@@ -1827,7 +1872,7 @@ function Invoke-PaletteCommand {
         "servers"  { Cmd-Servers }
         "config"   { Cmd-Config }
         "help"     { } # "/" already opens the palette — kept as a recognized no-op alias
-        "quit"     { Write-Host ("{0}Goodbye!{1}" -f $gray, $reset); exit 0 }
+        "quit"     { [Console]::CursorVisible = $true; Write-Host ("{0}Goodbye!{1}" -f $gray, $reset); exit 0 }
         default    { Write-Host ("{0}Unknown command: /{1}{2}" -f $red, $cmd, $reset); Start-Sleep -Seconds 1 }
     }
 }
@@ -1857,53 +1902,101 @@ function Test-ModelLoaded {
 # Agent-style. Bare text is sent as a chat message; the chat scrollback and
 # "/" palette are both rendered as part of the same full-screen redraw.
 
+# ── UI: Status Bar ────────────────────────────────────────────────────────
+# The Pi Agent-style single-line footer directly above the input: model,
+# thinking mode, GPU mode, server, connection. Reuses the $status object the
+# 2s poll already fetched — no extra SSH round trip per redraw.
+
+function Get-StatusBarModelName {
+    param($status)
+    if (-not $status) { return "no model" }
+    if ($status -is [array]) {
+        $running = @($status | Where-Object { $_.running -eq $true })
+        if ($running.Count -eq 2) { return "{0} + {1}" -f $running[0].model, $running[1].model }
+        if ($running.Count -eq 1) { return $running[0].model }
+        return "no model"
+    }
+    if ($status.running -and $status.model) { return $status.model }
+    return "no model"
+}
+
+function Get-StatusBarThinking {
+    param($status)
+    if ($status -is [array]) {
+        $running = @($status | Where-Object { $_.running -eq $true })
+        if ($running.Count -gt 0) { return [bool]$running[0].thinking }
+    } elseif ($status -and $status.running) {
+        return [bool]$status.thinking
+    }
+    return $Script:ThinkingEnabled
+}
+
+function Show-StatusBar {
+    param($status)
+
+    $w = [Console]::WindowWidth
+    Out-Line ("{0}{1}{2}" -f $dim, ("─" * [Math]::Max($w - 1, 20)), $reset)
+
+    $modelName = Get-StatusBarModelName $status
+    $thinking  = if (Get-StatusBarThinking $status) { "on" } else { "off" }
+    $serverStr = if ($Script:ActiveServerName) { "{0}@{1}" -f $Script:ActiveServerName, $Script:ActiveServer.host } else { "no server" }
+    $onlineStr = if ($Script:ServerOnline) { "{0}● online{1}" -f $green, $reset } else { "{0}● offline{1}" -f $red, $reset }
+    $sep = "{0}|{1}" -f $gray, $reset
+
+    $line  = "  {0}{1}{2}" -f $pink, $modelName, $reset
+    $line += "  {0}  {1}think:{2}{3}" -f $sep, $cyan, $thinking, $reset
+    $line += "  {0}  {1}{2} mode{3}" -f $sep, $cyan, $Script:ActiveMode, $reset
+    $line += "  {0}  {1}{2}{3}" -f $sep, $amber, $serverStr, $reset
+    $line += "  {0}  {1}" -f $sep, $onlineStr
+    Out-Line $line
+}
+
+# ── UI: Main Screen ───────────────────────────────────────────────────────
+# Everything is top-anchored — no padding to push the input to the last row.
+# Dashboard, chat scrollback, status bar, and input all flow directly one
+# after another; the palette (when open) drops down right under the input,
+# Pi Agent-style, instead of being pinned separately with dead space between.
+
 function Draw-Screen {
     param($status, [string]$inputBuffer, [bool]$paletteOpen, [string]$paletteFilter, [int]$paletteIndex)
 
-    Clear-Host
+    $Script:RenderBuffer.Clear()
+
     Show-ActiveHeader -status $status
     Show-ChatHistory
 
     if ($Script:InputHint) {
-        Write-Host ("  {0}{1}{2}" -f $amber, $Script:InputHint, $reset)
+        Out-Line ("  {0}{1}{2}" -f $amber, $Script:InputHint, $reset)
     }
 
-    # Everything is top-anchored — no padding to push the input to the last
-    # row. The input line sits directly under the header/scrollback, and the
-    # palette (if open) drops down directly under the input, Pi Agent-style,
-    # instead of being pinned separately with dead space in between.
-    $promptPrefix = "  › "   # visible chars only — must match what's written below for cursor math
+    Show-StatusBar $status
+
+    # Self-drawn block cursor instead of relying on the native terminal
+    # cursor — thicker, always visible regardless of terminal cursor style,
+    # and its position in the text is exact since it's just another glyph.
     $prefix = if ($paletteOpen) { "/$paletteFilter" } else { $inputBuffer }
-    $inputRow = [Console]::CursorTop
-    Write-Host ("  {0}›{1} {2}" -f $teal, $reset, $prefix)
-    $cursorCol = [Math]::Min($promptPrefix.Length + $prefix.Length, [Console]::WindowWidth - 1)
+    Out-Line ("  {0}›{1} {2}{3}█{4}" -f $teal, $reset, $white, $prefix, $reset)
 
     if ($paletteOpen) {
         $filtered = @($Script:PaletteCommands | Where-Object { $_.Name -like "*${paletteFilter}*" })
         if ($filtered.Count -eq 0) {
-            Write-Host ("  {0}No matching commands.{1}" -f $gray, $reset)
+            Out-Line ("  {0}No matching commands.{1}" -f $gray, $reset)
         } else {
-            $lastSection = $null
             for ($i = 0; $i -lt $filtered.Count; $i++) {
                 $c = $filtered[$i]
-                if ($c.Section -ne $lastSection) {
-                    Write-Host ("  {0}{1}{2}" -f $teal, $c.Section, $reset)
-                    $lastSection = $c.Section
-                }
-                $label = "/{0,-10} {1}" -f $c.Name, $c.Desc
+                $nameCol = "{0,-16}" -f $c.Name
                 if ($i -eq $paletteIndex) {
-                    Write-Host ("  {0}❯ {1}{2}" -f $teal, $label, $reset)
+                    Out-Line ("  {0}→{1} {2}{3}{4}  {5}{6}{4}" -f $teal, $reset, $white, $nameCol, $reset, $gray, $c.Desc)
                 } else {
-                    Write-Host ("    {0}{1}{2}" -f $white, $label, $reset)
+                    Out-Line ("    {0}{1}{2}  {3}{4}{2}" -f $gray, $nameCol, $reset, $gray, $c.Desc)
                 }
             }
         }
-        Write-Host ("  {0}up/down navigate  ·  enter select  ·  esc cancel{1}" -f $gray, $reset)
+        $pageLabel = if ($filtered.Count -gt 0) { "({0}/{1})" -f ($paletteIndex + 1), $filtered.Count } else { "(0/0)" }
+        Out-Line ("  {0}{1}{2}" -f $gray, $pageLabel, $reset)
     }
 
-    # Park the blinking cursor back on the input line (right after the typed
-    # text) even though the palette printed further rows beneath it.
-    try { [Console]::SetCursorPosition($cursorCol, $inputRow) } catch {}
+    Render-Frame
 }
 
 function Main {
@@ -1922,6 +2015,12 @@ function Main {
     $paletteFilter = ""
     $paletteIndex = 0
     $needsRedraw = $true
+
+    # Hide the native terminal cursor — the input line draws its own thick
+    # block cursor instead, so a second native cursor blinking wherever
+    # SetCursorPosition last left it would just be visual noise.
+    [Console]::CursorVisible = $false
+    try {
 
     while ($true) {
         # Auto-refresh every 2s — fires on its own now, not just after a command
@@ -2017,6 +2116,10 @@ function Main {
         }
 
         $needsRedraw = $true
+    }
+
+    } finally {
+        [Console]::CursorVisible = $true
     }
 }
 
