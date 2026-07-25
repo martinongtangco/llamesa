@@ -24,11 +24,12 @@ You run the client on Windows. It SSHs into your Bazzite machine and tells your 
 
 ## Features
 
-- 🚀 **One-command startup** — pick a model, set thinking mode, context size, done
-- 📊 **Live stats dashboard** — VRAM, GPU%, CPU%, RAM updating every 2 seconds
-- 🧠 **Thinking mode support** — toggle extended thinking on/off per session
-- 🔄 **Hot-swap models** — switch between models without full restart
-- 💬 **Built-in chat** — stream responses token-by-token right in your terminal
+- ⌨️ **Command palette** — press `/` for an arrow-key, live-filtering command menu; the chat input stays fixed at the bottom, always ready
+- 🚀 **GPU-aware startup** — `/start` picks 1 or more models: 1 loads across all GPUs (combined VRAM), one-per-GPU loads a model on each
+- 📊 **Live stats dashboard** — VRAM, GPU%, RAM, CPU auto-refreshing every 2 seconds, no keypress needed
+- 🧠 **Thinking mode support** — toggle extended thinking on/off with `/think` and `/nothink`
+- 🔄 **Hot-swap models** — run `/start` again and the server stops the old model for you
+- 💬 **Chat is the default** — just type and hit enter, no separate chat mode; responses stream token-by-token
 - ⬇️ **Model downloads** — pull from HuggingFace without leaving the client
 - 🖼️ **Multimodal detection** — auto-detects mmproj files for vision models
 - 🖥️ **Multi-server profiles** — manage multiple Bazzite rigs from one client
@@ -55,7 +56,7 @@ pwsh -File client/llamesa.ps1
 ### Then just...
 
 ```
-/select a model → /start → watch it fire up → /chat → profit
+press / → /start → pick a model (or two, one per GPU) → watch it fire up → just start typing
 ```
 
 ## How It Works
@@ -89,21 +90,27 @@ Full setup guides: [Bazzite](docs/bazzite-setup.md) · [Windows](docs/windows-se
 
 ## Commands
 
+Press `/` any time to open the command palette — arrow keys to navigate, type
+to filter, enter to run. The dashboard (VRAM/GPU/RAM/CPU) is always on screen
+and refreshes on its own every 2 seconds; the input at the bottom is always a
+chat box unless you're running a command with it.
+
 | Command | What it does |
 |---------|-------------|
-| `/start` | Start server — pick model, thinking mode, context size |
-| `/stop` | Graceful shutdown |
-| `/switch` | Hot-swap to a different model |
-| `/restart` | Stop + start with same settings |
-| `/stats` | Live stats dashboard with scrolling logs |
+| `/start` | Start server — pick 1 model (loads across all GPUs) or one per GPU, thinking mode, context size |
+| `/stop` | Stop what's running — no prompt if only one thing is loaded |
+| `/restart` | Stop + start with the same settings |
 | `/health` | Ping `/health` and `/v1/models` endpoints |
 | `/logs` | Stream verbose server output |
 | `/models` | List downloaded models with sizes |
 | `/download` | Download from HuggingFace |
-| `/chat` | Chat with the model directly |
+| `/clear` | Clear chat history |
+| `/think` / `/nothink` | Toggle thinking mode |
 | `/servers` | Manage server profiles |
 | `/config` | View/edit config |
 | `/quit` | Exit |
+
+To chat, just type — no `/` needed — and hit enter.
 
 ## Config
 

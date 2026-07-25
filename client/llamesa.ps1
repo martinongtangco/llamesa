@@ -26,13 +26,15 @@ $Script:LLAMESA_DIR    = Join-Path $env:USERPROFILE ".llamesa"
 $Script:CONFIG_FILE    = Join-Path $Script:LLAMESA_DIR "config.json"
 $Script:Config         = $null
 $Script:ActiveServer   = $null
-$Script:CurrentView        = "menu"  # menu, chat, logs
 $Script:ChatHistory        = @()
-$Script:RefreshTimer       = $null
-$Script:LastTokS           = $null   # updated after each /chat response; shown in header badge
+$Script:LastTokS           = $null   # updated after each chat response; shown in header badge
 $Script:LastStatusRefresh  = $null   # tracks when stat cards were last fetched
 $Script:GpuStatus         = $null   # parsed GPU status array from --gpu all
 $Script:ActiveMode       = "single" # single, big, dual — tracks which kind of server was last started (local state only, never written to config)
+$Script:ChatPort           = $null   # resolved chat endpoint port; re-resolved when ActiveMode changes
+$Script:ChatModeSnapshot   = $null   # ActiveMode at the time ChatPort was resolved
+$Script:ThinkingEnabled    = $false  # toggled with /think, /nothink; seeded from server status on first resolve
+$Script:ThinkingSeeded     = $false
 
 # ── JSON Helpers ──────────────────────────────────────────────────────────
 
@@ -262,6 +264,130 @@ function Get-HealthColor {
     }
 }
 
+# ── UI: Select Widgets ───────────────────────────────────────────────────
+# Arrow-key modal list pickers. Both fully redraw (Clear-Host) on every
+# keystroke, same technique already used by the rest of the app (Main's
+# loop, Cmd-Servers, etc.) — simple and robust across terminals, at the cost
+# of a little flicker. $HeaderFn, if given, is called first each redraw so
+# callers can keep printing whatever static context (a title, prior prompts)
+# should stay visible above the list.
+
+function Read-SelectList {
+    param(
+        [Parameter(Mandatory)] [array]$Items,
+        [Parameter(Mandatory)] [scriptblock]$LabelFn,
+        [scriptblock]$HeaderFn = $null,
+        [switch]$Filterable,
+        [string]$EmptyText = "No matches."
+    )
+
+    if (-not $Items -or $Items.Count -eq 0) { return $null }
+
+    $filter = ""
+    $index = 0
+
+    while ($true) {
+        $filtered = if ($Filterable -and $filter) {
+            @($Items | Where-Object { (& $LabelFn $_) -like "*${filter}*" })
+        } else {
+            @($Items)
+        }
+        if ($filtered.Count -eq 0) { $index = 0 } else { $index = [Math]::Min($index, $filtered.Count - 1) }
+
+        Clear-Host
+        if ($HeaderFn) { & $HeaderFn }
+
+        if ($filtered.Count -eq 0) {
+            Write-Host ("  {0}{1}{2}" -f $gray, $EmptyText, $reset)
+        } else {
+            for ($i = 0; $i -lt $filtered.Count; $i++) {
+                $label = & $LabelFn $filtered[$i]
+                if ($i -eq $index) {
+                    Write-Host ("  {0}❯ {1}{2}" -f $teal, $label, $reset)
+                } else {
+                    Write-Host ("    {0}{1}{2}" -f $white, $label, $reset)
+                }
+            }
+        }
+
+        if ($Filterable) {
+            Write-Host ""
+            Write-Host ("  {0}/{1}{2}█{3}" -f $gray, $reset, $filter, $reset)
+        }
+        Write-Host ""
+        Write-Host ("  {0}up/down navigate  ·  enter select  ·  esc cancel{1}" -f $gray, $reset)
+
+        $key = [Console]::ReadKey($true)
+        switch ($key.Key) {
+            'UpArrow'   { if ($filtered.Count -gt 0) { $index = ($index - 1 + $filtered.Count) % $filtered.Count } }
+            'DownArrow' { if ($filtered.Count -gt 0) { $index = ($index + 1) % $filtered.Count } }
+            'Enter'     { if ($filtered.Count -gt 0) { return $filtered[$index] } }
+            'Escape'    { return $null }
+            'Backspace' { if ($Filterable -and $filter.Length -gt 0) { $filter = $filter.Substring(0, $filter.Length - 1) } }
+            default {
+                if ($Filterable -and $key.KeyChar -and -not [char]::IsControl($key.KeyChar)) {
+                    $filter += $key.KeyChar
+                    $index = 0
+                }
+            }
+        }
+    }
+}
+
+function Read-MultiSelectList {
+    param(
+        [Parameter(Mandatory)] [array]$Items,
+        [Parameter(Mandatory)] [scriptblock]$LabelFn,
+        [scriptblock]$HeaderFn = $null,
+        [int]$MaxCount = 0   # 0 = unlimited
+    )
+
+    if (-not $Items -or $Items.Count -eq 0) { return $null }
+
+    $index = 0
+    $checked = [ordered]@{}   # index -> $true, insertion order = pick order
+
+    while ($true) {
+        Clear-Host
+        if ($HeaderFn) { & $HeaderFn }
+
+        for ($i = 0; $i -lt $Items.Count; $i++) {
+            $label = & $LabelFn $Items[$i]
+            $box = if ($checked.Contains($i)) { "{0}[x]{1}" -f $teal, $reset } else { "{0}[ ]{1}" -f $gray, $reset }
+            if ($i -eq $index) {
+                Write-Host ("  {0}❯{1} {2} {3}{4}{5}" -f $teal, $reset, $box, $white, $label, $reset)
+            } else {
+                Write-Host ("    {0} {1}{2}{3}" -f $box, $white, $label, $reset)
+            }
+        }
+
+        $capText = if ($MaxCount -gt 0) { " (max {0})" -f $MaxCount } else { "" }
+        Write-Host ""
+        Write-Host ("  {0}{1} selected{2}{3}" -f $gray, $checked.Count, $capText, $reset)
+        Write-Host ("  {0}up/down navigate  ·  space toggle  ·  enter confirm  ·  esc cancel{1}" -f $gray, $reset)
+
+        $key = [Console]::ReadKey($true)
+        switch ($key.Key) {
+            'UpArrow'   { $index = ($index - 1 + $Items.Count) % $Items.Count }
+            'DownArrow' { $index = ($index + 1) % $Items.Count }
+            'Spacebar' {
+                if ($checked.Contains($index)) {
+                    $checked.Remove($index)
+                } elseif ($MaxCount -le 0 -or $checked.Count -lt $MaxCount) {
+                    $checked[$index] = $true
+                }
+            }
+            'Enter' {
+                if ($checked.Count -eq 0) {
+                    return @($Items[$index])
+                }
+                return @($checked.Keys | ForEach-Object { $Items[$_] })
+            }
+            'Escape' { return $null }
+        }
+    }
+}
+
 # ── UI: ASCII bar helper ──────────────────────────────────────────────────
 
 function New-Bar {
@@ -370,32 +496,33 @@ function Show-Header {
         $gpuVal  = "{0}%" -f $gpu
         $vramVal = if ($vramTotGb -gt 0) { "{0} / {1} GB" -f $vramUsedGb, $vramTotGb } else { "{0} GB" -f $vramUsedGb }
 
-        # Top border — small=15 dashes, VRAM=20 dashes
-        Write-Host ("  ${b}┌───────────────┐${r} ${b}┌───────────────┐${r} ${b}┌───────────────┐${r} ${b}┌────────────────────┐${r}")
+        # Card order: VRAM, GPU, RAM, CPU — "loaded memory to gpus" first, CPU last.
+        # Top border — VRAM=20 dashes, small=15 dashes
+        Write-Host ("  ${b}┌────────────────────┐${r} ${b}┌───────────────┐${r} ${b}┌───────────────┐${r} ${b}┌───────────────┐${r}")
 
-        # Label row: 1 leading space + label padded to 14 (small) / 19 (VRAM)
-        $lblRow  = "  ${b}│${r} ${gray}$("CPU".PadRight(14))${r}${b}│${r} "
-        $lblRow += "${b}│${r} ${gray}$("RAM".PadRight(14))${r}${b}│${r} "
+        # Label row: 1 leading space + label padded to 19 (VRAM) / 14 (small)
+        $lblRow  = "  ${b}│${r} ${gray}$("VRAM".PadRight(19))${r}${b}│${r} "
         $lblRow += "${b}│${r} ${gray}$("GPU".PadRight(14))${r}${b}│${r} "
-        $lblRow += "${b}│${r} ${gray}$("VRAM".PadRight(19))${r}${b}│${r}"
+        $lblRow += "${b}│${r} ${gray}$("RAM".PadRight(14))${r}${b}│${r} "
+        $lblRow += "${b}│${r} ${gray}$("CPU".PadRight(14))${r}${b}│${r}"
         Write-Host $lblRow
 
-        # Value row: colored value padded to 14 (small) / 19 (VRAM) — PadRight on plain string, then wrap in color
-        $valRow  = "  ${b}│${r} ${cpuCol}$($cpuVal.PadRight(14))${r}${b}│${r} "
-        $valRow += "${b}│${r} ${ramCol}$($ramVal.PadRight(14))${r}${b}│${r} "
+        # Value row: colored value padded to 19 (VRAM) / 14 (small) — PadRight on plain string, then wrap in color
+        $valRow  = "  ${b}│${r} ${vramCol}$($vramVal.PadRight(19))${r}${b}│${r} "
         $valRow += "${b}│${r} ${gpuCol}$($gpuVal.PadRight(14))${r}${b}│${r} "
-        $valRow += "${b}│${r} ${vramCol}$($vramVal.PadRight(19))${r}${b}│${r}"
+        $valRow += "${b}│${r} ${ramCol}$($ramVal.PadRight(14))${r}${b}│${r} "
+        $valRow += "${b}│${r} ${cpuCol}$($cpuVal.PadRight(14))${r}${b}│${r}"
         Write-Host $valRow
 
-        # Bar row: 12-char bar + padding to fill inner (small: 2 spaces, VRAM: 7 spaces)
-        $barRow  = "  ${b}│${r} ${cpuBar}  ${b}│${r} "
-        $barRow += "${b}│${r} ${ramBar}  ${b}│${r} "
+        # Bar row: 12-char bar + padding to fill inner (VRAM: 7 spaces, small: 2 spaces)
+        $barRow  = "  ${b}│${r} ${vramBar}       ${b}│${r} "
         $barRow += "${b}│${r} ${gpuBar}  ${b}│${r} "
-        $barRow += "${b}│${r} ${vramBar}       ${b}│${r}"
+        $barRow += "${b}│${r} ${ramBar}  ${b}│${r} "
+        $barRow += "${b}│${r} ${cpuBar}  ${b}│${r}"
         Write-Host $barRow
 
         # Bottom border
-        Write-Host ("  ${b}└───────────────┘${r} ${b}└───────────────┘${r} ${b}└───────────────┘${r} ${b}└────────────────────┘${r}")
+        Write-Host ("  ${b}└────────────────────┘${r} ${b}└───────────────┘${r} ${b}└───────────────┘${r} ${b}└───────────────┘${r}")
 
         # Model row with pill badges
         if ($status.running) {
@@ -433,11 +560,11 @@ function Show-Header {
         }
     } else {
         # Offline placeholder — same number of lines as card block so layout is stable
-        Write-Host ("  ${dim}┌───────────────┐ ┌───────────────┐ ┌───────────────┐ ┌────────────────────┐${reset}")
-        Write-Host ("  ${dim}│  offline      │ │               │ │               │ │                    │${reset}")
-        Write-Host ("  ${dim}│               │ │               │ │               │ │                    │${reset}")
-        Write-Host ("  ${dim}│               │ │               │ │               │ │                    │${reset}")
-        Write-Host ("  ${dim}└───────────────┘ └───────────────┘ └───────────────┘ └────────────────────┘${reset}")
+        Write-Host ("  ${dim}┌────────────────────┐ ┌───────────────┐ ┌───────────────┐ ┌───────────────┐${reset}")
+        Write-Host ("  ${dim}│  offline           │ │               │ │               │ │               │${reset}")
+        Write-Host ("  ${dim}│                    │ │               │ │               │ │               │${reset}")
+        Write-Host ("  ${dim}│                    │ │               │ │               │ │               │${reset}")
+        Write-Host ("  ${dim}└────────────────────┘ └───────────────┘ └───────────────┘ └───────────────┘${reset}")
         Write-Host ("  ${gray}MODEL  none${reset}")
 
         # Last-updated timestamp (offline)
@@ -523,10 +650,11 @@ function Show-HeaderBig {
         $cpuVal = "{0}%" -f $cpu
         $ramVal = if ($ramTotGb -gt 0) { "{0} / {1} GB" -f $ramUsedGb, $ramTotGb } else { "{0} GB" -f $ramUsedGb }
 
+        # Card order: RAM, CPU — GPU/VRAM already covered by the per-device bars above.
         Write-Host ("  ${b}┌───────────────┐${r} ${b}┌───────────────┐${r}")
-        Write-Host ("  ${b}│${r} ${gray}$("CPU".PadRight(14))${r}${b}│${r} ${b}│${r} ${gray}$("RAM".PadRight(14))${r}${b}│${r}")
-        Write-Host ("  ${b}│${r} ${cpuCol}$($cpuVal.PadRight(14))${r}${b}│${r} ${b}│${r} ${ramCol}$($ramVal.PadRight(14))${r}${b}│${r}")
-        Write-Host ("  ${b}│${r} ${cpuBar}  ${b}│${r} ${b}│${r} ${ramBar}  ${b}│${r}")
+        Write-Host ("  ${b}│${r} ${gray}$("RAM".PadRight(14))${r}${b}│${r} ${b}│${r} ${gray}$("CPU".PadRight(14))${r}${b}│${r}")
+        Write-Host ("  ${b}│${r} ${ramCol}$($ramVal.PadRight(14))${r}${b}│${r} ${b}│${r} ${cpuCol}$($cpuVal.PadRight(14))${r}${b}│${r}")
+        Write-Host ("  ${b}│${r} ${ramBar}  ${b}│${r} ${b}│${r} ${cpuBar}  ${b}│${r}")
         Write-Host ("  ${b}└───────────────┘${r} ${b}└───────────────┘${r}")
 
         if ($status.running) {
@@ -596,27 +724,28 @@ function Show-DualInstanceRow {
     $dotColor = if ($running) { $teal } else { $red }
     Write-Host ("  {0}●{1} {2}{3}{4}" -f $dotColor, $r, $teal, $gpuId, $r)
 
-    Write-Host ("  ${b}┌───────────────┐${r} ${b}┌───────────────┐${r} ${b}┌───────────────┐${r} ${b}┌────────────────────┐${r}")
+    # Card order: VRAM, GPU, RAM, CPU — "loaded memory to gpus" first, CPU last.
+    Write-Host ("  ${b}┌────────────────────┐${r} ${b}┌───────────────┐${r} ${b}┌───────────────┐${r} ${b}┌───────────────┐${r}")
 
-    $lblRow  = "  ${b}│${r} ${gray}$("CPU".PadRight(14))${r}${b}│${r} "
-    $lblRow += "${b}│${r} ${gray}$("RAM".PadRight(14))${r}${b}│${r} "
+    $lblRow  = "  ${b}│${r} ${gray}$("VRAM".PadRight(19))${r}${b}│${r} "
     $lblRow += "${b}│${r} ${gray}$("GPU".PadRight(14))${r}${b}│${r} "
-    $lblRow += "${b}│${r} ${gray}$("VRAM".PadRight(19))${r}${b}│${r}"
+    $lblRow += "${b}│${r} ${gray}$("RAM".PadRight(14))${r}${b}│${r} "
+    $lblRow += "${b}│${r} ${gray}$("CPU".PadRight(14))${r}${b}│${r}"
     Write-Host $lblRow
 
-    $valRow  = "  ${b}│${r} ${cpuCol}$($cpuVal.PadRight(14))${r}${b}│${r} "
-    $valRow += "${b}│${r} ${ramCol}$($ramVal.PadRight(14))${r}${b}│${r} "
+    $valRow  = "  ${b}│${r} ${vramCol}$($vramVal.PadRight(19))${r}${b}│${r} "
     $valRow += "${b}│${r} ${gpuCol}$($gpuVal.PadRight(14))${r}${b}│${r} "
-    $valRow += "${b}│${r} ${vramCol}$($vramVal.PadRight(19))${r}${b}│${r}"
+    $valRow += "${b}│${r} ${ramCol}$($ramVal.PadRight(14))${r}${b}│${r} "
+    $valRow += "${b}│${r} ${cpuCol}$($cpuVal.PadRight(14))${r}${b}│${r}"
     Write-Host $valRow
 
-    $barRow  = "  ${b}│${r} ${cpuBar}  ${b}│${r} "
-    $barRow += "${b}│${r} ${ramBar}  ${b}│${r} "
+    $barRow  = "  ${b}│${r} ${vramBar}       ${b}│${r} "
     $barRow += "${b}│${r} ${gpuBar}  ${b}│${r} "
-    $barRow += "${b}│${r} ${vramBar}       ${b}│${r}"
+    $barRow += "${b}│${r} ${ramBar}  ${b}│${r} "
+    $barRow += "${b}│${r} ${cpuBar}  ${b}│${r}"
     Write-Host $barRow
 
-    Write-Host ("  ${b}└───────────────┘${r} ${b}└───────────────┘${r} ${b}└───────────────┘${r} ${b}└────────────────────┘${r}")
+    Write-Host ("  ${b}└────────────────────┘${r} ${b}└───────────────┘${r} ${b}└───────────────┘${r} ${b}└───────────────┘${r}")
 
     if ($running) {
         $thinkingPill = if ($inst.thinking) { "${teal}[thinking on]${r}" } else { "${gray}[thinking off]${r}" }
@@ -722,191 +851,261 @@ function Detect-ActiveMode {
     $Script:ActiveMode = "single"
 }
 
-# ── UI: Menu ──────────────────────────────────────────────────────────────
+# ── Server-side command helpers (shared by /start, /stop, /restart) ──────
 
-function Show-Menu {
-    $w   = [Console]::WindowWidth
-    $sep = "{0}{1}{2}" -f $dim, ("─" * [Math]::Max($w - 1, 20)), $reset
+# Unlike Invoke-ServerCommand -raw (which discards the SSH session's stderr —
+# fine for short-lived calls), start-big/start-dual/stop-big/stop-dual/etc.
+# fail fast with an error written only to stderr (never stdout, per the
+# server's JSON discipline). This variant merges stderr into the captured
+# output and reports the exit code, so callers can detect failure before
+# entering a wait loop.
+function Invoke-ServerCommandChecked {
+    param([string]$command)
 
-    function Section([string]$title) {
-        Write-Host ("{0}{1}{2}" -f $teal, $title, $reset)
-    }
-    function Row([string]$cmd, [string]$desc, [string]$hint = "") {
-        if ($hint) {
-            $hintStr = "${gray}${hint}${reset}"
-            # Right-align hint: pad desc to fill space up to terminal width
-            $ww = [Console]::WindowWidth
-            $plainLen = 2 + 10 + 2 + $desc.Length
-            $pad = [Math]::Max(1, $ww - $plainLen - $hint.Length - 2)
-            Write-Host ("  ${white}$("{0,-10}" -f $cmd)${reset}  ${desc}$(" " * $pad)${hintStr}")
-        } else {
-            Write-Host ("  ${white}$("{0,-10}" -f $cmd)${reset}  ${desc}")
-        }
+    if (-not $Script:ActiveServer) {
+        Write-Error "No active server configured."
+        return [PSCustomObject]@{ Output = @(); ExitCode = 1 }
     }
 
-    Write-Host ""
-    Section "SERVER"
-    Row "/start"   "start server"                   "model · thinking · context"
-    Row "/stop"    "graceful shutdown"
-    Row "/switch"  "hot-swap model"                 "hot-swap"
-    Row "/restart" "stop + start with same settings"
-    Write-Host ""
-    Section "MULTI-GPU"
-    Row "/start-big"    "start combined-VRAM server (Vulkan, both GPUs)"
-    Row "/stop-big"     "stop combined-VRAM server"
-    Row "/restart-big"  "restart combined-VRAM server"                "re-selects model"
-    Row "/start-dual"   "start two independent servers (one per GPU)"
-    Row "/stop-dual"    "stop dual instance(s)"
-    Row "/restart-dual" "restart dual instance(s)"                    "remembers model(s)"
-    Write-Host ""
-    Section "MONITORING"
-    Row "/health"  "ping /health and /v1/models"
-    Row "/logs"    "tail verbose server output"
-    Write-Host ""
-    Section "MODELS"
-    Row "/models"   "list downloaded models + sizes"
-    Row "/download" "download from huggingface"
-    Write-Host ""
-    Section "CHAT"
-    Row "/chat" "chat with the model directly"
-    Write-Host ""
-    Section "CONFIG"
-    Row "/servers" "manage server profiles"
-    Row "/config"  "view/edit config"
-    Row "/quit"    "exit"
+    $sshUser = $Script:ActiveServer.ssh_user
+    $sshHost = $Script:ActiveServer.host
+    $llamesaPath = $Script:ActiveServer.llamesa_path
+    $fullCommand = "bash ${llamesaPath} ${command} 2>&1"
+
+    try {
+        $result = ssh -o BatchMode=yes -o ConnectTimeout=5 "${sshUser}@${sshHost}" $fullCommand
+        return [PSCustomObject]@{ Output = $result; ExitCode = $LASTEXITCODE }
+    } catch {
+        return [PSCustomObject]@{ Output = @("SSH failed: $_"); ExitCode = 1 }
+    }
 }
 
-# ── GPU Picker ────────────────────────────────────────────────────────────
+function Get-DualStatus {
+    param([string]$gpu = "")
+    $cmdStr = if ($gpu) { "status-dual --gpu $gpu" } else { "status-dual" }
+    $raw = Invoke-ServerCommand $cmdStr -raw
+    if (-not $raw) { return $null }
 
-function Show-GpuPicker {
-    # If only one GPU, skip picker
-    if (-not $Script:GpuStatus -or ($Script:GpuStatus -isnot [array]) -or $Script:GpuStatus.Count -le 1) {
-        return 0
+    try {
+        $jsonStartIndex = -1
+        for ($i = 0; $i -lt $raw.Count; $i++) {
+            if ($raw[$i] -match '^\s*[\[{]' -and $raw[$i] -notmatch '^\s*\[(INFO|WARN|ERROR)\]') {
+                $jsonStartIndex = $i
+                break
+            }
+        }
+        if ($jsonStartIndex -lt 0) { return $null }
+        $jsonText = $raw[$jsonStartIndex..($raw.Count - 1)] -join "`n"
+        return $jsonText | ConvertFrom-Json
+    } catch {
+        return $null
     }
+}
 
-    Write-Host ""
-    Write-Host ("  {0}Which GPU?{1}" -f $white, $reset)
-    for ($i = 0; $i -lt $Script:GpuStatus.Count; $i++) {
-        $g = $Script:GpuStatus[$i]
-        $vram = if ($g.vram_total_bytes) { [math]::Round($g.vram_total_bytes / 1GB) } else { 0 }
-        Write-Host ("    {0}  GPU{1} {2,-12} {3} GB" -f ($i + 1).ToString(), $g.gpu_id, $g.gpu_name, $vram)
+function Wait-BigLoaded {
+    Write-Host ("{0}Waiting for model to load...{1}" -f $cyan, $reset)
+    for ($i = 0; $i -lt 150; $i++) {
+        Start-Sleep -Seconds 2
+        $bigStatus = Get-BigStatus
+        if ($bigStatus -and $bigStatus.running) {
+            Write-Host ("{0}✓ Model loaded!{1}" -f $green, $reset)
+            return
+        }
+        if (($i + 1) % 15 -eq 0) {
+            Write-Host ("  Loading... ({0}s elapsed)" -f (($i + 1) * 2))
+        }
     }
-    Write-Host ""
-    $choice = Read-Host ">"
-    $idx = [int]$choice - 1
-    if ($idx -lt 0 -or $idx -ge $Script:GpuStatus.Count) {
-        Write-Host ("{0}Invalid selection. Defaulting to GPU 0.{1}" -f $amber, $reset)
-        return 0
-    }
-    return $Script:GpuStatus[$idx].gpu_id
+    Write-Host ("{0}Timed out waiting for the Vulkan server to load.{1}" -f $red, $reset)
+}
+
+function Format-ModelLabel {
+    param($m)
+    $size = Format-Bytes $m.size_bytes
+    $visionTag = if ($m.has_mmproj) { " {0}[vision]{1}" -f $amber, $reset } else { "" }
+    return "{0,-30} {1,-12}{2}" -f $m.name, $size, $visionTag
 }
 
 # ── Command: /start ───────────────────────────────────────────────────────
+# Unified entry point: picks 1..gpuCount models and infers the mode from how
+# many were picked — 1 model → combined VRAM across all GPUs (single-GPU
+# boxes just use that one GPU); exactly 2 models on a 2-GPU box → one model
+# per GPU (independent instances). Absorbs the old dedicated -big/-dual flows.
 
 function Cmd-Start {
+    $gpuCount = if ($Script:GpuStatus -is [array]) { $Script:GpuStatus.Count } else { 1 }
+    $maxSelectable = [Math]::Min([Math]::Max($gpuCount, 1), 2)
+
     Write-Host ("{0}Fetching available models...{1}" -f $cyan, $reset)
     $models = Get-ModelList
-
     if (-not $models -or $models.Count -eq 0) {
         Write-Host ("{0}No models found.{1}" -f $red, $reset)
         return
     }
 
-    Write-Host ""
-    Write-Host ("  {0}Select model:{1}" -f $white, $reset)
-
-    for ($i = 0; $i -lt $models.Count; $i++) {
-        $m = $models[$i]
-        $size = Format-Bytes $m.size_bytes
-        $visionTag = if ($m.has_mmproj) { " {0}[vision]{1}" -f $amber, $reset } else { "" }
-        Write-Host ("    {0}  {1,-30} {2,-12}{3}" -f ($i + 1).ToString(), $m.name, $size, $visionTag)
+    $labelFn = { param($m) Format-ModelLabel $m }
+    $headerFn = {
+        if ($gpuCount -gt 1) {
+            Write-Host ("  {0}Select model(s) — pick 1 to load across all {1} GPUs (combined VRAM), or 2 to load one per GPU:{2}" -f $white, $gpuCount, $reset)
+        } else {
+            Write-Host ("  {0}Select a model:{1}" -f $white, $reset)
+        }
+        Write-Host ""
     }
 
-    Write-Host ""
-    $choice = Read-Host ">"
-    $idx = [int]$choice - 1
-
-    if ($idx -lt 0 -or $idx -ge $models.Count) {
-        Write-Host ("{0}Invalid selection.{1}" -f $red, $reset)
-        return
+    $selected = $null
+    while ($true) {
+        $selected = Read-MultiSelectList -Items $models -LabelFn $labelFn -HeaderFn $headerFn -MaxCount $maxSelectable
+        if (-not $selected) { Write-Host ("{0}Cancelled.{1}" -f $gray, $reset); return }
+        if ($selected.Count -eq 1 -or ($selected.Count -eq 2 -and $gpuCount -ge 2)) { break }
+        Write-Host ("{0}Pick 1 model (combined VRAM) or exactly 2 (one per GPU) — you picked {1}.{2}" -f $red, $selected.Count, $reset)
+        Start-Sleep -Seconds 2
     }
 
-    $selectedModel = $models[$idx].name
-
-    # GPU picker
-    $gpuId = Show-GpuPicker
-
-    # Ask for options
-    $thinkingInput = Read-Host "Thinking mode? [on/off]"
-    $thinking = if ($thinkingInput -match '^(on|yes|true|1)$') { "true" } else { "false" }
+    $thinkChoice = Read-SelectList -Items @("on", "off") -LabelFn { param($x) $x } `
+        -HeaderFn { Write-Host ("  {0}Thinking mode?{1}" -f $white, $reset) }
+    if (-not $thinkChoice) { Write-Host ("{0}Cancelled.{1}" -f $gray, $reset); return }
+    $thinking = if ($thinkChoice -eq "on") { "true" } else { "false" }
 
     $ctx = Read-Host "Context size? [131072]"
     if (-not $ctx) { $ctx = "131072" }
 
-    $parallelInput = Read-Host "Parallel slots? [1-4, default: 1]"
-    if (-not $parallelInput) { $parallelInput = "1" }
-    $parallelInput = [math]::Max(1, [math]::Min(4, [int]$parallelInput))
-    $parallelArg = "--parallel $parallelInput"
+    if ($selected.Count -eq 1 -and $gpuCount -le 1) {
+        $parallelInput = Read-Host "Parallel slots? [1-4, default: 1]"
+        if (-not $parallelInput) { $parallelInput = "1" }
+        $parallelInput = [math]::Max(1, [math]::Min(4, [int]$parallelInput))
+        $parallelArg = "--parallel $parallelInput"
 
+        $selectedModel = $selected[0].name
+        Write-Host ""
+        Write-Host ("{0}Starting {1}...{2}" -f $cyan, $selectedModel, $reset)
+        $raw = Invoke-ServerCommand ("start --model ""{0}"" --gpu 0 --thinking {1} --ctx {2} {3}" -f $selectedModel, $thinking, $ctx, $parallelArg).Trim() -raw
+        Write-Host ($raw -join "`n")
+
+        Write-Host ("{0}Waiting for model to load...{1}" -f $cyan, $reset)
+        for ($i = 0; $i -lt 30; $i++) {
+            Start-Sleep -Seconds 2
+            $status = Get-ServerStatus
+            if ($status -and $status.running -and $status.vram_used_bytes -gt 1GB) {
+                Write-Host ("{0}✓ Model loaded!{1}" -f $green, $reset)
+                break
+            }
+            Write-Host ("  Loading... ({0}s)" -f ($i * 2))
+        }
+        $Script:ActiveMode = "single"
+        return
+    }
+
+    if ($selected.Count -eq 1) {
+        $selectedModel = $selected[0].name
+        Write-Host ""
+        Write-Host ("{0}Starting {1} (combined VRAM across {2} GPUs)...{3}" -f $cyan, $selectedModel, $gpuCount, $reset)
+        $result = Invoke-ServerCommandChecked ("start-big --model ""{0}"" --thinking {1} --ctx {2}" -f $selectedModel, $thinking, $ctx)
+        Write-Host ($result.Output -join "`n")
+        if ($result.ExitCode -ne 0) {
+            Write-Host ("{0}start failed — see error above.{1}" -f $red, $reset)
+            return
+        }
+        $Script:ActiveMode = "big"
+        Wait-BigLoaded
+        return
+    }
+
+    # 2 models on a 2-GPU box: one per GPU (server keys these r9700a/r9700b — picker order maps in order)
+    $modelA = $selected[0].name
+    $modelB = $selected[1].name
     Write-Host ""
-    $gpuLabel = if ($gpuId) { " on GPU${gpuId}" } else { "" }
-    Write-Host ("{0}Starting {1}{2}...{3}" -f $cyan, $selectedModel, $gpuLabel, $reset)
+    Write-Host ("{0}Starting one model per GPU: {1} · {2}...{3}" -f $cyan, $modelA, $modelB, $reset)
+    $result = Invoke-ServerCommandChecked ("start-dual --model-r9700a ""{0}"" --model-r9700b ""{1}"" --thinking {2} --ctx {3}" -f $modelA, $modelB, $thinking, $ctx)
+    Write-Host ($result.Output -join "`n")
+    if ($result.ExitCode -ne 0) {
+        Write-Host ("{0}start failed — see error above.{1}" -f $red, $reset)
+        return
+    }
+    $Script:ActiveMode = "dual"
 
-    $raw = Invoke-ServerCommand ("start --model ""{0}"" --gpu {1} --thinking {2} --ctx {3} {4}" -f $selectedModel, $gpuId, $thinking, $ctx, $parallelArg).Trim() -raw
-    Write-Host ($raw -join "`n")
-
-    # Poll until loaded
-    Write-Host ("{0}Waiting for model to load...{1}" -f $cyan, $reset)
-    for ($i = 0; $i -lt 30; $i++) {
+    Write-Host ("{0}Waiting for both instances to load...{1}" -f $cyan, $reset)
+    for ($i = 0; $i -lt 150; $i++) {
         Start-Sleep -Seconds 2
-        $status = Get-ServerStatus
-        if ($status -and $status.running -and $status.vram_used_bytes -gt 1GB) {
-            Write-Host ("{0}✓ Model loaded!{1}" -f $green, $reset)
+        $dualStatus = Get-DualStatus
+        if ($dualStatus -is [array] -and (@($dualStatus | Where-Object { $_.running -eq $true })).Count -eq 2) {
+            Write-Host ("{0}✓ Both models loaded!{1}" -f $green, $reset)
             break
         }
-        Write-Host ("  Loading... ({0}s)" -f ($i * 2))
+        if (($i + 1) % 15 -eq 0) { Write-Host ("  Loading... ({0}s elapsed)" -f (($i + 1) * 2)) }
     }
 }
 
 # ── Command: /stop ────────────────────────────────────────────────────────
+# Unified entry point: detects whatever's actually running (combined-VRAM,
+# dual instances, or plain single-GPU) and stops it directly with no prompt
+# when there's only one thing running; asks which (or "Both") otherwise.
 
 function Cmd-Stop {
-    # Check how many GPUs are running
-    $runningGpus = @()
-    if ($Script:GpuStatus -is [array]) {
-        $runningGpus = $Script:GpuStatus | Where-Object { $_.running -eq $true }
-    } elseif ($Script:GpuStatus -and $Script:GpuStatus.running) {
-        $runningGpus = @($Script:GpuStatus)
+    $running = @()
+
+    $bigStatus = Get-BigStatus
+    if ($bigStatus -and $bigStatus.running) {
+        $running += [PSCustomObject]@{ Label = "{0} (combined VRAM)" -f $bigStatus.model; Mode = "big"; GpuArg = $null }
+    } else {
+        $dualStatus = Get-DualStatus
+        $dualInstances = @()
+        if ($dualStatus -is [array]) { $dualInstances = $dualStatus } elseif ($dualStatus) { $dualInstances = @($dualStatus) }
+        foreach ($inst in @($dualInstances | Where-Object { $_.running -eq $true })) {
+            $running += [PSCustomObject]@{ Label = "{0}: {1}" -f $inst.gpu_id, $inst.model; Mode = "dual"; GpuArg = $inst.gpu_id }
+        }
+
+        if ($running.Count -eq 0) {
+            $runningGpus = @()
+            if ($Script:GpuStatus -is [array]) { $runningGpus = @($Script:GpuStatus | Where-Object { $_.running -eq $true }) }
+            elseif ($Script:GpuStatus -and $Script:GpuStatus.running) { $runningGpus = @($Script:GpuStatus) }
+            foreach ($g in $runningGpus) {
+                $running += [PSCustomObject]@{ Label = "GPU{0} {1}" -f $g.gpu_id, $g.gpu_name; Mode = "single"; GpuArg = $g.gpu_id }
+            }
+        }
     }
 
-    $gpuArg = "0"  # default
-    if ($runningGpus.Count -gt 1) {
-        Write-Host ("  {0}Stop which GPU?{1}" -f $white, $reset)
-        for ($i = 0; $i -lt $runningGpus.Count; $i++) {
-            $g = $runningGpus[$i]
-            Write-Host ("    {0}  GPU{1} {2}" -f ($i + 1).ToString(), $g.gpu_id, $g.gpu_name)
-        }
-        Write-Host ("    {0}  Both" -f ($runningGpus.Count + 1).ToString())
-        Write-Host ""
-        $choice = Read-Host ">"
-        $idx = [int]$choice
-        if ($idx -le $runningGpus.Count) {
-            $gpuArg = $runningGpus[$idx - 1].gpu_id
-        } else {
-            $gpuArg = "all"
-        }
-    } elseif ($runningGpus.Count -eq 1) {
-        $gpuArg = $runningGpus[0].gpu_id
+    if ($running.Count -eq 0) {
+        Write-Host ("{0}Nothing running.{1}" -f $gray, $reset)
+        return
     }
 
-    Write-Host ("{0}Stopping GPU {1}...{2}" -f $cyan, $gpuArg, $reset)
-    $raw = Invoke-ServerCommand ("stop --gpu {0}" -f $gpuArg) -raw
-    Write-Host ($raw -join "`n")
+    $targets = $running
+    if ($running.Count -gt 1) {
+        $bothOption = [PSCustomObject]@{ Label = "Both"; Mode = "__both__"; GpuArg = $null }
+        $pick = Read-SelectList -Items (@($running) + @($bothOption)) -LabelFn { param($t) $t.Label } `
+            -HeaderFn { Write-Host ("  {0}Stop which?{1}" -f $white, $reset) }
+        if (-not $pick) { Write-Host ("{0}Cancelled.{1}" -f $gray, $reset); return }
+        $targets = if ($pick.Mode -eq "__both__") { $running } else { @($pick) }
+    }
+
+    foreach ($t in $targets) {
+        Write-Host ("{0}Stopping {1}...{2}" -f $cyan, $t.Label, $reset)
+        switch ($t.Mode) {
+            "big" {
+                $result = Invoke-ServerCommandChecked "stop-big"
+                Write-Host ($result.Output -join "`n")
+                if ($result.ExitCode -eq 0 -and $Script:ActiveMode -eq "big") { $Script:ActiveMode = "single" }
+            }
+            "dual" {
+                $result = Invoke-ServerCommandChecked ("stop-dual --gpu {0}" -f $t.GpuArg)
+                Write-Host ($result.Output -join "`n")
+            }
+            "single" {
+                $raw = Invoke-ServerCommand ("stop --gpu {0}" -f $t.GpuArg) -raw
+                Write-Host ($raw -join "`n")
+            }
+        }
+    }
+
+    $stoppedAllDual = ($targets.Count -eq $running.Count) -and (@($targets | Where-Object { $_.Mode -eq "dual" }).Count -gt 0)
+    if ($stoppedAllDual -and $Script:ActiveMode -eq "dual") { $Script:ActiveMode = "single" }
 }
 
 # ── Command: /restart ─────────────────────────────────────────────────────
+# Unified entry point: detects which mode is actually running (or was last
+# running) and delegates to that mode's restart flow.
 
-function Cmd-Restart {
+function Restart-SingleMode {
     if (-not $Script:ActiveServer) { Write-Host ("{0}No active server.{1}" -f $red, $reset); return }
 
     $sshUser     = $Script:ActiveServer.ssh_user
@@ -968,107 +1167,36 @@ function Cmd-Restart {
         Write-Host ("{0}Timed out waiting for server after restart.{1}" -f $red, $reset)
         Write-Host ("Check logs on Bazzite: tail -f ~/.llamesa/restart.log" )
     }
+    $Script:ActiveMode = "single"
 }
 
-# ── Command: /switch ──────────────────────────────────────────────────────
-
-function Cmd-Switch {
-    Cmd-Start  # same flow as start but stops first (handled by server)
-}
-
-# ── Commands: /start-big /stop-big /restart-big ──────────────────────────
-# Fully independent of Cmd-Start/Cmd-Stop/Cmd-Restart above — these never call
-# or modify any of them.
-
-# Unlike Invoke-ServerCommand -raw (which discards the SSH session's stderr —
-# fine for v1, whose polling windows are short), -big/-dual commands fail fast
-# with an error written only to stderr (never stdout, per the server's JSON
-# discipline). This variant merges stderr into the captured output and reports
-# the exit code, so callers can detect failure before entering a wait loop.
-function Invoke-ServerCommandChecked {
-    param([string]$command)
-
-    if (-not $Script:ActiveServer) {
-        Write-Error "No active server configured."
-        return [PSCustomObject]@{ Output = @(); ExitCode = 1 }
-    }
-
-    $sshUser = $Script:ActiveServer.ssh_user
-    $sshHost = $Script:ActiveServer.host
-    $llamesaPath = $Script:ActiveServer.llamesa_path
-    $fullCommand = "bash ${llamesaPath} ${command} 2>&1"
-
-    try {
-        $result = ssh -o BatchMode=yes -o ConnectTimeout=5 "${sshUser}@${sshHost}" $fullCommand
-        return [PSCustomObject]@{ Output = $result; ExitCode = $LASTEXITCODE }
-    } catch {
-        return [PSCustomObject]@{ Output = @("SSH failed: $_"); ExitCode = 1 }
-    }
-}
-
-function Prompt-BigModelOptions {
+function Restart-BigMode {
+    Write-Host ("{0}Combined-VRAM mode doesn't remember the last model — select it again.{1}" -f $gray, $reset)
     $models = Get-ModelList
-
     if (-not $models -or $models.Count -eq 0) {
         Write-Host ("{0}No models found.{1}" -f $red, $reset)
-        return $null
+        return
     }
 
-    Write-Host ""
-    Write-Host ("  {0}Select model (Vulkan combined-VRAM):{1}" -f $white, $reset)
-    for ($i = 0; $i -lt $models.Count; $i++) {
-        $m = $models[$i]
-        $size = Format-Bytes $m.size_bytes
-        $visionTag = if ($m.has_mmproj) { " {0}[vision]{1}" -f $amber, $reset } else { "" }
-        Write-Host ("    {0}  {1,-30} {2,-12}{3}" -f ($i + 1).ToString(), $m.name, $size, $visionTag)
-    }
+    $model = Read-SelectList -Items $models -LabelFn { param($m) Format-ModelLabel $m } `
+        -HeaderFn { Write-Host ("  {0}Select model (combined VRAM):{1}" -f $white, $reset) }
+    if (-not $model) { Write-Host ("{0}Cancelled.{1}" -f $gray, $reset); return }
 
-    Write-Host ""
-    $choice = Read-Host ">"
-    $idx = [int]$choice - 1
-    if ($idx -lt 0 -or $idx -ge $models.Count) {
-        Write-Host ("{0}Invalid selection.{1}" -f $red, $reset)
-        return $null
-    }
-    $selectedModel = $models[$idx].name
-
-    $thinkingInput = Read-Host "Thinking mode? [on/off]"
-    $thinking = if ($thinkingInput -match '^(on|yes|true|1)$') { "true" } else { "false" }
+    $thinkChoice = Read-SelectList -Items @("on", "off") -LabelFn { param($x) $x } `
+        -HeaderFn { Write-Host ("  {0}Thinking mode?{1}" -f $white, $reset) }
+    if (-not $thinkChoice) { Write-Host ("{0}Cancelled.{1}" -f $gray, $reset); return }
+    $thinking = if ($thinkChoice -eq "on") { "true" } else { "false" }
 
     $ctx = Read-Host "Context size? [131072]"
     if (-not $ctx) { $ctx = "131072" }
 
-    return [PSCustomObject]@{ model = $selectedModel; thinking = $thinking; ctx = $ctx }
-}
-
-function Wait-BigLoaded {
-    Write-Host ("{0}Waiting for model to load...{1}" -f $cyan, $reset)
-    for ($i = 0; $i -lt 150; $i++) {
-        Start-Sleep -Seconds 2
-        $bigStatus = Get-BigStatus
-        if ($bigStatus -and $bigStatus.running) {
-            Write-Host ("{0}✓ Model loaded!{1}" -f $green, $reset)
-            return
-        }
-        if (($i + 1) % 15 -eq 0) {
-            Write-Host ("  Loading... ({0}s elapsed)" -f (($i + 1) * 2))
-        }
-    }
-    Write-Host ("{0}Timed out waiting for the Vulkan server to load.{1}" -f $red, $reset)
-}
-
-function Cmd-StartBig {
-    Write-Host ("{0}Fetching available models...{1}" -f $cyan, $reset)
-    $opts = Prompt-BigModelOptions
-    if (-not $opts) { return }
-
     Write-Host ""
-    Write-Host ("{0}Starting {1} (Vulkan combined-VRAM)...{2}" -f $cyan, $opts.model, $reset)
-    $result = Invoke-ServerCommandChecked ("start-big --model ""{0}"" --thinking {1} --ctx {2}" -f $opts.model, $opts.thinking, $opts.ctx)
+    Write-Host ("{0}Restarting with {1} (combined VRAM)...{2}" -f $cyan, $model.name, $reset)
+    $result = Invoke-ServerCommandChecked ("restart-big --model ""{0}"" --thinking {1} --ctx {2}" -f $model.name, $thinking, $ctx)
     Write-Host ($result.Output -join "`n")
 
     if ($result.ExitCode -ne 0) {
-        Write-Host ("{0}start-big failed — see error above.{1}" -f $red, $reset)
+        Write-Host ("{0}restart failed — see error above.{1}" -f $red, $reset)
         return
     }
 
@@ -1076,173 +1204,19 @@ function Cmd-StartBig {
     Wait-BigLoaded
 }
 
-function Cmd-StopBig {
-    Write-Host ("{0}Stopping Vulkan combined-VRAM server...{1}" -f $cyan, $reset)
-    $result = Invoke-ServerCommandChecked "stop-big"
-    Write-Host ($result.Output -join "`n")
-    if ($result.ExitCode -eq 0 -and $Script:ActiveMode -eq "big") { $Script:ActiveMode = "single" }
-}
-
-function Cmd-RestartBig {
-    Write-Host ("{0}restart-big does not remember the last model — select it again.{1}" -f $gray, $reset)
-    $opts = Prompt-BigModelOptions
-    if (-not $opts) { return }
-
-    Write-Host ""
-    Write-Host ("{0}Restarting with {1} (Vulkan combined-VRAM)...{2}" -f $cyan, $opts.model, $reset)
-    $result = Invoke-ServerCommandChecked ("restart-big --model ""{0}"" --thinking {1} --ctx {2}" -f $opts.model, $opts.thinking, $opts.ctx)
-    Write-Host ($result.Output -join "`n")
-
-    if ($result.ExitCode -ne 0) {
-        Write-Host ("{0}restart-big failed — see error above.{1}" -f $red, $reset)
-        return
-    }
-
-    $Script:ActiveMode = "big"
-    Wait-BigLoaded
-}
-
-# ── Commands: /start-dual /stop-dual /restart-dual ────────────────────────
-# Fully independent of Cmd-Start/Cmd-Stop/Cmd-Restart and of the -big commands
-# above — these never call or modify any of them.
-
-function Get-DualStatus {
-    param([string]$gpu = "")
-    $cmdStr = if ($gpu) { "status-dual --gpu $gpu" } else { "status-dual" }
-    $raw = Invoke-ServerCommand $cmdStr -raw
-    if (-not $raw) { return $null }
-
-    try {
-        $jsonStartIndex = -1
-        for ($i = 0; $i -lt $raw.Count; $i++) {
-            if ($raw[$i] -match '^\s*[\[{]' -and $raw[$i] -notmatch '^\s*\[(INFO|WARN|ERROR)\]') {
-                $jsonStartIndex = $i
-                break
-            }
-        }
-        if ($jsonStartIndex -lt 0) { return $null }
-        $jsonText = $raw[$jsonStartIndex..($raw.Count - 1)] -join "`n"
-        return $jsonText | ConvertFrom-Json
-    } catch {
-        return $null
-    }
-}
-
-function Cmd-StartDual {
-    Write-Host ("{0}Fetching available models...{1}" -f $cyan, $reset)
-    $models = Get-ModelList
-
-    if (-not $models -or $models.Count -eq 0) {
-        Write-Host ("{0}No models found.{1}" -f $red, $reset)
-        return
-    }
-
-    function Select-DualModel([string]$label) {
-        Write-Host ""
-        Write-Host ("  {0}Select model for {1}:{2}" -f $white, $label, $reset)
-        for ($i = 0; $i -lt $models.Count; $i++) {
-            $m = $models[$i]
-            $size = Format-Bytes $m.size_bytes
-            $visionTag = if ($m.has_mmproj) { " {0}[vision]{1}" -f $amber, $reset } else { "" }
-            Write-Host ("    {0}  {1,-30} {2,-12}{3}" -f ($i + 1).ToString(), $m.name, $size, $visionTag)
-        }
-        Write-Host ""
-        $choice = Read-Host ">"
-        $idx = [int]$choice - 1
-        if ($idx -lt 0 -or $idx -ge $models.Count) { return $null }
-        return $models[$idx].name
-    }
-
-    $modelR9700a = Select-DualModel "R9700 (A)"
-    if (-not $modelR9700a) { Write-Host ("{0}Invalid selection.{1}" -f $red, $reset); return }
-
-    $modelR9700b = Select-DualModel "R9700 (B)"
-    if (-not $modelR9700b) { Write-Host ("{0}Invalid selection.{1}" -f $red, $reset); return }
-
-    $thinkingInput = Read-Host "Thinking mode? [on/off]"
-    $thinking = if ($thinkingInput -match '^(on|yes|true|1)$') { "true" } else { "false" }
-
-    $ctx = Read-Host "Context size? [131072]"
-    if (-not $ctx) { $ctx = "131072" }
-
-    Write-Host ""
-    Write-Host ("{0}Starting dual instances: R9700A={1}, R9700B={2}...{3}" -f $cyan, $modelR9700a, $modelR9700b, $reset)
-
-    $result = Invoke-ServerCommandChecked ("start-dual --model-r9700a ""{0}"" --model-r9700b ""{1}"" --thinking {2} --ctx {3}" -f $modelR9700a, $modelR9700b, $thinking, $ctx)
-    Write-Host ($result.Output -join "`n")
-
-    if ($result.ExitCode -ne 0) {
-        Write-Host ("{0}start-dual failed — see error above.{1}" -f $red, $reset)
-        return
-    }
-
-    $Script:ActiveMode = "dual"
-
-    Write-Host ("{0}Waiting for both instances to load...{1}" -f $cyan, $reset)
-    for ($i = 0; $i -lt 150; $i++) {
-        Start-Sleep -Seconds 2
-        $dualStatus = Get-DualStatus
-        if ($dualStatus -is [array] -and (@($dualStatus | Where-Object { $_.running -eq $true })).Count -eq 2) {
-            Write-Host ("{0}✓ Both models loaded!{1}" -f $green, $reset)
-            break
-        }
-        if (($i + 1) % 15 -eq 0) { Write-Host ("  Loading... ({0}s elapsed)" -f (($i + 1) * 2)) }
-    }
-}
-
-function Cmd-StopDual {
-    $dualStatus = Get-DualStatus
-    $runningInstances = @()
-    if ($dualStatus -is [array]) {
-        $runningInstances = @($dualStatus | Where-Object { $_.running -eq $true })
-    }
-
-    $gpuArg = ""
-    if ($runningInstances.Count -gt 1) {
-        Write-Host ("  {0}Stop which instance?{1}" -f $white, $reset)
-        for ($i = 0; $i -lt $runningInstances.Count; $i++) {
-            Write-Host ("    {0}  {1}" -f ($i + 1).ToString(), $runningInstances[$i].gpu_id)
-        }
-        Write-Host ("    {0}  Both" -f ($runningInstances.Count + 1).ToString())
-        Write-Host ""
-        $choice = Read-Host ">"
-        $idx = [int]$choice
-        if ($idx -ge 1 -and $idx -le $runningInstances.Count) {
-            $gpuArg = $runningInstances[$idx - 1].gpu_id
-        }
-    } elseif ($runningInstances.Count -eq 1) {
-        $gpuArg = $runningInstances[0].gpu_id
-    }
-
-    $cmdStr = if ($gpuArg) { "stop-dual --gpu $gpuArg" } else { "stop-dual" }
-    $scopeLabel = if ($gpuArg) { $gpuArg } else { "both" }
-    Write-Host ("{0}Stopping dual instance(s) ({1})...{2}" -f $cyan, $scopeLabel, $reset)
-    $result = Invoke-ServerCommandChecked $cmdStr
-    Write-Host ($result.Output -join "`n")
-
-    if ($result.ExitCode -eq 0 -and -not $gpuArg -and $Script:ActiveMode -eq "dual") {
-        $Script:ActiveMode = "single"
-    }
-}
-
-function Cmd-RestartDual {
+function Restart-DualMode {
     $dualStatus = Get-DualStatus
     $knownInstances = @()
     if ($dualStatus -is [array]) { $knownInstances = $dualStatus }
 
     $gpuArg = ""
     if ($knownInstances.Count -gt 1) {
-        Write-Host ("  {0}Restart which instance?{1}" -f $white, $reset)
-        for ($i = 0; $i -lt $knownInstances.Count; $i++) {
-            Write-Host ("    {0}  {1}" -f ($i + 1).ToString(), $knownInstances[$i].gpu_id)
-        }
-        Write-Host ("    {0}  Both" -f ($knownInstances.Count + 1).ToString())
-        Write-Host ""
-        $choice = Read-Host ">"
-        $idx = [int]$choice
-        if ($idx -ge 1 -and $idx -le $knownInstances.Count) {
-            $gpuArg = $knownInstances[$idx - 1].gpu_id
-        }
+        $bothOption = [PSCustomObject]@{ gpu_id = $null; __label = "Both" }
+        $items = @($knownInstances | ForEach-Object { [PSCustomObject]@{ gpu_id = $_.gpu_id; __label = $_.gpu_id } }) + @($bothOption)
+        $pick = Read-SelectList -Items $items -LabelFn { param($x) $x.__label } `
+            -HeaderFn { Write-Host ("  {0}Restart which instance?{1}" -f $white, $reset) }
+        if (-not $pick) { Write-Host ("{0}Cancelled.{1}" -f $gray, $reset); return }
+        if ($pick.gpu_id) { $gpuArg = $pick.gpu_id }
     }
 
     $cmdStr = if ($gpuArg) { "restart-dual --gpu $gpuArg" } else { "restart-dual" }
@@ -1252,7 +1226,7 @@ function Cmd-RestartDual {
     Write-Host ($result.Output -join "`n")
 
     if ($result.ExitCode -ne 0) {
-        Write-Host ("{0}restart-dual failed — see error above.{1}" -f $red, $reset)
+        Write-Host ("{0}restart failed — see error above.{1}" -f $red, $reset)
         return
     }
 
@@ -1274,6 +1248,24 @@ function Cmd-RestartDual {
         }
         if (($i + 1) % 15 -eq 0) { Write-Host ("  Loading... ({0}s elapsed)" -f (($i + 1) * 2)) }
     }
+}
+
+function Cmd-Restart {
+    $bigStatus = Get-BigStatus
+    if ($bigStatus -and $bigStatus.running) {
+        Restart-BigMode
+        return
+    }
+
+    $dualStatus = Get-DualStatus
+    $dualInstances = @()
+    if ($dualStatus -is [array]) { $dualInstances = $dualStatus } elseif ($dualStatus) { $dualInstances = @($dualStatus) }
+    if (@($dualInstances | Where-Object { $_.running -eq $true }).Count -gt 0) {
+        Restart-DualMode
+        return
+    }
+
+    Restart-SingleMode
 }
 
 # ── Command: /models ──────────────────────────────────────────────────────
@@ -1387,30 +1379,36 @@ function Cmd-Download {
     Write-Host ($raw -join "`n")
 }
 
-# ── Command: /chat ────────────────────────────────────────────────────────
+# ── Chat ──────────────────────────────────────────────────────────────────
+# Chat is no longer a separate mode — bare text typed at the fixed bottom
+# input is sent as a chat message directly (see Main). These are the pieces
+# that used to live inline in a dedicated Cmd-Chat loop: endpoint resolution,
+# history rendering, and the streaming send itself.
 
-function Cmd-Chat {
-    $Script:CurrentView = "chat"
-    $Script:ChatHistory = @()
+# Resolves which port/model to talk to for the active mode, caching the
+# result until $Script:ActiveMode changes (so it doesn't re-prompt "which
+# GPU?" on every single message in dual mode). Returns $false if nothing is
+# running to chat with.
+function Resolve-ChatEndpoint {
+    if ($Script:ChatPort -and $Script:ChatModeSnapshot -eq $Script:ActiveMode) {
+        return $true
+    }
 
     # -big sessions: one model, one endpoint, but still on a different port
-    # (1236 by default) than the v1 single-GPU path Get-ActiveGpuPort resolves.
+    # than the v1 single-GPU path Get-ActiveGpuPort resolves.
     $bigPort = $null
     $bigThinking = $null
     if ($Script:ActiveMode -eq "big") {
         $bigStatus = Get-BigStatus
         if (-not $bigStatus -or -not $bigStatus.running) {
-            Write-Host ("{0}No running -big instance to chat with.{1}" -f $red, $reset)
-            $Script:CurrentView = "menu"
-            return
+            Write-Host ("{0}No running model to chat with.{1}" -f $red, $reset)
+            return $false
         }
         $bigPort = $bigStatus.port
         $bigThinking = [bool]$bigStatus.thinking
     }
 
-    # -dual sessions: pick which GPU's endpoint to chat against. Single/-big
-    # sessions are unaffected — this block only runs when a dual session is
-    # active, and only determines $dualPort/$dualThinking used just below.
+    # -dual sessions: pick which GPU's endpoint to chat against, if both are running.
     $dualPort = $null
     $dualThinking = $null
     if ($Script:ActiveMode -eq "dual") {
@@ -1421,284 +1419,265 @@ function Cmd-Chat {
 
         $runningInstances = @($dualInstances | Where-Object { $_.running -eq $true })
         if ($runningInstances.Count -eq 0) {
-            Write-Host ("{0}No running dual instances to chat with.{1}" -f $red, $reset)
-            $Script:CurrentView = "menu"
-            return
+            Write-Host ("{0}No running model to chat with.{1}" -f $red, $reset)
+            return $false
         } elseif ($runningInstances.Count -eq 1) {
             $dualPort = $runningInstances[0].port
             $dualThinking = [bool]$runningInstances[0].thinking
         } else {
-            Write-Host ("  {0}Which GPU?{1}" -f $white, $reset)
-            for ($i = 0; $i -lt $runningInstances.Count; $i++) {
-                $inst = $runningInstances[$i]
-                Write-Host ("    {0}  {1,-10} {2}" -f ($i + 1).ToString(), $inst.gpu_id, $inst.model)
-            }
-            Write-Host ""
-            $choice = Read-Host ">"
-            $idx = [int]$choice - 1
-            if ($idx -lt 0 -or $idx -ge $runningInstances.Count) {
-                Write-Host ("{0}Invalid selection.{1}" -f $red, $reset)
-                $Script:CurrentView = "menu"
-                return
-            }
-            $dualPort = $runningInstances[$idx].port
-            $dualThinking = [bool]$runningInstances[$idx].thinking
+            $pick = Read-SelectList -Items $runningInstances -LabelFn { param($i) "{0}  {1}" -f $i.gpu_id, $i.model } `
+                -HeaderFn { Write-Host ("  {0}Which model do you want to chat with?{1}" -f $white, $reset) }
+            if (-not $pick) { return $false }
+            $dualPort = $pick.port
+            $dualThinking = [bool]$pick.thinking
         }
     }
 
-    $port = if ($dualPort) { $dualPort } elseif ($bigPort) { $bigPort } else { Get-ActiveGpuPort }
+    if ($Script:ActiveMode -eq "single" -and (-not $Script:ServerStatus -or -not $Script:ServerStatus.running)) {
+        Write-Host ("{0}No running model to chat with.{1}" -f $red, $reset)
+        return $false
+    }
+
+    $Script:ChatPort = if ($dualPort) { $dualPort } elseif ($bigPort) { $bigPort } else { Get-ActiveGpuPort }
+
+    # Seed thinking mode from server status once; after that /think and /nothink own it.
+    if (-not $Script:ThinkingSeeded) {
+        if ($null -ne $dualThinking) { $Script:ThinkingEnabled = $dualThinking }
+        elseif ($null -ne $bigThinking) { $Script:ThinkingEnabled = $bigThinking }
+        elseif ($Script:ServerStatus -and $Script:ServerStatus.thinking) { $Script:ThinkingEnabled = [bool]$Script:ServerStatus.thinking }
+        $Script:ThinkingSeeded = $true
+    }
+
+    $Script:ChatModeSnapshot = $Script:ActiveMode
+    return $true
+}
+
+# Renders $Script:ChatHistory — called as part of every screen redraw so
+# chat is always visible, not just in a dedicated mode.
+function Show-ChatHistory {
+    foreach ($msg in $Script:ChatHistory) {
+        if ($msg.role -eq "user") {
+            Write-Host ("  {0}You:{1}" -f $cyan, $reset)
+            Write-Host ("  {0}{1}{2}" -f $white, $msg.content, $reset)
+            Write-Host ""
+        }
+        elseif ($msg.role -eq "assistant") {
+            Write-Host ("  {0}Model:{1}" -f $amber, $reset)
+
+            if ($msg.thinking) {
+                Write-Host ("  {0}⟨thinking⟩{1}" -f $gray, $reset)
+                Write-Host ("  {0}{1}{2}" -f $gray, $msg.thinking, $reset)
+                Write-Host ("  {0}⟨/thinking⟩{1}" -f $gray, $reset)
+            }
+
+            Write-Host ("  {0}{1}{2}" -f $white, $msg.content, $reset)
+
+            if ($msg.tok_s) {
+                Write-Host ""
+                Write-Host ("  {0}─{1}" -f $dim, "───────────────────────────────────────────────", $reset)
+                $thinkingDisplay = if ($msg.thinking_toks) { "$($msg.thinking_toks) thinking · " } else { "" }
+                Write-Host ("  {0}⬡ {1} prompt · {2}{3} gen · {4} tok/s · {5}s{6}" -f `
+                    $amber, $msg.prompt_toks, $thinkingDisplay, $msg.gen_toks, $msg.tok_s, $msg.duration, $reset)
+            }
+
+            Write-Host ""
+        }
+    }
+}
+
+function Cmd-ClearChat {
+    $Script:ChatHistory = @()
+    Write-Host ("{0}Chat history cleared.{1}" -f $gray, $reset)
+}
+
+function Cmd-Think {
+    $Script:ThinkingEnabled = $true
+    $Script:ThinkingSeeded = $true
+    Write-Host ("{0}Thinking mode ON — the model will reason before responding.{1}" -f $amber, $reset)
+}
+
+function Cmd-NoThink {
+    $Script:ThinkingEnabled = $false
+    $Script:ThinkingSeeded = $true
+    Write-Host ("{0}Thinking mode OFF.{1}" -f $gray, $reset)
+}
+
+# Sends one message and streams the response inline. Blocks the main loop
+# for the duration of the response, same as the app already does for every
+# other command — the idle auto-refresh resumes once this returns.
+function Send-ChatMessage {
+    param([string]$text)
+
+    if (-not (Resolve-ChatEndpoint)) { return }
+
+    $port = $Script:ChatPort
     $hostAddr = $Script:ActiveServer.host
 
-    # Seed thinking mode from server status; user can toggle with /think and /nothink
-    $thinkingEnabled = $false
-    if ($null -ne $dualThinking) {
-        $thinkingEnabled = $dualThinking
-    } elseif ($null -ne $bigThinking) {
-        $thinkingEnabled = $bigThinking
-    } elseif ($Script:ServerStatus -and $Script:ServerStatus.thinking) {
-        $thinkingEnabled = [bool]$Script:ServerStatus.thinking
+    $Script:ChatHistory += [PSCustomObject]@{
+        role    = "user"
+        content = $text
     }
 
-    Write-Host ("{0}Chat mode — type /exit to return, /clear to clear history{1}" -f $cyan, $reset)
-    Write-Host ("{0}Thinking mode: {1}{2}" -f $gray, $(if ($thinkingEnabled) { "on (toggle with /nothink)" } else { "off (toggle with /think)" }), $reset)
-
-    Clear-Host
-    while ($Script:CurrentView -eq "chat") {
-
-        # Chat header
-        $logo = "{0}LL{1}a{2}M{3}esa{4} chat" -f $teal, $amber, $teal, $amber, $reset
-        Write-Host $logo
-        Write-Host ""
-
-        # Show history
-        foreach ($msg in $Script:ChatHistory) {
-            if ($msg.role -eq "user") {
-                Write-Host ("  {0}You:{1}" -f $cyan, $reset)
-                Write-Host ("  {0}{1}{2}" -f $white, $msg.content, $reset)
-                Write-Host ""
-            }
-            elseif ($msg.role -eq "assistant") {
-                Write-Host ("  {0}Model:{1}" -f $amber, $reset)
-
-                # Handle thinking blocks
-                if ($msg.thinking) {
-                    Write-Host ("  {0}⟨thinking⟩{1}" -f $gray, $reset)
-                    Write-Host ("  {0}{1}{2}" -f $gray, $msg.thinking, $reset)
-                    Write-Host ("  {0}⟨/thinking⟩{1}" -f $gray, $reset)
-                }
-
-                Write-Host ("  {0}{1}{2}" -f $white, $msg.content, $reset)
-
-                # Token stats if available
-                if ($msg.tok_s) {
-                    Write-Host ""
-                    Write-Host ("  {0}─{1}" -f $dim, "───────────────────────────────────────────────", $reset)
-                    $thinkingDisplay = if ($msg.thinking_toks) { "$($msg.thinking_toks) thinking · " } else { "" }
-                    Write-Host ("  {0}⬡ {1} prompt · {2}{3} gen · {4} tok/s · {5}s{6}" -f `
-                        $amber, $msg.prompt_toks, $thinkingDisplay, $msg.gen_toks, $msg.tok_s, $msg.duration, $reset)
-                }
-
-                Write-Host ""
+    $messages = @()
+    foreach ($msg in $Script:ChatHistory) {
+        if ($msg.role -eq "user" -or $msg.role -eq "assistant") {
+            $messages += [PSCustomObject]@{
+                role    = $msg.role
+                content = $msg.content
             }
         }
+    }
 
-        # Prompt — plain text so the cursor stays pinned to the bottom on resize
-        $input = Read-Host "  ›"
+    Write-Host ("  {0}Model: {1}" -f $amber, $reset)
 
-        if (-not $input) { continue }
-
-        # Commands
-        if ($input -match '^/(exit|quit|back)$') {
-            break
+    # Get model ID directly from /v1/models endpoint
+    $modelId = "default"
+    try {
+        $modelsResponse = Invoke-RestMethod -Uri "http://${hostAddr}:${port}/v1/models" -TimeoutSec 5
+        if ($modelsResponse.data -and $modelsResponse.data.Count -gt 0) {
+            $modelId = $modelsResponse.data[0].id
         }
-        elseif ($input -eq "/clear") {
-            $Script:ChatHistory = @()
-            continue
-        }
-        elseif ($input -eq "/think") {
-            $thinkingEnabled = $true
-            Write-Host ("{0}Thinking mode ON — Qwen3 will reason before responding.{1}" -f $amber, $reset)
-            continue
-        }
-        elseif ($input -eq "/nothink") {
-            $thinkingEnabled = $false
-            Write-Host ("{0}Thinking mode OFF.{1}" -f $gray, $reset)
-            continue
-        }
+    } catch {}
 
-        # Add user message to history
-        $Script:ChatHistory += [PSCustomObject]@{
-            role    = "user"
-            content = $input
-        }
+    $requestBody = [PSCustomObject]@{
+        model          = $modelId
+        messages       = $messages
+        stream         = $true
+        stream_options = [PSCustomObject]@{ include_usage = $true }
+    }
+    # Always send enable_thinking explicitly (true or false) rather than omitting
+    # it when off — some chat templates (e.g. Qwen3.6) default to thinking-on when
+    # the kwarg is absent, so omission failed to actually turn thinking off for them.
+    # Unrecognized template kwargs are harmlessly ignored by templates that don't use them.
+    $requestBody | Add-Member -NotePropertyName chat_template_kwargs -NotePropertyValue ([PSCustomObject]@{ enable_thinking = $Script:ThinkingEnabled })
+    $body = $requestBody | ConvertTo-Json -Depth 5
 
-        # Build messages array for API
-        $messages = @()
-        foreach ($msg in $Script:ChatHistory) {
-            if ($msg.role -eq "user" -or $msg.role -eq "assistant") {
-                $messages += [PSCustomObject]@{
-                    role    = $msg.role
-                    content = $msg.content
-                }
-            }
-        }
+    $assistantContent = ""
+    $thinkingContent  = ""
+    $promptToks       = 0
+    $genToks          = 0
+    $thinkingToks     = 0
 
-        # Call API with streaming
-        Write-Host ("  {0}Model: {1}" -f $amber, $reset)
+    try {
+        # Use HttpWebRequest for true SSE streaming (HttpClient buffers response content in .NET/PowerShell)
+        Write-Host ("  {0}Connecting to {1}:{2}...{3}" -f $gray, $hostAddr, $port, $reset)
 
-        # Get model ID directly from /v1/models endpoint
-        $modelId = "default"
-        try {
-            $modelsResponse = Invoke-RestMethod -Uri "http://${hostAddr}:${port}/v1/models" -TimeoutSec 5
-            if ($modelsResponse.data -and $modelsResponse.data.Count -gt 0) {
-                $modelId = $modelsResponse.data[0].id
-            }
-        } catch {}
+        $request = [System.Net.HttpWebRequest]::Create("http://${hostAddr}:${port}/v1/chat/completions")
+        $request.Method = "POST"
+        $request.ContentType = "application/json; charset=utf-8"
+        $request.Timeout = 120000
+        $request.ServicePoint.Expect100Continue = $false
 
-        $requestBody = [PSCustomObject]@{
-            model          = $modelId
-            messages       = $messages
-            stream         = $true
-            stream_options = [PSCustomObject]@{ include_usage = $true }
-        }
-        # Always send enable_thinking explicitly (true or false) rather than omitting
-        # it when off — some chat templates (e.g. Qwen3.6) default to thinking-on when
-        # the kwarg is absent, so omission failed to actually turn thinking off for them.
-        # Unrecognized template kwargs are harmlessly ignored by templates that don't use them.
-        $requestBody | Add-Member -NotePropertyName chat_template_kwargs -NotePropertyValue ([PSCustomObject]@{ enable_thinking = $thinkingEnabled })
-        $body = $requestBody | ConvertTo-Json -Depth 5
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($body)
+        $request.ContentLength = $bytes.Length
+        $requestStream = $request.GetRequestStream()
+        $requestStream.Write($bytes, 0, $bytes.Length)
+        $requestStream.Close()
 
-        $assistantContent = ""
-        $thinkingContent  = ""
-        $inThinking       = $false
-        $promptToks       = 0
-        $genToks          = 0
-        $thinkingToks     = 0
+        $response = $request.GetResponse()
+        Write-Host ("  {0}HTTP {1}{2}" -f $gray, $response.StatusCode, $reset)
+        Write-Host ("  {0}Stream opened, reading...{1}" -f $gray, $reset)
+
+        $stream = $response.GetResponseStream()
+        $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8)
+        $streamStart = Get-Date
 
         try {
-            # Use HttpWebRequest for true SSE streaming (HttpClient buffers response content in .NET/PowerShell)
-            Write-Host ("  {0}Connecting to {1}:{2}...{3}" -f $gray, $hostAddr, $port, $reset)
+            while ($true) {
+                $line = $reader.ReadLine()
+                if ($null -eq $line) { break }
+                if ([string]::IsNullOrEmpty($line)) { continue }
 
-            $request = [System.Net.HttpWebRequest]::Create("http://${hostAddr}:${port}/v1/chat/completions")
-            $request.Method = "POST"
-            $request.ContentType = "application/json; charset=utf-8"
-            $request.Timeout = 120000
-            $request.ServicePoint.Expect100Continue = $false
+                if ($line.StartsWith("data:")) {
+                    $jsonStr = $line.Substring(5).Trim()
+                    if ($jsonStr -eq '[DONE]') { break }
 
-            $bytes = [System.Text.Encoding]::UTF8.GetBytes($body)
-            $request.ContentLength = $bytes.Length
-            $requestStream = $request.GetRequestStream()
-            $requestStream.Write($bytes, 0, $bytes.Length)
-            $requestStream.Close()
+                    try {
+                        $delta = $jsonStr | ConvertFrom-Json
 
-            $response = $request.GetResponse()
-            Write-Host ("  {0}HTTP {1}{2}" -f $gray, $response.StatusCode, $reset)
-            Write-Host ("  {0}Stream opened, reading...{1}" -f $gray, $reset)
-
-            $stream = $response.GetResponseStream()
-            $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8)
-            $streamStart = Get-Date
-
-            try {
-                while ($true) {
-                    $line = $reader.ReadLine()
-                    if ($null -eq $line) { break }
-                    if ([string]::IsNullOrEmpty($line)) { continue }
-
-                    if ($line.StartsWith("data:")) {
-                        $jsonStr = $line.Substring(5).Trim()
-                        if ($jsonStr -eq '[DONE]') { break }
-
-                        try {
-                            $delta = $jsonStr | ConvertFrom-Json
-
-                            # Track usage — safe property access required under Set-StrictMode
-                            $usage = $delta.PSObject.Properties['usage']?.Value
-                            if ($usage) {
-                                $pv = $usage.PSObject.Properties['prompt_tokens']?.Value
-                                $gv = $usage.PSObject.Properties['completion_tokens']?.Value
-                                if ($pv -ne $null) { $promptToks = [int]$pv }
-                                if ($gv -ne $null) { $genToks = [int]$gv }
-                            }
-
-                            # Handle content deltas — safe property access required under Set-StrictMode
-                            if ($delta.choices -and $delta.choices[0].delta) {
-                                $deltaObj = $delta.choices[0].delta
-                                $reasoningChunk = $deltaObj.PSObject.Properties['reasoning_content']?.Value
-                                $contentChunk = $deltaObj.PSObject.Properties['content']?.Value
-
-                                if ($reasoningChunk) {
-                                    $thinkingToks++
-                                    $thinkingContent += $reasoningChunk
-                                    Write-Host $reasoningChunk -NoNewline -ForegroundColor DarkGray
-                                }
-                                if ($contentChunk) {
-                                    if (-not $assistantContent) {
-                                        Write-Host ""
-                                        Write-Host ""
-                                    }
-                                    $assistantContent += $contentChunk
-                                    Write-Host $contentChunk -NoNewline
-                                }
-                            }
-                        } catch {
-                            # Skip malformed lines
+                        # Track usage — safe property access required under Set-StrictMode
+                        $usage = $delta.PSObject.Properties['usage']?.Value
+                        if ($usage) {
+                            $pv = $usage.PSObject.Properties['prompt_tokens']?.Value
+                            $gv = $usage.PSObject.Properties['completion_tokens']?.Value
+                            if ($pv -ne $null) { $promptToks = [int]$pv }
+                            if ($gv -ne $null) { $genToks = [int]$gv }
                         }
+
+                        # Handle content deltas — safe property access required under Set-StrictMode
+                        if ($delta.choices -and $delta.choices[0].delta) {
+                            $deltaObj = $delta.choices[0].delta
+                            $reasoningChunk = $deltaObj.PSObject.Properties['reasoning_content']?.Value
+                            $contentChunk = $deltaObj.PSObject.Properties['content']?.Value
+
+                            if ($reasoningChunk) {
+                                $thinkingToks++
+                                $thinkingContent += $reasoningChunk
+                                Write-Host $reasoningChunk -NoNewline -ForegroundColor DarkGray
+                            }
+                            if ($contentChunk) {
+                                if (-not $assistantContent) {
+                                    Write-Host ""
+                                    Write-Host ""
+                                }
+                                $assistantContent += $contentChunk
+                                Write-Host $contentChunk -NoNewline
+                            }
+                        }
+                    } catch {
+                        # Skip malformed lines
                     }
                 }
-            } finally {
-                $reader.Dispose()
-                $response.Close()
             }
-            $streamEnd = Get-Date
-
-            Write-Host ""
-
-            $duration = [math]::Round(($streamEnd - $streamStart).TotalSeconds, 1)
-
-            # Fallback: if the server didn't send usage (stream_options not honoured), estimate
-            if ($genToks -eq 0) {
-                # completion_tokens includes thinking; approximate from both contents
-                $genToks = [Math]::Max(1, [int](($assistantContent.Length + $thinkingContent.Length) / 4))
-            }
-            if ($promptToks -eq 0) {
-                $totalMsgLen = ($messages | ForEach-Object { $_.content.Length } | Measure-Object -Sum).Sum
-                $promptToks = [Math]::Max(1, [int]($totalMsgLen / 4))
-            }
-
-            # Total tokens generated = thinking tokens + content tokens
-            $tokS = if ($duration -gt 0) { [math]::Round(($thinkingToks + $genToks) / $duration, 1) } else { 0 }
-            if ($tokS -gt 0) { $Script:LastTokS = $tokS }
-
-            # Always display token stats after a successful response
-            if ($assistantContent) {
-                Write-Host ("  {0}─{1}" -f $dim, "───────────────────────────────────────────────", $reset)
-                Write-Host ("  {0}⬡ {1} prompt · {2} thinking · {3} gen · {4} tok/s · {5}s{6}" -f `
-                    $amber, $promptToks, $thinkingToks, $genToks, $tokS, [math]::Round($duration, 1), $reset)
-                Write-Host ""
-            }
-
-            # Add assistant message to history
-            $Script:ChatHistory += [PSCustomObject]@{
-                role         = "assistant"
-                content      = $assistantContent
-                thinking     = $thinkingContent
-                prompt_toks  = $promptToks
-                thinking_toks = $thinkingToks
-                gen_toks     = $genToks
-                tok_s        = $tokS
-                duration     = [math]::Round($duration, 1)
-            }
-
-        } catch {
-            Write-Host ("{0}Error: {1}{2}" -f $red, $_.Exception.Message, $reset)
-            Write-Host ("{0}Detail: {1}{2}" -f $red, $_.Exception.ToString(), $reset)
-            Write-Host ("{0}Stack: {1}{2}" -f $red, $_.ScriptStackTrace, $reset)
+        } finally {
+            $reader.Dispose()
+            $response.Close()
         }
-    }
+        $streamEnd = Get-Date
 
-    $Script:CurrentView = "menu"
-    Clear-Host
+        Write-Host ""
+
+        $duration = [math]::Round(($streamEnd - $streamStart).TotalSeconds, 1)
+
+        # Fallback: if the server didn't send usage (stream_options not honoured), estimate
+        if ($genToks -eq 0) {
+            # completion_tokens includes thinking; approximate from both contents
+            $genToks = [Math]::Max(1, [int](($assistantContent.Length + $thinkingContent.Length) / 4))
+        }
+        if ($promptToks -eq 0) {
+            $totalMsgLen = ($messages | ForEach-Object { $_.content.Length } | Measure-Object -Sum).Sum
+            $promptToks = [Math]::Max(1, [int]($totalMsgLen / 4))
+        }
+
+        # Total tokens generated = thinking tokens + content tokens
+        $tokS = if ($duration -gt 0) { [math]::Round(($thinkingToks + $genToks) / $duration, 1) } else { 0 }
+        if ($tokS -gt 0) { $Script:LastTokS = $tokS }
+
+        # Always display token stats after a successful response
+        if ($assistantContent) {
+            Write-Host ("  {0}─{1}" -f $dim, "───────────────────────────────────────────────", $reset)
+            Write-Host ("  {0}⬡ {1} prompt · {2} thinking · {3} gen · {4} tok/s · {5}s{6}" -f `
+                $amber, $promptToks, $thinkingToks, $genToks, $tokS, [math]::Round($duration, 1), $reset)
+            Write-Host ""
+        }
+
+        # Add assistant message to history
+        $Script:ChatHistory += [PSCustomObject]@{
+            role         = "assistant"
+            content      = $assistantContent
+            thinking     = $thinkingContent
+            prompt_toks  = $promptToks
+            thinking_toks = $thinkingToks
+            gen_toks     = $genToks
+            tok_s        = $tokS
+            duration     = [math]::Round($duration, 1)
+        }
+
+    } catch {
+        Write-Host ("{0}Error: {1}{2}" -f $red, $_.Exception.Message, $reset)
+        Write-Host ("{0}Detail: {1}{2}" -f $red, $_.Exception.ToString(), $reset)
+        Write-Host ("{0}Stack: {1}{2}" -f $red, $_.ScriptStackTrace, $reset)
+    }
 }
 
 # ── Command: /servers ─────────────────────────────────────────────────────
@@ -1807,56 +1786,117 @@ function Cmd-Config {
     Write-Host ""
 }
 
-# ── Command: /help ────────────────────────────────────────────────────────
+# ── Command Palette ───────────────────────────────────────────────────────
+# Single source of truth for "/" — both what the palette lists and what
+# typing a full command name (e.g. "/start" + Enter) dispatches to.
 
-function Cmd-Help {
-    Write-Host ""
-    Write-Host ("  {0}LLaMesa Commands{1}" -f $teal, $reset)
-    Write-Host ("  {0}─{1}" -f $dim, "──────────────────────────────────────────────────────", $reset)
-    Write-Host ""
-    Write-Host ("  {0}/start{1}        Start the inference server with model selection" -f $white, $reset)
-    Write-Host ("  {0}/stop{1}         Stop the running server gracefully" -f $white, $reset)
-    Write-Host ("  {0}/switch{1}       Hot-swap to a different model" -f $white, $reset)
-    Write-Host ("  {0}/restart{1}      Restart server with same/new settings" -f $white, $reset)
-    Write-Host ("  {0}/start-big{1}    Start combined-VRAM server (Vulkan, both GPUs)" -f $white, $reset)
-    Write-Host ("  {0}/stop-big{1}     Stop the combined-VRAM server" -f $white, $reset)
-    Write-Host ("  {0}/restart-big{1}  Restart the combined-VRAM server (re-selects model)" -f $white, $reset)
-    Write-Host ("  {0}/start-dual{1}   Start two independent servers, one per GPU (ROCm)" -f $white, $reset)
-    Write-Host ("  {0}/stop-dual{1}    Stop dual instance(s) (prompts which, if both running)" -f $white, $reset)
-    Write-Host ("  {0}/restart-dual{1} Restart dual instance(s) with remembered model(s)" -f $white, $reset)
-    Write-Host ("  {0}/health{1}       Check server API endpoints" -f $white, $reset)
-    Write-Host ("  {0}/logs{1}         Stream server logs (Ctrl+C to exit)" -f $white, $reset)
-    Write-Host ("  {0}/models{1}       List all available models" -f $white, $reset)
-    Write-Host ("  {0}/download{1}     Download a model from HuggingFace" -f $white, $reset)
-    Write-Host ("  {0}/chat{1}         Chat with the model ({2}/exit{1} to leave)" -f $white, $reset, $gray)
-    Write-Host ("  {0}/servers{1}      Manage server profiles" -f $white, $reset)
-    Write-Host ("  {0}/config{1}       View/edit configuration" -f $white, $reset)
-    Write-Host ("  {0}/help{1}         Show this help" -f $white, $reset)
-    Write-Host ("  {0}/quit{1}         Exit LLaMesa" -f $white, $reset)
-    Write-Host ""
-    Write-Host ("  {0}Chat commands: /clear /think /nothink /exit{1}" -f $gray, $reset)
-    Write-Host ""
-}
-
-# ── Command Autocomplete ──────────────────────────────────────────────────
-
-$Script:Commands = @(
-    "start", "stop", "switch", "restart",
-    "start-big", "stop-big", "restart-big",
-    "start-dual", "stop-dual", "restart-dual",
-    "health", "logs",
-    "models", "download",
-    "chat",
-    "servers", "config", "help", "quit"
+$Script:PaletteCommands = @(
+    [PSCustomObject]@{ Name = "start";    Section = "SERVER";     Desc = "start server — model(s), thinking, context" }
+    [PSCustomObject]@{ Name = "stop";     Section = "SERVER";     Desc = "stop what's running" }
+    [PSCustomObject]@{ Name = "restart";  Section = "SERVER";     Desc = "stop + start with same settings" }
+    [PSCustomObject]@{ Name = "health";   Section = "MONITORING"; Desc = "ping /health and /v1/models" }
+    [PSCustomObject]@{ Name = "logs";     Section = "MONITORING"; Desc = "tail verbose server output" }
+    [PSCustomObject]@{ Name = "models";   Section = "MODELS";     Desc = "list downloaded models + sizes" }
+    [PSCustomObject]@{ Name = "download"; Section = "MODELS";     Desc = "download from huggingface" }
+    [PSCustomObject]@{ Name = "clear";    Section = "CHAT";       Desc = "clear chat history" }
+    [PSCustomObject]@{ Name = "think";    Section = "CHAT";       Desc = "enable thinking mode" }
+    [PSCustomObject]@{ Name = "nothink";  Section = "CHAT";       Desc = "disable thinking mode" }
+    [PSCustomObject]@{ Name = "servers";  Section = "CONFIG";     Desc = "manage server profiles" }
+    [PSCustomObject]@{ Name = "config";   Section = "CONFIG";     Desc = "view/edit config" }
+    [PSCustomObject]@{ Name = "quit";     Section = "CONFIG";     Desc = "exit LLaMesa" }
 )
 
-function Get-MatchingCommands {
-    param([string]$prefix)
+function Invoke-PaletteCommand {
+    param([string]$cmd)
 
-    return $Script:Commands | Where-Object { $_ -like "${prefix}*" }
+    switch ($cmd) {
+        "start"    { Cmd-Start;    Read-Host "`nPress Enter to continue" | Out-Null }
+        "stop"     { Cmd-Stop;     Read-Host "`nPress Enter to continue" | Out-Null }
+        "restart"  { Cmd-Restart;  Read-Host "`nPress Enter to continue" | Out-Null }
+        "health"   { Cmd-Health;   Read-Host "`nPress Enter to continue" | Out-Null }
+        "logs"     { Cmd-Logs }
+        "models"   { Cmd-Models;   Read-Host "`nPress Enter to continue" | Out-Null }
+        "download" { Cmd-Download; Read-Host "`nPress Enter to continue" | Out-Null }
+        "clear"    { Cmd-ClearChat }
+        "think"    { Cmd-Think }
+        "nothink"  { Cmd-NoThink }
+        "servers"  { Cmd-Servers }
+        "config"   { Cmd-Config }
+        "help"     { } # "/" already opens the palette — kept as a recognized no-op alias
+        "quit"     { Write-Host ("{0}Goodbye!{1}" -f $gray, $reset); exit 0 }
+        default    { Write-Host ("{0}Unknown command: /{1}{2}" -f $red, $cmd, $reset); Start-Sleep -Seconds 1 }
+    }
+}
+
+function Test-ModelLoaded {
+    switch ($Script:ActiveMode) {
+        "big" {
+            $s = Get-BigStatus
+            return [bool]($s -and $s.running)
+        }
+        "dual" {
+            $s = Get-DualStatus
+            $inst = @()
+            if ($s -is [array]) { $inst = $s } elseif ($s) { $inst = @($s) }
+            return (@($inst | Where-Object { $_.running -eq $true }).Count -gt 0)
+        }
+        default {
+            return [bool]($Script:ServerStatus -and $Script:ServerStatus.running)
+        }
+    }
 }
 
 # ── Main Loop ─────────────────────────────────────────────────────────────
+# Non-blocking key poll — this is what makes the dashboard actually
+# auto-refresh while idle (previously gated behind a blocking Read-Host) and
+# lets "/" open a live-filtering palette above a fixed bottom input, Pi
+# Agent-style. Bare text is sent as a chat message; the chat scrollback and
+# "/" palette are both rendered as part of the same full-screen redraw.
+
+function Draw-Screen {
+    param($status, [string]$inputBuffer, [bool]$paletteOpen, [string]$paletteFilter, [int]$paletteIndex)
+
+    Clear-Host
+    Show-ActiveHeader -status $status
+    Show-ChatHistory
+
+    $filtered = @()
+    if ($paletteOpen) {
+        $filtered = @($Script:PaletteCommands | Where-Object { $_.Name -like "*${paletteFilter}*" })
+        Write-Host ""
+        if ($filtered.Count -eq 0) {
+            Write-Host ("  {0}No matching commands.{1}" -f $gray, $reset)
+        } else {
+            $lastSection = $null
+            for ($i = 0; $i -lt $filtered.Count; $i++) {
+                $c = $filtered[$i]
+                if ($c.Section -ne $lastSection) {
+                    Write-Host ("  {0}{1}{2}" -f $teal, $c.Section, $reset)
+                    $lastSection = $c.Section
+                }
+                $label = "/{0,-10} {1}" -f $c.Name, $c.Desc
+                if ($i -eq $paletteIndex) {
+                    Write-Host ("  {0}❯ {1}{2}" -f $teal, $label, $reset)
+                } else {
+                    Write-Host ("    {0}{1}{2}" -f $white, $label, $reset)
+                }
+            }
+        }
+        Write-Host ("  {0}up/down navigate  ·  enter select  ·  esc cancel{1}" -f $gray, $reset)
+    }
+
+    if ($Script:InputHint) {
+        Write-Host ("  {0}{1}{2}" -f $amber, $Script:InputHint, $reset)
+    }
+
+    # Pin the input line to the last row — pad with blank lines to fill remaining height
+    $usedRows = [Console]::CursorTop
+    $padLines = [Math]::Max(0, [Console]::WindowHeight - $usedRows - 2)
+    if ($padLines -gt 0) { Write-Host ("`n" * ($padLines - 1)) }
+
+    $prefix = if ($paletteOpen) { "/$paletteFilter" } else { $inputBuffer }
+    Write-Host ("  {0}›{1} {2}" -f $teal, $reset, $prefix) -NoNewline
+}
 
 function Main {
     $host.UI.RawUI.WindowTitle = "LLaMesa"
@@ -1864,12 +1904,19 @@ function Main {
     Detect-ActiveMode
 
     $Script:ServerOnline = $false
+    $Script:InputHint = $null
     $status = $null
     # MinValue forces an immediate status fetch on the first iteration
     $lastRefresh = [DateTime]::MinValue
 
+    $inputBuffer = ""
+    $paletteOpen = $false
+    $paletteFilter = ""
+    $paletteIndex = 0
+    $needsRedraw = $true
+
     while ($true) {
-        # Refresh status every 2s (or on first run / after a command)
+        # Auto-refresh every 2s — fires on its own now, not just after a command
         $elapsed = ([DateTime]::Now - $lastRefresh).TotalSeconds
         if ($elapsed -ge 2) {
             try {
@@ -1882,49 +1929,86 @@ function Main {
                 $status = $null
             }
             $lastRefresh = [DateTime]::Now
+            $needsRedraw = $true
         }
 
-        # Full clear + redraw every loop so there's never a stale/doubled header
-        Clear-Host
-        Show-ActiveHeader -status $status
-        Show-Menu
-
-        # Pin the prompt to the last row — pad with blank lines to fill remaining height
-        $usedRows = [Console]::CursorTop
-        $padLines = [Math]::Max(0, [Console]::WindowHeight - $usedRows - 2)
-        if ($padLines -gt 0) { Write-Host ("`n" * ($padLines - 1)) }
-
-        # Read command — plain prompt (no ANSI codes) so PowerShell keeps the cursor pinned
-        $input = Read-Host "  ›:"
-
-        if (-not $input -or -not $input.Trim()) { continue }
-        $cmd = $input.Trim().TrimStart('/')
-
-        switch ($cmd) {
-            "start"    { Clear-Host; Cmd-Start;    Read-Host "`nPress Enter to continue" }
-            "stop"     { Clear-Host; Cmd-Stop;     Read-Host "`nPress Enter to continue" }
-            "switch"   { Clear-Host; Cmd-Switch;   Read-Host "`nPress Enter to continue" }
-            "restart"  { Clear-Host; Cmd-Restart;  Read-Host "`nPress Enter to continue" }
-            "start-big"   { Clear-Host; Cmd-StartBig;   Read-Host "`nPress Enter to continue" }
-            "stop-big"    { Clear-Host; Cmd-StopBig;    Read-Host "`nPress Enter to continue" }
-            "restart-big" { Clear-Host; Cmd-RestartBig; Read-Host "`nPress Enter to continue" }
-            "start-dual"   { Clear-Host; Cmd-StartDual;   Read-Host "`nPress Enter to continue" }
-            "stop-dual"    { Clear-Host; Cmd-StopDual;    Read-Host "`nPress Enter to continue" }
-            "restart-dual" { Clear-Host; Cmd-RestartDual; Read-Host "`nPress Enter to continue" }
-            "health"   { Clear-Host; Cmd-Health;   Read-Host "`nPress Enter to continue" }
-            "logs"     { Cmd-Logs }
-            "models"   { Clear-Host; Cmd-Models;   Read-Host "`nPress Enter to continue" }
-            "download" { Clear-Host; Cmd-Download; Read-Host "`nPress Enter to continue" }
-            "chat"     { Cmd-Chat }
-            "servers"  { Clear-Host; Cmd-Servers;  Read-Host "`nPress Enter to continue" }
-            "config"   { Clear-Host; Cmd-Config;   Read-Host "`nPress Enter to continue" }
-            "help"     { Clear-Host; Cmd-Help;     Read-Host "`nPress Enter to continue" }
-            "quit"     { Clear-Host; Write-Host ("{0}Goodbye!{1}" -f $gray, $reset); exit 0 }
-            default    { Write-Host ("{0}Unknown command: /{1}{2}" -f $red, $cmd, $reset); Start-Sleep -Seconds 1 }
+        if ($needsRedraw) {
+            Draw-Screen -status $status -inputBuffer $inputBuffer -paletteOpen $paletteOpen -paletteFilter $paletteFilter -paletteIndex $paletteIndex
+            $needsRedraw = $false
         }
 
-        # Force immediate status re-fetch after any command
-        $lastRefresh = [DateTime]::MinValue
+        if (-not [Console]::KeyAvailable) {
+            Start-Sleep -Milliseconds 50
+            continue
+        }
+
+        $key = [Console]::ReadKey($true)
+
+        if ($paletteOpen) {
+            $filtered = @($Script:PaletteCommands | Where-Object { $_.Name -like "*${paletteFilter}*" })
+            switch ($key.Key) {
+                'UpArrow'   { if ($filtered.Count -gt 0) { $paletteIndex = ($paletteIndex - 1 + $filtered.Count) % $filtered.Count } }
+                'DownArrow' { if ($filtered.Count -gt 0) { $paletteIndex = ($paletteIndex + 1) % $filtered.Count } }
+                'Escape'    { $paletteOpen = $false; $paletteFilter = ""; $paletteIndex = 0; $inputBuffer = "" }
+                'Backspace' {
+                    if ($paletteFilter.Length -gt 0) { $paletteFilter = $paletteFilter.Substring(0, $paletteFilter.Length - 1) }
+                    else { $paletteOpen = $false }
+                    $paletteIndex = 0
+                }
+                'Enter' {
+                    if ($filtered.Count -gt 0) {
+                        $cmd = $filtered[$paletteIndex].Name
+                        $paletteOpen = $false; $paletteFilter = ""; $paletteIndex = 0; $inputBuffer = ""; $Script:InputHint = $null
+                        Clear-Host
+                        Invoke-PaletteCommand $cmd
+                        $lastRefresh = [DateTime]::MinValue
+                    }
+                }
+                default {
+                    if ($key.KeyChar -and -not [char]::IsControl($key.KeyChar)) {
+                        $paletteFilter += $key.KeyChar
+                        $paletteIndex = 0
+                    }
+                }
+            }
+        } else {
+            switch ($key.Key) {
+                'Enter' {
+                    $text = $inputBuffer.Trim()
+                    if ($text) {
+                        if ($text.StartsWith("/")) {
+                            $inputBuffer = ""; $Script:InputHint = $null
+                            Clear-Host
+                            Invoke-PaletteCommand ($text.TrimStart('/'))
+                            $lastRefresh = [DateTime]::MinValue
+                        } elseif (Test-ModelLoaded) {
+                            $inputBuffer = ""; $Script:InputHint = $null
+                            Clear-Host
+                            Send-ChatMessage $text
+                            $lastRefresh = [DateTime]::MinValue
+                        } else {
+                            $Script:InputHint = "No model loaded — press / then /start to load one."
+                        }
+                    }
+                }
+                'Backspace' {
+                    if ($inputBuffer.Length -gt 0) { $inputBuffer = $inputBuffer.Substring(0, $inputBuffer.Length - 1) }
+                }
+                default {
+                    if ($key.KeyChar -and -not [char]::IsControl($key.KeyChar)) {
+                        if ($key.KeyChar -eq '/' -and $inputBuffer.Length -eq 0) {
+                            $paletteOpen = $true
+                            $paletteFilter = ""
+                            $paletteIndex = 0
+                        } else {
+                            $inputBuffer += $key.KeyChar
+                        }
+                    }
+                }
+            }
+        }
+
+        $needsRedraw = $true
     }
 }
 

@@ -119,23 +119,26 @@ It will test the SSH connection and save your config to `~/.llamesa/config.json`
 
 ## 8. Using LLaMesa
 
-Once connected, you'll see the main menu:
+Once connected, you'll see the live VRAM/GPU/RAM/CPU dashboard with a chat input fixed
+at the bottom. Press `/` to open the command palette (arrow keys to navigate, type to
+filter):
 
 | Command | Description |
 |---------|-------------|
-| `/start` | Start inference server with model picker |
-| `/stop` | Stop the server gracefully |
-| `/switch` | Hot-swap to a different model |
-| `/restart` | Restart with same settings |
-| `/stats` | Live stats dashboard |
+| `/start` | Start server — pick 1 model (all GPUs) or one per GPU, thinking mode, context size |
+| `/stop` | Stop what's running — no prompt if only one thing is loaded |
+| `/restart` | Restart with the same settings |
 | `/health` | Check API endpoints |
 | `/logs` | Stream server logs |
 | `/models` | List available models |
 | `/download` | Download from HuggingFace |
-| `/chat` | Chat with the model |
+| `/clear` | Clear chat history |
+| `/think` / `/nothink` | Toggle thinking mode |
 | `/servers` | Manage server profiles |
 | `/config` | View/edit config |
 | `/quit` | Exit |
+
+To chat, just type — no `/` needed — and hit enter.
 
 ## Troubleshooting
 

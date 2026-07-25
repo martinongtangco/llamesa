@@ -276,16 +276,18 @@ llamesa.sh logs-big
 
 ### Windows client (`llamesa.ps1`)
 
-The menu's **MULTI-GPU** section adds `/start-big`, `/stop-big`, `/restart-big`,
-`/start-dual`, `/stop-dual`, `/restart-dual`. The header switches to a per-mode layout
-automatically once one of these is started:
+There's no separate `-big`/`-dual` menu section — `/start` picks the mode for you based
+on how many models you select: pick 1 to load it across all GPUs (combined VRAM, what
+used to be `start-big`), or one per GPU to load independent instances (what used to be
+`start-dual`). `/stop` and `/restart` detect whichever mode is actually running the same
+way. The header switches to a per-mode layout automatically:
 
 - **`-big` header**: single stats row with side-by-side per-device VRAM/GPU% mini-bars.
 - **`-dual` header**: two full stats rows, one per GPU, each with its own model/ctx/thinking line.
 
-`/chat` prompts you to pick which GPU's endpoint to talk to when a `-dual` session with
-both instances running is active; otherwise it behaves exactly as it does for a single
-server or a `-big` session.
+Chat is always available from the bottom input — it prompts you to pick which GPU's
+model to talk to when a `-dual` session with both instances running is active; otherwise
+it behaves exactly as it does for a single server or a `-big` session.
 
 ---
 
