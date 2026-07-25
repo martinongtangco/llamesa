@@ -5,6 +5,25 @@ This guide covers LLaMesa's two multi-GPU capabilities, added on top of the sing
 variants). Both are fully independent, additive command sets — neither touches how the
 base commands work.
 
+> **Hardware update (2026-07-24):** the RX 9060 XT (16GB) has been physically replaced
+> with a second AMD Radeon AI PRO R9700 (32GB), verified via `lspci`/`rocm-smi` on the
+> host. The system is now **dual R9700**, not R9700 + RX 9060 XT. The two identical
+> cards are named `r9700a` (PCI bus `06:00.0`, ROCm/ `--list-devices` index 0, existing
+> card) and `r9700b` (PCI bus `0f:00.0`, index 1, new card) throughout config, CLI
+> flags, and this doc — see [Config setup](#config-setup) for the naming rename from the
+> old `r9700`/`rx9060xt` keys. Combined VRAM for `-big` is now ~64GB, not ~48GB.
+> Historical sections below (env vars, tensor-split ratios, VRAM test tables) that were
+> measured against the old asymmetric R9700+RX9060XT pair are kept as a record of that
+> testing and marked accordingly — **they describe hardware that no longer exists in
+> this system and have not been re-validated against the new symmetric pair**, with one
+> exception: [ROCm vs Vulkan speed for `-big`](#rocm-vs-vulkan-speed-on-the-new-symmetric-hardware)
+> has been re-tested (2026-07-24) and is no longer stale. Still unverified: whether
+> `r9700b` needs the same `RADV_DEBUG`/`GPU_MAX_HW_QUEUES` env vars as `r9700a` (config
+> currently assumes yes, since it's the same card model), and the actual VRAM-headroom/
+> cross-GPU-split reliability figures in the `-big` Known Limitations table below — don't
+> assume the two cards behave identically for bandwidth-sensitive workloads without
+> testing, since PCIe topology per-slot can still differ even with identical GPUs.
+
 > **Read [Known Limitations](#known-limitations) before relying on either mode.**
 > `-dual` is confirmed fully working on both GPUs, now that it runs on a dedicated ROCm
 > build (see [Two backends](#two-backends-why-dual-is-rocm-and-big-is-vulkan) below).
@@ -17,10 +36,10 @@ base commands work.
 |---|---|---|
 | Backend | **ROCm/HIP** (dedicated build, see below) | Vulkan |
 | Processes | Two independent `llama-server` processes | One process spanning both GPUs |
-| VRAM | Each model limited to its own GPU's VRAM | Combined VRAM (~48GB on R9700 + RX 9060 XT) |
+| VRAM | Each model limited to its own GPU's VRAM | Combined VRAM (~64GB on 2x R9700) |
 | Use when | Running two separate models at once (e.g. a chat model + a coder model) | One model too large for either GPU alone |
 | Config block | `dual_gpu` | `vulkan_split` |
-| Status | **Confirmed working**, both GPUs | **Confirmed working**, genuine cross-GPU splits up to ~48GB combined, *from a clean VRAM starting state* |
+| Status | **Confirmed working**, both GPUs | **Confirmed working** *(pre-hardware-swap split-reliability results below; combined VRAM figure updated; backend speed re-tested 2026-07-24, see [below](#rocm-vs-vulkan-speed-on-the-new-symmetric-hardware); cross-GPU split reliability itself not yet re-tested on the new symmetric pair)*, from a clean VRAM starting state |
 
 ---
 
@@ -43,10 +62,40 @@ reason about (silent CPU/RAM fallback with no error — see
 (hard fail instead of silent fallback — see below) is a feature, not a risk, because you
 find out immediately if a model doesn't fit rather than discovering it later via `free -h`.
 
-`-big` stays on Vulkan because Vulkan's graceful spill-to-RAM (slow, but not a crash) is
-actually useful for the tensor-split path, and because `-big`'s open cross-GPU bug (see
-[Known Limitations](#known-limitations)) is not a backend-availability problem — moving it
-to ROCm would not fix it and would trade a slow-but-alive failure mode for an outright OOM.
+`-big` stays on Vulkan **by default** for the same reason as before — Vulkan's graceful
+spill-to-RAM (slow, but not a crash) is useful for the tensor-split path, and it avoids the
+unmerged ROCm split-mode bug entirely (see [Known Limitations](#known-limitations)). But
+unlike the ROCm-availability question, the *speed* case for staying on Vulkan is no longer
+clear-cut: see [ROCm vs Vulkan speed on the new symmetric hardware](#rocm-vs-vulkan-speed-on-the-new-symmetric-hardware)
+below — on the old asymmetric R9700+RX9060XT pair ROCm was ~30% slower, but re-tested on
+the new symmetric dual-R9700 pair it's roughly at parity (slightly ahead in one run). If
+you only ever run dense models through `-big`, ROCm is a legitimate thing to try; if you
+run MoE/hybrid-recurrent (A3B-style) models through it, stay on Vulkan regardless of speed
+until the split-mode bug is fixed upstream.
+
+### ROCm vs Vulkan speed on the new symmetric hardware
+
+Re-tested 2026-07-24 (same day as the RX 9060 XT → second R9700 swap), mirroring the
+2026-07-14 methodology: temporarily pointed `vulkan_split.llama_binary` at the ROCm build
+and ran `-big` through the same code path, from a clean VRAM state, dense Qwen3.6-27B
+(Q6_K_XL, ctx=131072, `tensor_split` now `1,1`), measured via the native `/completion`
+endpoint's `timings`:
+
+| Backend | Generation speed | Model load time |
+|---|---|---|
+| Vulkan | 20.05 tok/s | ~26s |
+| ROCm | 21.08 tok/s | ~6s |
+
+Single run each — the ~5% gap is within plausible run-to-run noise, so read this as "roughly
+at parity, maybe a slight ROCm edge," not a confirmed win. What *did* flip decisively from
+the old asymmetric-hardware result (ROCm ~30% slower) is the load time and the fact that
+ROCm is no longer clearly worse. This supports the original hypothesis that the old
+result was caused by the asymmetric 32GB/16GB VRAM split, not something inherent to ROCm
+on this GPU generation. Live config was reverted back to the Vulkan binary after this test
+— **`-big`'s default stays Vulkan**; this section documents that ROCm is a viable
+alternative for dense models if you want to experiment further, not a recommendation to
+switch. Only tested with a dense model — do not extrapolate this result to MoE/hybrid
+architectures, which hit the split-mode bug regardless of relative speed.
 
 ### Building the ROCm binary
 
@@ -75,7 +124,8 @@ visible before pointing config at it:
 
 ```bash
 ~/llama.cpp-rocm/build-rocm/bin/llama-server --list-devices
-# ROCm0 = RX 9060 XT (16GB), ROCm1 = R9700 (32GB)
+# ROCm0 = AMD Radeon Graphics (32624 MiB), ROCm1 = AMD Radeon Graphics (32624 MiB)
+# Both cards report identical VRAM now — see the tie-break note below.
 ```
 
 **That index mapping (`ROCm0`/`ROCm1`) is not guaranteed stable across launches** — same
@@ -85,6 +135,17 @@ launch (matching by VRAM size) rather than hardcoding it. The function is backen
 its regex matches `[A-Za-z]+([0-9]+):`, so the same code path handles `Vulkan0`/`Vulkan1`
 or `ROCm0`/`ROCm1` depending on which binary a given `dual_gpu.<gpu>.llama_binary` points
 at.
+
+**With two identical 32GB R9700s, VRAM size alone can no longer disambiguate the two
+devices** — both `r9700a` and `r9700b` would otherwise resolve to the same nearest-VRAM
+match. `_resolve_device_index` takes an optional exclude-index argument for this: `-dual`
+resolves `r9700a`'s device first, then resolves `r9700b` passing `r9700a`'s resolved index
+as the exclusion, guaranteeing the two instances always land on different physical GPUs
+(even though which *specific* physical card ends up `r9700a` vs `r9700b` on any given
+launch isn't pinned down — harmless here since the two cards are functionally identical).
+The same fix applies to `_resolve_drm_card`, used by v1's `--gpu 0|1|all` status/stats
+display, via a `skip_count` argument computed from how many earlier `gpus[]` config
+entries share the same `vram_gb`.
 
 ---
 
@@ -104,13 +165,13 @@ Reference values for this hardware:
 
 | Setting | Value |
 |---|---|
-| R9700 port | `1234` |
-| RX 9060 XT port | `1235` |
+| R9700A port (bus `06:00.0`, existing card) | `1234` |
+| R9700B port (bus `0f:00.0`, new card) | `1235` |
 | Vulkan split (`-big`) port | `1236` |
-| `dual_gpu.r9700.llama_binary` / `dual_gpu.rx9060xt.llama_binary` | ROCm build, e.g. `~/llama.cpp-rocm/build-rocm/bin/llama-server` |
-| `dual_gpu.r9700.env` / `dual_gpu.rx9060xt.env` | `{}` — no env vars needed. In particular, do **not** set `HIP_VISIBLE_DEVICES`: it restricts the device list `_resolve_device_index` reads from `--list-devices`, which conflicts with `-sm none -mg <index>` needing to see and select from *both* devices. |
+| `dual_gpu.r9700a.llama_binary` / `dual_gpu.r9700b.llama_binary` | ROCm build, e.g. `~/llama.cpp-rocm/build-rocm/bin/llama-server` |
+| `dual_gpu.r9700a.env` / `dual_gpu.r9700b.env` | `{}` — no env vars needed. In particular, do **not** set `HIP_VISIBLE_DEVICES`: it restricts the device list `_resolve_device_index` reads from `--list-devices`, which conflicts with `-sm none -mg <index>` needing to see and select from *both* devices. |
 | `vulkan_split.llama_binary` (`-big`) | Original Vulkan build, unchanged |
-| Vulkan tensor split ratio | `2,1` (approximates 32GB:16GB) — **applies to whichever device lands in position 0 vs 1**, and that order is not stable across process launches (observed flipping between runs). A ratio that's correct one launch can be backwards the next. |
+| Vulkan tensor split ratio | `1,1` (symmetric 32GB:32GB, updated from the old `2,1` asymmetric ratio) — **applies to whichever device lands in position 0 vs 1**, and that order is not stable across process launches (observed flipping between runs on the old asymmetric pair). With a 1:1 ratio this no longer matters for correctness the way it did for `2,1`, but re-verify once tested on the new hardware. |
 | `--n-gpu-layers` | Must be `auto`, never a fixed number like the old `default_gpu_layers: 99` convention — a hardcoded value makes `-fit` abort ("n_gpu_layers already set by user... abort") instead of picking the right split |
 
 Back up your config before editing:
@@ -126,11 +187,11 @@ cp ~/.llamesa/config.json ~/.llamesa/config.json.bak
 ### `-dual`
 
 ```bash
-llamesa.sh start-dual --model-r9700 "<model>" --model-rx9060xt "<model>" [--thinking true] [--ctx 131072]
-llamesa.sh stop-dual [--gpu r9700|rx9060xt]        # omit --gpu to stop both
-llamesa.sh restart-dual [--gpu r9700|rx9060xt]     # remembers each instance's last model
-llamesa.sh status-dual [--gpu r9700|rx9060xt]      # omit --gpu for a JSON array of both
-llamesa.sh logs-dual --gpu r9700|rx9060xt          # --gpu is required, no combined tail
+llamesa.sh start-dual --model-r9700a "<model>" --model-r9700b "<model>" [--thinking true] [--ctx 131072]
+llamesa.sh stop-dual [--gpu r9700a|r9700b]        # omit --gpu to stop both
+llamesa.sh restart-dual [--gpu r9700a|r9700b]     # remembers each instance's last model
+llamesa.sh status-dual [--gpu r9700a|r9700b]      # omit --gpu for a JSON array of both
+llamesa.sh logs-dual --gpu r9700a|r9700b          # --gpu is required, no combined tail
 ```
 
 Stopping or restarting one GPU leaves the other instance running untouched.
@@ -164,8 +225,15 @@ server or a `-big` session.
 
 ### `-dual`: confirmed working on both GPUs (ROCm) — but no VRAM-overflow safety net
 
-End-to-end tested on ROCm: Qwen3.6-27B on R9700 (27.3GB VRAM, stable) + Qwen3-8B-Q8_0 on
-RX 9060 XT (10.9GB VRAM, 100% GPU busy, actually computing — 31.6 tok/s) simultaneously,
+> **Pre-hardware-swap result.** The test below was run on the old asymmetric R9700 +
+> RX 9060 XT pair, before the RX 9060 XT was replaced with a second R9700 (see the
+> hardware update note at the top of this doc). It's kept as evidence that `-dual`'s
+> process-per-GPU design works end-to-end on ROCm; the specific VRAM figures and the
+> "one big model + one small model" split no longer reflect the current symmetric
+> 32GB+32GB hardware and haven't been re-run on it yet.
+
+End-to-end tested on ROCm: Qwen3.6-27B on the R9700 (27.3GB VRAM, stable) + Qwen3-8B-Q8_0 on
+the RX 9060 XT (10.9GB VRAM, 100% GPU busy, actually computing — 31.6 tok/s) simultaneously,
 ctx=8192 each. System RAM stayed at 6.1GB with 0 swap — zero CPU fallback on either GPU.
 No `Vulkan`/`RADV` anywhere in the logs, genuinely running on ROCm.
 
@@ -207,6 +275,15 @@ someone experiments with ROCm split-mode flags directly (see
 [Troubleshooting](#troubleshooting)).
 
 ### `-big`: cross-GPU split works reliably from a clean VRAM state
+
+> **Pre-hardware-swap result.** Everything in this section — the VRAM figures, the
+> per-model split table, and the "clean VRAM state" theory — was measured on the old
+> asymmetric R9700 + RX 9060 XT pair (~48GB combined). The RX 9060 XT has since been
+> replaced with a second R9700 (~64GB combined, see the hardware update note at the top
+> of this doc). The "start from a clean VRAM state" precaution almost certainly still
+> applies, but the actual split ratios, tok/s figures, and which models are "genuine
+> cross-GPU splits" all need re-measuring on the new hardware — treat this table as
+> historical, not current.
 
 Earlier testing concluded `-big`'s cross-GPU split was fundamentally broken: for models
 needing both GPUs, the split would start correctly (both GPUs briefly showing real,
@@ -289,7 +366,7 @@ OOM/allocation-failure message, and retry with a smaller model or lower `--ctx`.
 
 **`start-dual` only shows one GPU active** — check `llamesa.sh logs-dual --gpu <id>` for
 that instance specifically. Each instance is a fully separate process/log/PID file
-(`~/.llamesa/dual-r9700.*` and `~/.llamesa/dual-rx9060xt.*`), so a failure on one never
+(`~/.llamesa/dual-r9700a.*` and `~/.llamesa/dual-r9700b.*`), so a failure on one never
 affects the other.
 
 **A model appears loaded/responsive but VRAM looks empty on `-big`** — no longer expected

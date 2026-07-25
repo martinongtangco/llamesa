@@ -15,10 +15,10 @@ while [[ $_i -lt ${#_args[@]} ]]; do
     if [[ "${_args[$_i]}" == "--gpu" ]]; then
         _i=$(( _i + 1 ))
         _gpu_val="${_args[$_i]:-}"
-        # Accepts v1's numeric IDs / 'all', plus the -dual instance keys (r9700, rx9060xt).
+        # Accepts v1's numeric IDs / 'all', plus the -dual instance keys (r9700a, r9700b).
         # Widening this set only adds new accepted values — 0/1/all behavior is unchanged.
-        if [[ "$_gpu_val" != "all" ]] && [[ "$_gpu_val" != "r9700" ]] && [[ "$_gpu_val" != "rx9060xt" ]] && ! [[ "$_gpu_val" =~ ^[0-9]+$ ]]; then
-            echo "[ERROR] Invalid GPU ID: $_gpu_val. Use 0, 1, 'all', 'r9700', or 'rx9060xt'." >&2
+        if [[ "$_gpu_val" != "all" ]] && [[ "$_gpu_val" != "r9700a" ]] && [[ "$_gpu_val" != "r9700b" ]] && ! [[ "$_gpu_val" =~ ^[0-9]+$ ]]; then
+            echo "[ERROR] Invalid GPU ID: $_gpu_val. Use 0, 1, 'all', 'r9700a', or 'r9700b'." >&2
             exit 1
         fi
         GPU_ID="$_gpu_val"
@@ -47,10 +47,10 @@ BIG_LOG_FILE="${LLAMESA_DIR}/big.log"
 BIG_SESSION_FILE="${LLAMESA_DIR}/big_session.json"
 
 # -dual (independent ROCm processes) PID/log — fully separate from v1 and -big
-DUAL_R9700_PID_FILE="${LLAMESA_DIR}/dual-r9700.pid"
-DUAL_R9700_LOG_FILE="${LLAMESA_DIR}/dual-r9700.log"
-DUAL_RX9060XT_PID_FILE="${LLAMESA_DIR}/dual-rx9060xt.pid"
-DUAL_RX9060XT_LOG_FILE="${LLAMESA_DIR}/dual-rx9060xt.log"
+DUAL_R9700A_PID_FILE="${LLAMESA_DIR}/dual-r9700a.pid"
+DUAL_R9700A_LOG_FILE="${LLAMESA_DIR}/dual-r9700a.log"
+DUAL_R9700B_PID_FILE="${LLAMESA_DIR}/dual-r9700b.pid"
+DUAL_R9700B_LOG_FILE="${LLAMESA_DIR}/dual-r9700b.log"
 DUAL_SESSION_FILE="${LLAMESA_DIR}/dual_session.json"
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -125,12 +125,20 @@ read_config() {
 # Scan /sys/class/drm for the card whose VRAM total is closest to target_gb.
 # Uses nearest-match so kernel-reported values (e.g. 31GB for a 32GB card) still resolve correctly.
 # Falls back to fallback_card if no GPU sysfs entries found.
+#
+# Optional 3rd arg (skip_count) skips that many nearest-ranked cards before
+# returning a match. Needed now that multiple gpus[] entries can share the
+# same vram_gb (two identical 32GB R9700s) — plain nearest-match would
+# resolve every same-VRAM entry to the same physical card. Callers pass the
+# count of earlier config entries with the same vram_gb as skip_count, so
+# each entry in a same-VRAM group deterministically claims a distinct card
+# (ordered by diff, then by card number).
 _resolve_drm_card() {
     local target_gb="${1:-0}"
     local fallback_card="${2:-0}"
+    local skip_count="${3:-0}"
     local card_path total_bytes gb
-    local best_card="$fallback_card"
-    local best_diff=99999
+    local -a candidates=()
     for card_path in /sys/class/drm/card*/device; do
         [[ -f "${card_path}/mem_info_vram_total" ]] || continue
         total_bytes=$(cat "${card_path}/mem_info_vram_total" 2>/dev/null || echo "0")
@@ -138,12 +146,21 @@ _resolve_drm_card() {
         gb=$(( total_bytes / 1073741824 ))
         local diff=$(( gb - target_gb ))
         [[ $diff -lt 0 ]] && diff=$(( -diff ))
-        if [[ $diff -lt $best_diff ]]; then
-            best_diff=$diff
-            best_card=$(basename "$(dirname "$card_path")" | grep -o '[0-9]*$')
-        fi
+        local card_num
+        card_num=$(basename "$(dirname "$card_path")" | grep -o '[0-9]*$')
+        candidates+=("${diff}:${card_num}")
     done
-    echo "$best_card"
+
+    if [[ ${#candidates[@]} -eq 0 ]]; then
+        echo "$fallback_card"
+        return
+    fi
+
+    local sorted
+    sorted=$(printf '%s\n' "${candidates[@]}" | sort -t: -k1,1n -k2,2n)
+    local picked
+    picked=$(echo "$sorted" | sed -n "$((skip_count + 1))p" | cut -d: -f2)
+    echo "${picked:-$fallback_card}"
 }
 
 # Extract a GPU entry from config by ID. Populates GPU_PORT, GPU_NAME,
@@ -155,10 +172,14 @@ get_gpu_config() {
     GPU_HIP_DEVICE=$(jq -r --argjson id "$gpu_id" '.gpus[] | select(.id == $id) | .hip_device // $id' "$CONFIG_FILE" 2>/dev/null)
 
     # Resolve drm_card dynamically from VRAM size — immune to reboot reordering
-    local vram_gb config_drm_card
+    local vram_gb config_drm_card vram_tie_rank
     vram_gb=$(jq -r --argjson id "$gpu_id" '.gpus[] | select(.id == $id) | .vram_gb // 0' "$CONFIG_FILE" 2>/dev/null)
     config_drm_card=$(jq -r --argjson id "$gpu_id" '.gpus[] | select(.id == $id) | .drm_card // empty' "$CONFIG_FILE" 2>/dev/null || echo "$gpu_id")
-    GPU_DRM_CARD=$(_resolve_drm_card "$vram_gb" "${config_drm_card:-$gpu_id}")
+    # Count earlier (lower-id) entries sharing this vram_gb — becomes skip_count
+    # so same-VRAM entries (e.g. two 32GB R9700s) each resolve to a distinct card.
+    vram_tie_rank=$(jq -r --argjson id "$gpu_id" --argjson vram "${vram_gb:-0}" \
+        '[.gpus[] | select(.id < $id and (.vram_gb // 0) == $vram)] | length' "$CONFIG_FILE" 2>/dev/null || echo 0)
+    GPU_DRM_CARD=$(_resolve_drm_card "$vram_gb" "${config_drm_card:-$gpu_id}" "$vram_tie_rank")
 
     # Build newline-separated export lines from .env object
     GPU_ENV=$(jq -r --argjson id "$gpu_id" '.gpus[] | select(.id == $id) | .env // {} | to_entries[] | "\(.key)=\(.value)"' "$CONFIG_FILE" 2>/dev/null || true)
@@ -208,8 +229,8 @@ read_vulkan_config() {
     VULKAN_ENV=$(jq -r '(.vulkan_split.env // {}) | to_entries[] | "\(.key)=\(.value)"' "$CONFIG_FILE" 2>/dev/null || true)
 }
 
-# Read the dual_gpu config block for -dual commands. Populates R9700_PORT,
-# R9700_BINARY, R9700_ENV, RX9060XT_PORT, RX9060XT_BINARY, RX9060XT_ENV.
+# Read the dual_gpu config block for -dual commands. Populates R9700A_PORT,
+# R9700A_BINARY, R9700A_ENV, R9700B_PORT, R9700B_BINARY, R9700B_ENV.
 # Fails fast if either sub-block is missing — -dual never falls back to defaults.
 read_dual_gpu_config() {
     check_config
@@ -219,23 +240,23 @@ read_dual_gpu_config() {
         error "no dual_gpu config found — see docs/dual-gpu.md"
     fi
 
-    local has_r9700 has_rx9060xt
-    has_r9700=$(jq -r '.dual_gpu.r9700 // empty' "$CONFIG_FILE" 2>/dev/null || true)
-    has_rx9060xt=$(jq -r '.dual_gpu.rx9060xt // empty' "$CONFIG_FILE" 2>/dev/null || true)
-    if [[ -z "$has_r9700" ]] || [[ -z "$has_rx9060xt" ]]; then
-        error "dual_gpu config must include both 'r9700' and 'rx9060xt' blocks — see docs/dual-gpu.md"
+    local has_r9700a has_r9700b
+    has_r9700a=$(jq -r '.dual_gpu.r9700a // empty' "$CONFIG_FILE" 2>/dev/null || true)
+    has_r9700b=$(jq -r '.dual_gpu.r9700b // empty' "$CONFIG_FILE" 2>/dev/null || true)
+    if [[ -z "$has_r9700a" ]] || [[ -z "$has_r9700b" ]]; then
+        error "dual_gpu config must include both 'r9700a' and 'r9700b' blocks — see docs/dual-gpu.md"
     fi
 
-    R9700_PORT=$(jq -r '.dual_gpu.r9700.port // 1234' "$CONFIG_FILE")
-    R9700_BINARY=$(jq -r '.dual_gpu.r9700.llama_binary // empty' "$CONFIG_FILE")
-    R9700_ENV=$(jq -r '(.dual_gpu.r9700.env // {}) | to_entries[] | "\(.key)=\(.value)"' "$CONFIG_FILE" 2>/dev/null || true)
+    R9700A_PORT=$(jq -r '.dual_gpu.r9700a.port // 1234' "$CONFIG_FILE")
+    R9700A_BINARY=$(jq -r '.dual_gpu.r9700a.llama_binary // empty' "$CONFIG_FILE")
+    R9700A_ENV=$(jq -r '(.dual_gpu.r9700a.env // {}) | to_entries[] | "\(.key)=\(.value)"' "$CONFIG_FILE" 2>/dev/null || true)
 
-    RX9060XT_PORT=$(jq -r '.dual_gpu.rx9060xt.port // 1235' "$CONFIG_FILE")
-    RX9060XT_BINARY=$(jq -r '.dual_gpu.rx9060xt.llama_binary // empty' "$CONFIG_FILE")
-    RX9060XT_ENV=$(jq -r '(.dual_gpu.rx9060xt.env // {}) | to_entries[] | "\(.key)=\(.value)"' "$CONFIG_FILE" 2>/dev/null || true)
+    R9700B_PORT=$(jq -r '.dual_gpu.r9700b.port // 1235' "$CONFIG_FILE")
+    R9700B_BINARY=$(jq -r '.dual_gpu.r9700b.llama_binary // empty' "$CONFIG_FILE")
+    R9700B_ENV=$(jq -r '(.dual_gpu.r9700b.env // {}) | to_entries[] | "\(.key)=\(.value)"' "$CONFIG_FILE" 2>/dev/null || true)
 
-    if [[ -z "$R9700_BINARY" ]] || [[ -z "$RX9060XT_BINARY" ]]; then
-        error "dual_gpu.r9700.llama_binary and dual_gpu.rx9060xt.llama_binary must both be set — see docs/dual-gpu.md"
+    if [[ -z "$R9700A_BINARY" ]] || [[ -z "$R9700B_BINARY" ]]; then
+        error "dual_gpu.r9700a.llama_binary and dual_gpu.r9700b.llama_binary must both be set — see docs/dual-gpu.md"
     fi
 }
 
@@ -637,6 +658,12 @@ cmd_start() {
     info "Starting server with model: ${model_file}"
 
     # Build llama-server command
+    # --jinja applies the model's native chat template, which is required for
+    # tool-call requests/responses to use the structured OpenAI tool_calls
+    # format instead of the model emitting its native tool-call syntax as
+    # plain text content (breaks clients that expect structured tool_calls,
+    # e.g. pi, opencode — clients that parse tool calls from raw text
+    # themselves, e.g. Cline, are unaffected either way).
     local cmd_args=(
         "$LLAMA_BINARY"
         "--model" "$model_file"
@@ -645,6 +672,7 @@ cmd_start() {
         "--port" "$use_port"
         "--host" "0.0.0.0"
         "--log-file" "/tmp/llama-server.log"
+        "--jinja"
     )
     if [[ -n "$parallel" ]]; then
         cmd_args+=("--parallel" "$parallel")
@@ -1049,6 +1077,8 @@ cmd_start_big() {
     # See _start_dual_instance for why "auto" is used instead of the configured
     # numeric default_gpu_layers (999): a hardcoded value makes this build's -fit
     # system abort its own device-memory adjustment instead of performing it.
+    # --jinja: see the matching comment in cmd_start's cmd_args above — same
+    # tool-calling requirement applies here.
     local cmd_args=(
         "$VULKAN_BINARY"
         "--model" "$model_file"
@@ -1058,6 +1088,7 @@ cmd_start_big() {
         "-ngl" "auto"
         "--port" "$VULKAN_PORT"
         "--host" "0.0.0.0"
+        "--jinja"
     )
 
     local mmproj_file=""
@@ -1304,7 +1335,7 @@ cmd_logs_big() {
 # Fully independent of cmd_start/cmd_stop/cmd_status/cmd_restart/cmd_logs and of
 # the -big commands above — these never call or modify any of them.
 
-# Internal helper: launch one -dual instance for a given GPU key (r9700 | rx9060xt)
+# Internal helper: launch one -dual instance for a given GPU key (r9700a | r9700b)
 # Resolve which GPU device INDEX (0, 1, ...) corresponds to a GPU by matching
 # `llama-server --list-devices` output against a target VRAM size. Backend-
 # agnostic — matches "Vulkan0"/"Vulkan1" (Vulkan builds) or "ROCm0"/"ROCm1"
@@ -1312,14 +1343,21 @@ cmd_logs_big() {
 # Mirrors _resolve_drm_card's nearest-match approach — device enumeration
 # order is not guaranteed stable across process launches on this hardware.
 #
+# Optional 3rd arg excludes a device index from consideration. Needed now
+# that both cards are identical 32GB R9700s: with equal target_gb for both
+# calls, plain nearest-match would tie and resolve both r9700a and r9700b to
+# the SAME device index. Callers pass the first-resolved index as the
+# exclusion for the second call so the two instances never collide.
+#
 # Used with `-sm none -mg <index>` rather than `--device <name>`: testing found
 # --device pinning never achieved real GPU VRAM offload (always fell back to
 # system RAM, no error), while -sm none -mg <index> — leaving both devices
 # visible and explicitly selecting one for compute — was confirmed working
-# (stable, real VRAM usage, on the R9700). See docs/dual-gpu.md Known Limitations.
+# (stable, real VRAM usage, on the R9700A). See docs/dual-gpu.md Known Limitations.
 _resolve_device_index() {
     local binary="$1"
     local target_gb="${2:-0}"
+    local exclude_idx="${3:-}"
     local list_output
     list_output=$(distrobox enter -T "$CONTAINER" -- bash -c "'${binary}' --list-devices 2>&1" 2>/dev/null || true)
 
@@ -1327,6 +1365,7 @@ _resolve_device_index() {
     while IFS= read -r line; do
         if [[ "$line" =~ [A-Za-z]+([0-9]+):.*\(([0-9]+)\ MiB, ]]; then
             local dev_idx="${BASH_REMATCH[1]}"
+            [[ -n "$exclude_idx" && "$dev_idx" == "$exclude_idx" ]] && continue
             local mib="${BASH_REMATCH[2]}"
             local gb=$(( mib / 1024 ))
             local diff=$(( gb - target_gb ))
@@ -1382,6 +1421,8 @@ _start_dual_instance() {
     # never achieved real GPU VRAM offload (silent full fallback to system RAM,
     # no error) — -sm none -mg, which leaves both devices visible and explicitly
     # selects one for compute, was confirmed working. See docs/dual-gpu.md.
+    # --jinja: see the matching comment in cmd_start's cmd_args — same
+    # tool-calling requirement applies here.
     local cmd_args=(
         "$binary"
         "--model" "$model_file"
@@ -1391,6 +1432,7 @@ _start_dual_instance() {
         "-mg" "$device_index"
         "--port" "$port"
         "--host" "0.0.0.0"
+        "--jinja"
     )
 
     local mmproj_file=""
@@ -1493,7 +1535,7 @@ _status_dual_instance() {
     # Port-listening fallback: something is answering on this port, but since
     # our own PID file didn't confirm it, we can't tell whether it's actually
     # this dual instance or an unrelated process sharing the port (e.g. v1's
-    # /start reusing dual_gpu.r9700's configured port). pid_verified stays
+    # /start reusing dual_gpu.r9700a's configured port). pid_verified stays
     # false in that case, so DUAL_SESSION_FILE's thinking below isn't trusted
     # — it would otherwise silently apply a stale/unrelated dual session's
     # thinking setting to whatever process actually answered.
@@ -1617,14 +1659,14 @@ cmd_start_dual() {
     read_base_config
     read_dual_gpu_config
 
-    local model_r9700="" model_rx9060xt=""
+    local model_r9700a="" model_r9700b=""
     local thinking="$DEFAULT_THINKING"
     local ctx="$DEFAULT_CTX"
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --model-r9700) model_r9700="$2"; shift 2 ;;
-            --model-rx9060xt) model_rx9060xt="$2"; shift 2 ;;
+            --model-r9700a) model_r9700a="$2"; shift 2 ;;
+            --model-r9700b) model_r9700b="$2"; shift 2 ;;
             --thinking) thinking="$2"; shift 2 ;;
             --ctx) ctx="$2"; shift 2 ;;
             *) error "Unknown option: $1" ;;
@@ -1637,40 +1679,40 @@ cmd_start_dual() {
         *) thinking="false" ;;
     esac
 
-    if [[ -z "$model_r9700" ]] || [[ -z "$model_rx9060xt" ]]; then
-        error "Both --model-r9700 and --model-rx9060xt are required"
+    if [[ -z "$model_r9700a" ]] || [[ -z "$model_r9700b" ]]; then
+        error "Both --model-r9700a and --model-r9700b are required"
     fi
 
-    if [[ -f "$DUAL_R9700_PID_FILE" ]] && kill -0 "$(cat "$DUAL_R9700_PID_FILE")" 2>/dev/null; then
-        warn "r9700 dual instance is already running. Stopping it first."
-        _stop_dual_instance "r9700" "$R9700_PORT"
+    if [[ -f "$DUAL_R9700A_PID_FILE" ]] && kill -0 "$(cat "$DUAL_R9700A_PID_FILE")" 2>/dev/null; then
+        warn "r9700a dual instance is already running. Stopping it first."
+        _stop_dual_instance "r9700a" "$R9700A_PORT"
     fi
-    if [[ -f "$DUAL_RX9060XT_PID_FILE" ]] && kill -0 "$(cat "$DUAL_RX9060XT_PID_FILE")" 2>/dev/null; then
-        warn "rx9060xt dual instance is already running. Stopping it first."
-        _stop_dual_instance "rx9060xt" "$RX9060XT_PORT"
-    fi
-
-    local r9700_device rx9060xt_device
-    r9700_device=$(_resolve_device_index "$R9700_BINARY" 32)
-    rx9060xt_device=$(_resolve_device_index "$RX9060XT_BINARY" 16)
-    if [[ -z "$r9700_device" ]]; then
-        error "Could not resolve a Vulkan device for r9700 via --list-devices. Check dual_gpu.r9700.llama_binary and that both GPUs are visible to Vulkan (vulkaninfo --summary)."
-    fi
-    if [[ -z "$rx9060xt_device" ]]; then
-        error "Could not resolve a Vulkan device for rx9060xt via --list-devices. Check dual_gpu.rx9060xt.llama_binary and that both GPUs are visible to Vulkan (vulkaninfo --summary)."
+    if [[ -f "$DUAL_R9700B_PID_FILE" ]] && kill -0 "$(cat "$DUAL_R9700B_PID_FILE")" 2>/dev/null; then
+        warn "r9700b dual instance is already running. Stopping it first."
+        _stop_dual_instance "r9700b" "$R9700B_PORT"
     fi
 
-    _start_dual_instance "r9700" "$R9700_PORT" "$R9700_BINARY" "$R9700_ENV" "$model_r9700" "$ctx" "$r9700_device"
-    _start_dual_instance "rx9060xt" "$RX9060XT_PORT" "$RX9060XT_BINARY" "$RX9060XT_ENV" "$model_rx9060xt" "$ctx" "$rx9060xt_device"
+    local r9700a_device r9700b_device
+    r9700a_device=$(_resolve_device_index "$R9700A_BINARY" 32)
+    r9700b_device=$(_resolve_device_index "$R9700B_BINARY" 32 "$r9700a_device")
+    if [[ -z "$r9700a_device" ]]; then
+        error "Could not resolve a Vulkan device for r9700a via --list-devices. Check dual_gpu.r9700a.llama_binary and that both GPUs are visible to Vulkan (vulkaninfo --summary)."
+    fi
+    if [[ -z "$r9700b_device" ]]; then
+        error "Could not resolve a Vulkan device for r9700b via --list-devices. Check dual_gpu.r9700b.llama_binary and that both GPUs are visible to Vulkan (vulkaninfo --summary)."
+    fi
 
-    _wait_dual_instance "r9700" "$R9700_PORT"
-    _wait_dual_instance "rx9060xt" "$RX9060XT_PORT"
+    _start_dual_instance "r9700a" "$R9700A_PORT" "$R9700A_BINARY" "$R9700A_ENV" "$model_r9700a" "$ctx" "$r9700a_device"
+    _start_dual_instance "r9700b" "$R9700B_PORT" "$R9700B_BINARY" "$R9700B_ENV" "$model_r9700b" "$ctx" "$r9700b_device"
+
+    _wait_dual_instance "r9700a" "$R9700A_PORT"
+    _wait_dual_instance "r9700b" "$R9700B_PORT"
 
     mkdir -p "$LLAMESA_DIR"
     cat > "$DUAL_SESSION_FILE" <<EOF
 {
-  "r9700": {"model": "${model_r9700}"},
-  "rx9060xt": {"model": "${model_rx9060xt}"},
+  "r9700a": {"model": "${model_r9700a}"},
+  "r9700b": {"model": "${model_r9700b}"},
   "thinking": ${thinking},
   "ctx": ${ctx}
 }
@@ -1684,15 +1726,15 @@ cmd_stop_dual() {
     read_dual_gpu_config
 
     case "$GPU_ID" in
-        r9700)
-            _stop_dual_instance "r9700" "$R9700_PORT"
+        r9700a)
+            _stop_dual_instance "r9700a" "$R9700A_PORT"
             ;;
-        rx9060xt)
-            _stop_dual_instance "rx9060xt" "$RX9060XT_PORT"
+        r9700b)
+            _stop_dual_instance "r9700b" "$R9700B_PORT"
             ;;
         *)
-            _stop_dual_instance "r9700" "$R9700_PORT"
-            _stop_dual_instance "rx9060xt" "$RX9060XT_PORT"
+            _stop_dual_instance "r9700a" "$R9700A_PORT"
+            _stop_dual_instance "r9700b" "$R9700B_PORT"
             ;;
     esac
     echo '{"running":false}'
@@ -1703,59 +1745,59 @@ cmd_restart_dual() {
     read_dual_gpu_config
 
     if [[ ! -f "$DUAL_SESSION_FILE" ]]; then
-        error "No previous -dual session found. Use 'start-dual --model-r9700 <name> --model-rx9060xt <name>' instead."
+        error "No previous -dual session found. Use 'start-dual --model-r9700a <name> --model-r9700b <name>' instead."
     fi
 
-    local model_r9700 model_rx9060xt ctx
-    model_r9700=$(jq -r '.r9700.model // empty' "$DUAL_SESSION_FILE")
-    model_rx9060xt=$(jq -r '.rx9060xt.model // empty' "$DUAL_SESSION_FILE")
+    local model_r9700a model_r9700b ctx
+    model_r9700a=$(jq -r '.r9700a.model // empty' "$DUAL_SESSION_FILE")
+    model_r9700b=$(jq -r '.r9700b.model // empty' "$DUAL_SESSION_FILE")
     ctx=$(jq -r '.ctx // empty' "$DUAL_SESSION_FILE")
     [[ -z "$ctx" ]] && ctx="$DEFAULT_CTX"
 
     case "$GPU_ID" in
-        r9700)
-            if [[ -z "$model_r9700" ]]; then
-                error "No remembered model for r9700. Use 'start-dual' instead."
+        r9700a)
+            if [[ -z "$model_r9700a" ]]; then
+                error "No remembered model for r9700a. Use 'start-dual' instead."
             fi
-            info "Restarting r9700 dual instance..."
-            _stop_dual_instance "r9700" "$R9700_PORT"
+            info "Restarting r9700a dual instance..."
+            _stop_dual_instance "r9700a" "$R9700A_PORT"
             sleep 3
-            local r9700_device
-            r9700_device=$(_resolve_device_index "$R9700_BINARY" 32)
-            [[ -z "$r9700_device" ]] && error "Could not resolve a Vulkan device for r9700 via --list-devices."
-            _start_dual_instance "r9700" "$R9700_PORT" "$R9700_BINARY" "$R9700_ENV" "$model_r9700" "$ctx" "$r9700_device"
-            _wait_dual_instance "r9700" "$R9700_PORT"
+            local r9700a_device
+            r9700a_device=$(_resolve_device_index "$R9700A_BINARY" 32)
+            [[ -z "$r9700a_device" ]] && error "Could not resolve a Vulkan device for r9700a via --list-devices."
+            _start_dual_instance "r9700a" "$R9700A_PORT" "$R9700A_BINARY" "$R9700A_ENV" "$model_r9700a" "$ctx" "$r9700a_device"
+            _wait_dual_instance "r9700a" "$R9700A_PORT"
             ;;
-        rx9060xt)
-            if [[ -z "$model_rx9060xt" ]]; then
-                error "No remembered model for rx9060xt. Use 'start-dual' instead."
+        r9700b)
+            if [[ -z "$model_r9700b" ]]; then
+                error "No remembered model for r9700b. Use 'start-dual' instead."
             fi
-            info "Restarting rx9060xt dual instance..."
-            _stop_dual_instance "rx9060xt" "$RX9060XT_PORT"
+            info "Restarting r9700b dual instance..."
+            _stop_dual_instance "r9700b" "$R9700B_PORT"
             sleep 3
-            local rx9060xt_device
-            rx9060xt_device=$(_resolve_device_index "$RX9060XT_BINARY" 16)
-            [[ -z "$rx9060xt_device" ]] && error "Could not resolve a Vulkan device for rx9060xt via --list-devices."
-            _start_dual_instance "rx9060xt" "$RX9060XT_PORT" "$RX9060XT_BINARY" "$RX9060XT_ENV" "$model_rx9060xt" "$ctx" "$rx9060xt_device"
-            _wait_dual_instance "rx9060xt" "$RX9060XT_PORT"
+            local r9700b_device
+            r9700b_device=$(_resolve_device_index "$R9700B_BINARY" 32)
+            [[ -z "$r9700b_device" ]] && error "Could not resolve a Vulkan device for r9700b via --list-devices."
+            _start_dual_instance "r9700b" "$R9700B_PORT" "$R9700B_BINARY" "$R9700B_ENV" "$model_r9700b" "$ctx" "$r9700b_device"
+            _wait_dual_instance "r9700b" "$R9700B_PORT"
             ;;
         *)
-            if [[ -z "$model_r9700" ]] || [[ -z "$model_rx9060xt" ]]; then
+            if [[ -z "$model_r9700a" ]] || [[ -z "$model_r9700b" ]]; then
                 error "No remembered models for one or both GPUs. Use 'start-dual' instead."
             fi
             info "Restarting both dual instances..."
-            _stop_dual_instance "r9700" "$R9700_PORT"
-            _stop_dual_instance "rx9060xt" "$RX9060XT_PORT"
+            _stop_dual_instance "r9700a" "$R9700A_PORT"
+            _stop_dual_instance "r9700b" "$R9700B_PORT"
             sleep 3
-            local both_r9700_device both_rx9060xt_device
-            both_r9700_device=$(_resolve_device_index "$R9700_BINARY" 32)
-            both_rx9060xt_device=$(_resolve_device_index "$RX9060XT_BINARY" 16)
-            [[ -z "$both_r9700_device" ]] && error "Could not resolve a Vulkan device for r9700 via --list-devices."
-            [[ -z "$both_rx9060xt_device" ]] && error "Could not resolve a Vulkan device for rx9060xt via --list-devices."
-            _start_dual_instance "r9700" "$R9700_PORT" "$R9700_BINARY" "$R9700_ENV" "$model_r9700" "$ctx" "$both_r9700_device"
-            _start_dual_instance "rx9060xt" "$RX9060XT_PORT" "$RX9060XT_BINARY" "$RX9060XT_ENV" "$model_rx9060xt" "$ctx" "$both_rx9060xt_device"
-            _wait_dual_instance "r9700" "$R9700_PORT"
-            _wait_dual_instance "rx9060xt" "$RX9060XT_PORT"
+            local both_r9700a_device both_r9700b_device
+            both_r9700a_device=$(_resolve_device_index "$R9700A_BINARY" 32)
+            both_r9700b_device=$(_resolve_device_index "$R9700B_BINARY" 32 "$both_r9700a_device")
+            [[ -z "$both_r9700a_device" ]] && error "Could not resolve a Vulkan device for r9700a via --list-devices."
+            [[ -z "$both_r9700b_device" ]] && error "Could not resolve a Vulkan device for r9700b via --list-devices."
+            _start_dual_instance "r9700a" "$R9700A_PORT" "$R9700A_BINARY" "$R9700A_ENV" "$model_r9700a" "$ctx" "$both_r9700a_device"
+            _start_dual_instance "r9700b" "$R9700B_PORT" "$R9700B_BINARY" "$R9700B_ENV" "$model_r9700b" "$ctx" "$both_r9700b_device"
+            _wait_dual_instance "r9700a" "$R9700A_PORT"
+            _wait_dual_instance "r9700b" "$R9700B_PORT"
             ;;
     esac
 
@@ -1767,19 +1809,19 @@ cmd_status_dual() {
     read_dual_gpu_config
 
     case "$GPU_ID" in
-        r9700)
-            _status_dual_instance "r9700" "$R9700_PORT"
+        r9700a)
+            _status_dual_instance "r9700a" "$R9700A_PORT"
             ;;
-        rx9060xt)
-            _status_dual_instance "rx9060xt" "$RX9060XT_PORT"
+        r9700b)
+            _status_dual_instance "r9700b" "$R9700B_PORT"
             ;;
         *)
-            local r9700_json rx9060xt_json
-            r9700_json=$(_status_dual_instance "r9700" "$R9700_PORT")
-            rx9060xt_json=$(_status_dual_instance "rx9060xt" "$RX9060XT_PORT")
+            local r9700a_json r9700b_json
+            r9700a_json=$(_status_dual_instance "r9700a" "$R9700A_PORT")
+            r9700b_json=$(_status_dual_instance "r9700b" "$R9700B_PORT")
             echo "["
-            echo "  ${r9700_json},"
-            echo "  ${rx9060xt_json}"
+            echo "  ${r9700a_json},"
+            echo "  ${r9700b_json}"
             echo "]"
             ;;
     esac
@@ -1788,9 +1830,9 @@ cmd_status_dual() {
 cmd_logs_dual() {
     local log_file
     case "$GPU_ID" in
-        r9700)    log_file="$DUAL_R9700_LOG_FILE" ;;
-        rx9060xt) log_file="$DUAL_RX9060XT_LOG_FILE" ;;
-        *)        error "logs-dual requires --gpu r9700 or --gpu rx9060xt" ;;
+        r9700a) log_file="$DUAL_R9700A_LOG_FILE" ;;
+        r9700b) log_file="$DUAL_R9700B_LOG_FILE" ;;
+        *)      error "logs-dual requires --gpu r9700a or --gpu r9700b" ;;
     esac
 
     if [[ ! -f "$log_file" ]]; then
@@ -1812,7 +1854,7 @@ Usage: llamesa.sh <command> [options]
 Global options:
   --gpu <id|all>    Target GPU by ID (0, 1, ...) or 'all' for multi-GPU ops
                     Default: 0
-                    For -dual commands, also accepts 'r9700' or 'rx9060xt'
+                    For -dual commands, also accepts 'r9700a' or 'r9700b'
                     to scope to one dual instance (default: both)
 
 Commands:
@@ -1848,19 +1890,19 @@ Commands:
     Requires a vulkan_split block in config.json — see docs/dual-gpu.md
 
   start-dual  Start two independent servers, one per GPU (ROCm)
-    --model-r9700 <name>      Model for the R9700 (required)
-    --model-rx9060xt <name>   Model for the RX 9060 XT (required)
+    --model-r9700a <name>   Model for the first R9700 (required)
+    --model-r9700b <name>   Model for the second R9700 (required)
     --thinking <bool>   Enable thinking mode (default: ${DEFAULT_THINKING:-true})
     --ctx <n>           Context size (default: ${DEFAULT_CTX:-131072})
   stop-dual   Stop dual-mode instance(s)
-    --gpu <r9700|rx9060xt>  Scope to one instance (default: both)
+    --gpu <r9700a|r9700b>  Scope to one instance (default: both)
   restart-dual  Restart dual-mode instance(s) with their remembered model(s)
-    --gpu <r9700|rx9060xt>  Scope to one instance (default: both)
+    --gpu <r9700a|r9700b>  Scope to one instance (default: both)
   status-dual Show dual-mode instance(s)' status as JSON
-    --gpu <r9700|rx9060xt>  Scope to one instance (default: both, returned as an array)
+    --gpu <r9700a|r9700b>  Scope to one instance (default: both, returned as an array)
   logs-dual   Stream one dual-mode instance's logs
-    --gpu <r9700|rx9060xt>  Required — no combined-tail mode
-    Requires a dual_gpu block (with r9700 and rx9060xt) in config.json — see docs/dual-gpu.md
+    --gpu <r9700a|r9700b>  Required — no combined-tail mode
+    Requires a dual_gpu block (with r9700a and r9700b) in config.json — see docs/dual-gpu.md
 
   help        Show this help message
 

@@ -8,11 +8,11 @@
   "gpus": [
     {
       "id": 0,
-      "name": "R9700",
+      "name": "R9700A",
       "port": 1234,
       "vram_gb": 32,
       "hip_device": 0,
-      "drm_card": 0,
+      "drm_card": 1,
       "env": {
         "RADV_DEBUG": "nocompute",
         "GPU_MAX_HW_QUEUES": "1"
@@ -20,14 +20,14 @@
     },
     {
       "id": 1,
-      "name": "RX9060XT",
+      "name": "R9700B",
       "port": 1235,
-      "vram_gb": 16,
+      "vram_gb": 32,
       "hip_device": 1,
-      "drm_card": 1,
+      "drm_card": 2,
       "env": {
-        "GGML_CUDA_NO_PEER_COPY": "1",
-        "HSA_OVERRIDE_GFX_VERSION": "12.0.1"
+        "RADV_DEBUG": "nocompute",
+        "GPU_MAX_HW_QUEUES": "1"
       }
     }
   ],
@@ -35,12 +35,12 @@
   "_dual_gpu_and_vulkan_split_are_disabled_by_default": "The two blocks below are examples only, nested under this inert key so this file stays valid JSON without needing comments. To enable -dual and -big commands, copy the 'dual_gpu' and/or 'vulkan_split' objects out to the top level of your real ~/.llamesa/config.json (as siblings of 'gpus' above) and delete this wrapper key entirely. Never required for v1's start/stop/restart/status/logs or the existing --gpu 0|1|all commands. See docs/dual-gpu.md.",
   "_dual_gpu_example": {
     "dual_gpu": {
-      "r9700": {
+      "r9700a": {
         "port": 1234,
         "llama_binary": "/run/host/home/bongtangco/llama.cpp-rocm/build-rocm/bin/llama-server",
         "env": {}
       },
-      "rx9060xt": {
+      "r9700b": {
         "port": 1235,
         "llama_binary": "/run/host/home/bongtangco/llama.cpp-rocm/build-rocm/bin/llama-server",
         "env": {}
@@ -50,7 +50,7 @@
       "llama_binary": "/run/host/home/bongtangco/llama.cpp/build-vulkan/bin/llama-server",
       "port": 1236,
       "split_mode": "layer",
-      "tensor_split": [2, 1],
+      "tensor_split": [1, 1],
       "default_gpu_layers": 999,
       "env": {
         "RADV_PERFTEST": "nogttspill"

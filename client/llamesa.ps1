@@ -1153,11 +1153,11 @@ function Cmd-StartDual {
         return $models[$idx].name
     }
 
-    $modelR9700 = Select-DualModel "R9700"
-    if (-not $modelR9700) { Write-Host ("{0}Invalid selection.{1}" -f $red, $reset); return }
+    $modelR9700a = Select-DualModel "R9700 (A)"
+    if (-not $modelR9700a) { Write-Host ("{0}Invalid selection.{1}" -f $red, $reset); return }
 
-    $modelRx9060xt = Select-DualModel "RX 9060 XT"
-    if (-not $modelRx9060xt) { Write-Host ("{0}Invalid selection.{1}" -f $red, $reset); return }
+    $modelR9700b = Select-DualModel "R9700 (B)"
+    if (-not $modelR9700b) { Write-Host ("{0}Invalid selection.{1}" -f $red, $reset); return }
 
     $thinkingInput = Read-Host "Thinking mode? [on/off]"
     $thinking = if ($thinkingInput -match '^(on|yes|true|1)$') { "true" } else { "false" }
@@ -1166,9 +1166,9 @@ function Cmd-StartDual {
     if (-not $ctx) { $ctx = "131072" }
 
     Write-Host ""
-    Write-Host ("{0}Starting dual instances: R9700={1}, RX9060XT={2}...{3}" -f $cyan, $modelR9700, $modelRx9060xt, $reset)
+    Write-Host ("{0}Starting dual instances: R9700A={1}, R9700B={2}...{3}" -f $cyan, $modelR9700a, $modelR9700b, $reset)
 
-    $result = Invoke-ServerCommandChecked ("start-dual --model-r9700 ""{0}"" --model-rx9060xt ""{1}"" --thinking {2} --ctx {3}" -f $modelR9700, $modelRx9060xt, $thinking, $ctx)
+    $result = Invoke-ServerCommandChecked ("start-dual --model-r9700a ""{0}"" --model-r9700b ""{1}"" --thinking {2} --ctx {3}" -f $modelR9700a, $modelR9700b, $thinking, $ctx)
     Write-Host ($result.Output -join "`n")
 
     if ($result.ExitCode -ne 0) {
