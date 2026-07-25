@@ -974,6 +974,17 @@ function Format-ModelLabel {
     return "{0,-30} {1,-12}{2}" -f $m.name, $size, $visionTag
 }
 
+# Leaving this blank omits --ctx from the start command entirely, so the
+# server falls back to its own configured default_context — the operator's
+# intended max — rather than the client guessing/hardcoding a number that
+# could be stale relative to what's actually configured on the box.
+function Read-CtxArg {
+    Write-Host ("  {0}Context size — leave blank to use the server's configured max, or enter a smaller value.{1}" -f $gray, $reset)
+    $ctx = Read-Host "Context size"
+    if ($ctx) { return "--ctx $ctx" }
+    return ""
+}
+
 # ── Command: /start ───────────────────────────────────────────────────────
 # Unified entry point: picks 1..gpuCount models and infers the mode from how
 # many were picked — 1 model → combined VRAM across all GPUs (single-GPU
@@ -1015,8 +1026,7 @@ function Cmd-Start {
     if (-not $thinkChoice) { Write-Host ("{0}Cancelled.{1}" -f $gray, $reset); return }
     $thinking = if ($thinkChoice -eq "on") { "true" } else { "false" }
 
-    $ctx = Read-Host "Context size? [131072]"
-    if (-not $ctx) { $ctx = "131072" }
+    $ctxArg = Read-CtxArg
 
     if ($selected.Count -eq 1 -and $gpuCount -le 1) {
         $parallelInput = Read-Host "Parallel slots? [1-4, default: 1]"
@@ -1027,7 +1037,7 @@ function Cmd-Start {
         $selectedModel = $selected[0].name
         Write-Host ""
         Write-Host ("{0}Starting {1}...{2}" -f $cyan, $selectedModel, $reset)
-        $raw = Invoke-ServerCommand ("start --model ""{0}"" --gpu 0 --thinking {1} --ctx {2} {3}" -f $selectedModel, $thinking, $ctx, $parallelArg).Trim() -raw
+        $raw = Invoke-ServerCommand ("start --model ""{0}"" --gpu 0 --thinking {1} {2} {3}" -f $selectedModel, $thinking, $ctxArg, $parallelArg).Trim() -raw
         Write-Host ($raw -join "`n")
 
         Write-Host ("{0}Waiting for model to load...{1}" -f $cyan, $reset)
@@ -1048,7 +1058,7 @@ function Cmd-Start {
         $selectedModel = $selected[0].name
         Write-Host ""
         Write-Host ("{0}Starting {1} (combined VRAM across {2} GPUs)...{3}" -f $cyan, $selectedModel, $gpuCount, $reset)
-        $result = Invoke-ServerCommandChecked ("start-big --model ""{0}"" --thinking {1} --ctx {2}" -f $selectedModel, $thinking, $ctx)
+        $result = Invoke-ServerCommandChecked ("start-big --model ""{0}"" --thinking {1} {2}" -f $selectedModel, $thinking, $ctxArg)
         Write-Host ($result.Output -join "`n")
         if ($result.ExitCode -ne 0) {
             Write-Host ("{0}start failed — see error above.{1}" -f $red, $reset)
@@ -1064,7 +1074,7 @@ function Cmd-Start {
     $modelB = $selected[1].name
     Write-Host ""
     Write-Host ("{0}Starting one model per GPU: {1} · {2}...{3}" -f $cyan, $modelA, $modelB, $reset)
-    $result = Invoke-ServerCommandChecked ("start-dual --model-r9700a ""{0}"" --model-r9700b ""{1}"" --thinking {2} --ctx {3}" -f $modelA, $modelB, $thinking, $ctx)
+    $result = Invoke-ServerCommandChecked ("start-dual --model-r9700a ""{0}"" --model-r9700b ""{1}"" --thinking {2} {3}" -f $modelA, $modelB, $thinking, $ctxArg)
     Write-Host ($result.Output -join "`n")
     if ($result.ExitCode -ne 0) {
         Write-Host ("{0}start failed — see error above.{1}" -f $red, $reset)
@@ -1236,12 +1246,11 @@ function Restart-BigMode {
     if (-not $thinkChoice) { Write-Host ("{0}Cancelled.{1}" -f $gray, $reset); return }
     $thinking = if ($thinkChoice -eq "on") { "true" } else { "false" }
 
-    $ctx = Read-Host "Context size? [131072]"
-    if (-not $ctx) { $ctx = "131072" }
+    $ctxArg = Read-CtxArg
 
     Write-Host ""
     Write-Host ("{0}Restarting with {1} (combined VRAM)...{2}" -f $cyan, $model.name, $reset)
-    $result = Invoke-ServerCommandChecked ("restart-big --model ""{0}"" --thinking {1} --ctx {2}" -f $model.name, $thinking, $ctx)
+    $result = Invoke-ServerCommandChecked ("restart-big --model ""{0}"" --thinking {1} {2}" -f $model.name, $thinking, $ctxArg)
     Write-Host ($result.Output -join "`n")
 
     if ($result.ExitCode -ne 0) {
