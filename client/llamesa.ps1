@@ -345,7 +345,11 @@ function Read-MultiSelectList {
     if (-not $Items -or $Items.Count -eq 0) { return $null }
 
     $index = 0
-    $checked = [ordered]@{}   # index -> $true, insertion order = pick order
+    # List, not [ordered]@{} — OrderedDictionary's indexer is ambiguous with
+    # int keys (it also has a *positional* Item(int index) accessor), so
+    # $checked[$index] = $true would try to set-by-position on an empty dict
+    # and throw "Parameter 'index'" out-of-range instead of adding a key.
+    $checkedOrder = [System.Collections.Generic.List[int]]::new()   # insertion order = pick order
 
     while ($true) {
         Clear-Host
@@ -353,7 +357,7 @@ function Read-MultiSelectList {
 
         for ($i = 0; $i -lt $Items.Count; $i++) {
             $label = & $LabelFn $Items[$i]
-            $box = if ($checked.Contains($i)) { "{0}[x]{1}" -f $teal, $reset } else { "{0}[ ]{1}" -f $gray, $reset }
+            $box = if ($checkedOrder.Contains($i)) { "{0}[x]{1}" -f $teal, $reset } else { "{0}[ ]{1}" -f $gray, $reset }
             if ($i -eq $index) {
                 Write-Host ("  {0}❯{1} {2} {3}{4}{5}" -f $teal, $reset, $box, $white, $label, $reset)
             } else {
@@ -363,7 +367,7 @@ function Read-MultiSelectList {
 
         $capText = if ($MaxCount -gt 0) { " (max {0})" -f $MaxCount } else { "" }
         Write-Host ""
-        Write-Host ("  {0}{1} selected{2}{3}" -f $gray, $checked.Count, $capText, $reset)
+        Write-Host ("  {0}{1} selected{2}{3}" -f $gray, $checkedOrder.Count, $capText, $reset)
         Write-Host ("  {0}up/down navigate  ·  space toggle  ·  enter confirm  ·  esc cancel{1}" -f $gray, $reset)
 
         $key = [Console]::ReadKey($true)
@@ -371,17 +375,17 @@ function Read-MultiSelectList {
             'UpArrow'   { $index = ($index - 1 + $Items.Count) % $Items.Count }
             'DownArrow' { $index = ($index + 1) % $Items.Count }
             'Spacebar' {
-                if ($checked.Contains($index)) {
-                    $checked.Remove($index)
-                } elseif ($MaxCount -le 0 -or $checked.Count -lt $MaxCount) {
-                    $checked[$index] = $true
+                if ($checkedOrder.Contains($index)) {
+                    $checkedOrder.Remove($index) | Out-Null
+                } elseif ($MaxCount -le 0 -or $checkedOrder.Count -lt $MaxCount) {
+                    $checkedOrder.Add($index)
                 }
             }
             'Enter' {
-                if ($checked.Count -eq 0) {
+                if ($checkedOrder.Count -eq 0) {
                     return @($Items[$index])
                 }
-                return @($checked.Keys | ForEach-Object { $Items[$_] })
+                return @($checkedOrder | ForEach-Object { $Items[$_] })
             }
             'Escape' { return $null }
         }
