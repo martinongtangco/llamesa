@@ -97,6 +97,74 @@ alternative for dense models if you want to experiment further, not a recommenda
 switch. Only tested with a dense model — do not extrapolate this result to MoE/hybrid
 architectures, which hit the split-mode bug regardless of relative speed.
 
+### Tool-calling parse errors ("Failed to parse input at pos N") — fixed by rebuilding Vulkan
+
+**Symptom:** coding-agent clients using OpenAI-compatible tool calling against `-big`
+(tested with `pi`, also reported against `opencode`) intermittently fail with a raw
+`<tool_call><function=...>` XML block leaking into the response, or the server itself
+returning a 500 with `"Failed to parse input at pos N: ..."`. Only shows up when the model
+makes **multiple tool calls in one turn** (e.g. "write these two files") — single-tool-call
+turns are unaffected. Cline is unaffected because it parses tool calls from raw text itself
+rather than relying on the API's structured `tool_calls` field.
+
+**Root cause:** confirmed via direct testing (captured the exact request `pi` sent, replayed
+it directly against the server repeatedly — same request succeeds most of the time and
+fails intermittently, ruling out `pi` itself) to be a llama.cpp server-side bug, not
+`llamesa` or `pi`. Confirmed against upstream: llama.cpp maintainer `aldehir` diagnosed it
+in [ggml-org/llama.cpp#20650](https://github.com/ggml-org/llama.cpp/issues/20650) — the
+server's tool-call parser assumes at most one tool call per turn (`parallel_tool_calls`
+defaults to `false`), and chokes when a model produces more than one anyway. That thread
+covers several distinct root causes sharing the same generic error message, fixed
+piecemeal over months, with regressions reintroduced across versions — there's no single
+clean "commit X fixes it forever."
+
+**Fix that worked here:** rebuilt the Vulkan binary from current llama.cpp master
+(2026-07-24). Verified 8/8 success (5 runs with 2 simultaneous tool calls, 3 runs with 3)
+against a build that failed 3/3 on the prior June-2026 build. Do not assume this holds
+forever — this area of llama.cpp keeps regressing per the upstream thread; re-verify with a
+fresh multi-tool-call test after any future rebuild before trusting it.
+
+**Build gotcha:** this container's Vulkan dev packages (`libvulkan-dev`) ship only the
+loader, not headers, and `glslang-tools` (apt) provides `glslangValidator` but this
+llama.cpp version hard-requires `glslc` specifically (`find_package(Vulkan COMPONENTS glslc
+REQUIRED)`, no glslangValidator fallback). Needed three extra deps beyond the base
+`cmake .. -DGGML_VULKAN=ON` command below:
+
+```bash
+# Vulkan headers (loader-only apt package doesn't ship these)
+git clone --depth 1 https://github.com/KhronosGroup/Vulkan-Headers.git /tmp/Vulkan-Headers
+cmake -S /tmp/Vulkan-Headers -B /tmp/Vulkan-Headers/build -DCMAKE_INSTALL_PREFIX=/usr
+sudo cmake --install /tmp/Vulkan-Headers/build
+
+# SPIRV-Headers (ggml-vulkan's CMakeLists.txt requires this separately)
+git clone --depth 1 https://github.com/KhronosGroup/SPIRV-Headers.git /tmp/SPIRV-Headers
+cmake -S /tmp/SPIRV-Headers -B /tmp/SPIRV-Headers/build -DCMAKE_INSTALL_PREFIX=/usr
+sudo cmake --install /tmp/SPIRV-Headers/build
+
+# glslc itself (shaderc) — not packaged in apt here; build from source
+git clone --depth 1 https://github.com/google/shaderc.git /tmp/shaderc
+cd /tmp/shaderc && python3 utils/git-sync-deps
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSHADERC_SKIP_TESTS=ON \
+  -DSHADERC_SKIP_EXAMPLES=ON -DSHADERC_SKIP_COPYRIGHT_CHECK=ON
+cmake --build build -j12 --target glslc_exe
+sudo cp build/glslc/glslc /usr/local/bin/glslc
+```
+
+Then the actual rebuild, same flags as the original Vulkan binary, into a **fresh
+directory** (`~/llama.cpp-vulkan-latest`) so the old binary stays available as an instant
+rollback:
+
+```bash
+git clone https://github.com/ggerganov/llama.cpp ~/llama.cpp-vulkan-latest
+cd ~/llama.cpp-vulkan-latest && mkdir build && cd build
+cmake .. -DGGML_VULKAN=ON -DGGML_HIP=OFF -DCMAKE_BUILD_TYPE=Release
+make -j12
+```
+
+Point `vulkan_split.llama_binary` at the new `build/bin/llama-server` once verified. The
+original binary (`~/llama.cpp/build/bin/llama-server`) is untouched — revert
+`vulkan_split.llama_binary` to it if the new build causes any regression.
+
 ### Building the ROCm binary
 
 Built as a fresh, independent clone — the original Vulkan build is never touched:
@@ -170,7 +238,7 @@ Reference values for this hardware:
 | Vulkan split (`-big`) port | `1236` |
 | `dual_gpu.r9700a.llama_binary` / `dual_gpu.r9700b.llama_binary` | ROCm build, e.g. `~/llama.cpp-rocm/build-rocm/bin/llama-server` |
 | `dual_gpu.r9700a.env` / `dual_gpu.r9700b.env` | `{}` — no env vars needed. In particular, do **not** set `HIP_VISIBLE_DEVICES`: it restricts the device list `_resolve_device_index` reads from `--list-devices`, which conflicts with `-sm none -mg <index>` needing to see and select from *both* devices. |
-| `vulkan_split.llama_binary` (`-big`) | Original Vulkan build, unchanged |
+| `vulkan_split.llama_binary` (`-big`) | `~/llama.cpp-vulkan-latest/build/bin/llama-server` as of 2026-07-25 — rebuilt from current master to fix the tool-calling parse-error bug, see [below](#tool-calling-parse-errors-failed-to-parse-input-at-pos-n---fixed-by-rebuilding-vulkan). The original binary (`~/llama.cpp/build/bin/llama-server`) still exists as a rollback target. |
 | Vulkan tensor split ratio | `1,1` (symmetric 32GB:32GB, updated from the old `2,1` asymmetric ratio) — **applies to whichever device lands in position 0 vs 1**, and that order is not stable across process launches (observed flipping between runs on the old asymmetric pair). With a 1:1 ratio this no longer matters for correctness the way it did for `2,1`, but re-verify once tested on the new hardware. |
 | `--n-gpu-layers` | Must be `auto`, never a fixed number like the old `default_gpu_layers: 99` convention — a hardcoded value makes `-fit` abort ("n_gpu_layers already set by user... abort") instead of picking the right split |
 
