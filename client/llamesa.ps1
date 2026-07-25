@@ -1860,10 +1860,22 @@ function Draw-Screen {
     Show-ActiveHeader -status $status
     Show-ChatHistory
 
-    $filtered = @()
+    if ($Script:InputHint) {
+        Write-Host ("  {0}{1}{2}" -f $amber, $Script:InputHint, $reset)
+    }
+
+    # Everything is top-anchored — no padding to push the input to the last
+    # row. The input line sits directly under the header/scrollback, and the
+    # palette (if open) drops down directly under the input, Pi Agent-style,
+    # instead of being pinned separately with dead space in between.
+    $promptPrefix = "  › "   # visible chars only — must match what's written below for cursor math
+    $prefix = if ($paletteOpen) { "/$paletteFilter" } else { $inputBuffer }
+    $inputRow = [Console]::CursorTop
+    Write-Host ("  {0}›{1} {2}" -f $teal, $reset, $prefix)
+    $cursorCol = [Math]::Min($promptPrefix.Length + $prefix.Length, [Console]::WindowWidth - 1)
+
     if ($paletteOpen) {
         $filtered = @($Script:PaletteCommands | Where-Object { $_.Name -like "*${paletteFilter}*" })
-        Write-Host ""
         if ($filtered.Count -eq 0) {
             Write-Host ("  {0}No matching commands.{1}" -f $gray, $reset)
         } else {
@@ -1885,17 +1897,9 @@ function Draw-Screen {
         Write-Host ("  {0}up/down navigate  ·  enter select  ·  esc cancel{1}" -f $gray, $reset)
     }
 
-    if ($Script:InputHint) {
-        Write-Host ("  {0}{1}{2}" -f $amber, $Script:InputHint, $reset)
-    }
-
-    # Pin the input line to the last row — pad with blank lines to fill remaining height
-    $usedRows = [Console]::CursorTop
-    $padLines = [Math]::Max(0, [Console]::WindowHeight - $usedRows - 2)
-    if ($padLines -gt 0) { Write-Host ("`n" * ($padLines - 1)) }
-
-    $prefix = if ($paletteOpen) { "/$paletteFilter" } else { $inputBuffer }
-    Write-Host ("  {0}›{1} {2}" -f $teal, $reset, $prefix) -NoNewline
+    # Park the blinking cursor back on the input line (right after the typed
+    # text) even though the palette printed further rows beneath it.
+    try { [Console]::SetCursorPosition($cursorCol, $inputRow) } catch {}
 }
 
 function Main {
