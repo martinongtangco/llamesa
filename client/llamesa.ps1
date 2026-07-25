@@ -900,6 +900,28 @@ function Detect-ActiveMode {
     $Script:ActiveMode = "single"
 }
 
+# $Script:GpuStatus is only kept fresh by Main's 2s loop while ActiveMode is
+# "single" — Get-ActiveStatus calls Get-BigStatus/Get-DualStatus instead in
+# those modes, which don't touch $Script:GpuStatus at all. A session that
+# launches straight into (or was ever in) -big/-dual mode would otherwise
+# leave $Script:GpuStatus stale or $null, and anything computing "how many
+# GPUs does this box have" from it would wrongly see 1. GPU count is static
+# hardware info, so fetch it directly once here and cache it, independent of
+# whatever mode happens to be active when it's first asked for.
+$Script:GpuCount = $null
+
+function Get-GpuCount {
+    if ($Script:GpuCount) { return $Script:GpuCount }
+    Get-ServerStatus | Out-Null
+    if ($Script:GpuStatus -is [array]) {
+        $Script:GpuCount = $Script:GpuStatus.Count
+    } elseif ($Script:GpuStatus) {
+        $Script:GpuCount = 1
+    }
+    if ($Script:GpuCount) { return $Script:GpuCount }
+    return 1   # fetch failed (e.g. transient SSH hiccup) — don't cache a guess, retry next call
+}
+
 # ── Server-side command helpers (shared by /start, /stop, /restart) ──────
 
 # Unlike Invoke-ServerCommand -raw (which discards the SSH session's stderr —
@@ -992,7 +1014,7 @@ function Read-CtxArg {
 # per GPU (independent instances). Absorbs the old dedicated -big/-dual flows.
 
 function Cmd-Start {
-    $gpuCount = if ($Script:GpuStatus -is [array]) { $Script:GpuStatus.Count } else { 1 }
+    $gpuCount = Get-GpuCount
     $maxSelectable = [Math]::Min([Math]::Max($gpuCount, 1), 2)
 
     Write-Host ("{0}Fetching available models...{1}" -f $cyan, $reset)
@@ -1114,6 +1136,9 @@ function Cmd-Stop {
         }
 
         if ($running.Count -eq 0) {
+            # $Script:GpuStatus may be stale/unset if we just came from -big/-dual
+            # mode (only Main's "single" branch keeps it refreshed) — query fresh.
+            Get-ServerStatus | Out-Null
             $runningGpus = @()
             if ($Script:GpuStatus -is [array]) { $runningGpus = @($Script:GpuStatus | Where-Object { $_.running -eq $true }) }
             elseif ($Script:GpuStatus -and $Script:GpuStatus.running) { $runningGpus = @($Script:GpuStatus) }
@@ -1193,7 +1218,11 @@ function Restart-SingleMode {
 
     # Fire-and-forget: launch start detached so SSH returns immediately.
     # nohup + & + redirected output lets the SSH session close without killing the process.
-    # Get GPU id from running status
+    # Get GPU id from running status. This relies on $Script:GpuStatus still
+    # holding the pre-stop snapshot: Cmd-Stop's single-mode fallback (above)
+    # refreshes it fresh right before issuing the stop, and nothing since has
+    # overwritten it — fetching live here instead would just show nothing
+    # running (we already stopped it) and always fall back to GPU 0.
     $gpuArg = 0
     if ($Script:GpuStatus -is [array]) {
         $rg = $Script:GpuStatus | Where-Object { $_.running -eq $true } | Select-Object -First 1
