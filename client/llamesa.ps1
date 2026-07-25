@@ -585,7 +585,7 @@ function Show-Header {
             } elseif ($Script:GpuStatus -and $Script:GpuStatus.running) {
                 $gpuPill = "${gray}[GPU$($Script:GpuStatus.gpu_id) $($Script:GpuStatus.gpu_name)]${r}"
             }
-            Out-Line ("  ${gray}MODEL${r}  ${white}$($status.model)${r}  ${ctxPill}  ${thinkingPill}  ${toksPill}  ${gpuPill}")
+            Out-Line ("  ${gray}MODEL${r}  ${white}$(Get-FriendlyModelName $status.model)${r}  ${ctxPill}  ${thinkingPill}  ${toksPill}  ${gpuPill}")
         } else {
             Out-Line ("  ${gray}MODEL  none${r}")
         }
@@ -710,7 +710,7 @@ function Show-HeaderBig {
             $thinkingPill = if ($status.thinking) { "${teal}[thinking on]${reset}" } else { "${gray}[thinking off]${reset}" }
             $ctxPill      = if ($status.ctx -gt 0) { "${teal}[ctx $($status.ctx)]${reset}" } else { "" }
             $toksPill     = if ($Script:LastTokS)  { "${amber}[$($Script:LastTokS) tok/s]${reset}" } else { "" }
-            Out-Line ("  ${gray}MODEL${reset}  ${white}$($status.model)${reset}  ${ctxPill}  ${thinkingPill}  ${toksPill}  ${gray}[vulkan · both GPUs]${reset}")
+            Out-Line ("  ${gray}MODEL${reset}  ${white}$(Get-FriendlyModelName $status.model)${reset}  ${ctxPill}  ${thinkingPill}  ${toksPill}  ${gray}[vulkan · both GPUs]${reset}")
         } else {
             Out-Line ("  ${gray}MODEL  none${reset}")
         }
@@ -799,7 +799,7 @@ function Show-DualInstanceRow {
     if ($running) {
         $thinkingPill = if ($inst.thinking) { "${teal}[thinking on]${r}" } else { "${gray}[thinking off]${r}" }
         $ctxPill      = if ($inst.ctx -gt 0) { "${teal}[ctx $($inst.ctx)]${r}" } else { "" }
-        Out-Line ("  ${gray}MODEL${r}  ${white}$($inst.model)${r}  ${ctxPill}  ${thinkingPill}")
+        Out-Line ("  ${gray}MODEL${r}  ${white}$(Get-FriendlyModelName $inst.model)${r}  ${ctxPill}  ${thinkingPill}")
     } else {
         Out-Line ("  ${gray}MODEL  none${r}")
     }
@@ -1126,13 +1126,13 @@ function Cmd-Stop {
 
     $bigStatus = Get-BigStatus
     if ($bigStatus -and $bigStatus.running) {
-        $running += [PSCustomObject]@{ Label = "{0} (combined VRAM)" -f $bigStatus.model; Mode = "big"; GpuArg = $null }
+        $running += [PSCustomObject]@{ Label = "{0} (combined VRAM)" -f (Get-FriendlyModelName $bigStatus.model); Mode = "big"; GpuArg = $null }
     } else {
         $dualStatus = Get-DualStatus
         $dualInstances = @()
         if ($dualStatus -is [array]) { $dualInstances = $dualStatus } elseif ($dualStatus) { $dualInstances = @($dualStatus) }
         foreach ($inst in @($dualInstances | Where-Object { $_.running -eq $true })) {
-            $running += [PSCustomObject]@{ Label = "{0}: {1}" -f $inst.gpu_id, $inst.model; Mode = "dual"; GpuArg = $inst.gpu_id }
+            $running += [PSCustomObject]@{ Label = "{0}: {1}" -f $inst.gpu_id, (Get-FriendlyModelName $inst.model); Mode = "dual"; GpuArg = $inst.gpu_id }
         }
 
         if ($running.Count -eq 0) {
@@ -1945,16 +1945,37 @@ function Test-ModelLoaded {
 # thinking mode, GPU mode, server, connection. Reuses the $status object the
 # 2s poll already fetched — no extra SSH round trip per redraw.
 
+# status-big/status-dual sometimes echo the model's resolved .gguf file path
+# instead of the friendly directory name used everywhere else (list-models,
+# the /start picker) — a full path is both the wrong label and, printed on
+# the single-line status bar, long enough to wrap the terminal and corrupt
+# the buffered redraw. Normalize to that friendly name, and hard-cap length
+# as a defensive backstop against any other unexpectedly long value.
+function Get-FriendlyModelName {
+    param([string]$raw)
+    if (-not $raw) { return $raw }
+    $name = $raw
+    if ($name -match '[\\/]') {
+        $parent = Split-Path -Path $name -Parent
+        if ($parent) {
+            $leaf = Split-Path -Path $parent -Leaf
+            if ($leaf) { $name = $leaf }
+        }
+    }
+    if ($name.Length -gt 40) { $name = $name.Substring(0, 37) + "..." }
+    return $name
+}
+
 function Get-StatusBarModelName {
     param($status)
     if (-not $status) { return "no model" }
     if ($status -is [array]) {
         $running = @($status | Where-Object { $_.running -eq $true })
-        if ($running.Count -eq 2) { return "{0} + {1}" -f $running[0].model, $running[1].model }
-        if ($running.Count -eq 1) { return $running[0].model }
+        if ($running.Count -eq 2) { return "{0} + {1}" -f (Get-FriendlyModelName $running[0].model), (Get-FriendlyModelName $running[1].model) }
+        if ($running.Count -eq 1) { return Get-FriendlyModelName $running[0].model }
         return "no model"
     }
-    if ($status.running -and $status.model) { return $status.model }
+    if ($status.running -and $status.model) { return Get-FriendlyModelName $status.model }
     return "no model"
 }
 
@@ -2106,6 +2127,12 @@ function Main {
                         $paletteOpen = $false; $paletteFilter = ""; $paletteIndex = 0; $inputBuffer = ""; $Script:InputHint = $null
                         Clear-Host
                         Invoke-PaletteCommand $cmd
+                        # The command just printed a variable, unbuffered amount of
+                        # raw output that scrolled the terminal — clear it and reset
+                        # Render-Frame's row bookkeeping so the next buffered redraw
+                        # doesn't leave any of it behind or miscount rows against it.
+                        Clear-Host
+                        $Script:PrevFrameLines = 0
                         $lastRefresh = [DateTime]::MinValue
                     }
                 }
@@ -2125,11 +2152,17 @@ function Main {
                             $inputBuffer = ""; $Script:InputHint = $null
                             Clear-Host
                             Invoke-PaletteCommand ($text.TrimStart('/'))
+                            # See the palette Enter handler above — clears the
+                            # command's own raw output before the next buffered redraw.
+                            Clear-Host
+                            $Script:PrevFrameLines = 0
                             $lastRefresh = [DateTime]::MinValue
                         } elseif (Test-ModelLoaded) {
                             $inputBuffer = ""; $Script:InputHint = $null
                             Clear-Host
                             Send-ChatMessage $text
+                            Clear-Host
+                            $Script:PrevFrameLines = 0
                             $lastRefresh = [DateTime]::MinValue
                         } else {
                             $Script:InputHint = "No model loaded — press / then /start to load one."
