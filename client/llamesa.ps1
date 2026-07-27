@@ -195,7 +195,7 @@ function Invoke-ServerCommand {
     $fullCommand = "bash ${llamesaPath} ${command}"
 
     try {
-        $result = ssh -o BatchMode=yes -o ConnectTimeout=5 "${sshUser}@${sshHost}" $fullCommand 2>$null
+        $result = ssh -o BatchMode=yes -o ConnectTimeout=3 "${sshUser}@${sshHost}" $fullCommand 2>$null
 
         if ($LASTEXITCODE -ne 0 -and -not $raw) {
             Write-Warning "SSH command failed (exit code: $LASTEXITCODE)"
@@ -212,7 +212,7 @@ function Test-ServerConnection {
     try {
         $sshUser = $Script:ActiveServer.ssh_user
         $sshHost = $Script:ActiveServer.host
-        $result = ssh -o BatchMode=yes -o ConnectTimeout=5 "${sshUser}@${sshHost}" "echo ok" 2>&1
+        $result = ssh -o BatchMode=yes -o ConnectTimeout=3 "${sshUser}@${sshHost}" "echo ok" 2>&1
         return $result -match "ok"
     } catch {
         return $false
@@ -686,7 +686,8 @@ function Show-HeaderBig {
             Out-Line ("  ${devLabel} ${barStr} ${vramStr}  ${busyStr}")
         }
     } else {
-        Out-Line ("  {0}no device data{1}" -f $gray, $reset)
+        $deviceMsg = if ($Script:ServerOnline) { "no device data" } else { "offline" }
+        Out-Line ("  {0}{1}{2}" -f $gray, $deviceMsg, $reset)
     }
 
     # CPU/RAM stat cards — host-level, single instance (one process spans both GPUs)
@@ -832,7 +833,8 @@ function Show-HeaderDual {
     elseif ($status) { $instances = @($status) }
 
     if ($instances.Count -eq 0) {
-        Out-Line ("  {0}no dual instance data{1}" -f $gray, $reset)
+        $instanceMsg = if ($Script:ServerOnline) { "no dual instance data" } else { "offline" }
+        Out-Line ("  {0}{1}{2}" -f $gray, $instanceMsg, $reset)
     } else {
         foreach ($inst in $instances) {
             Show-DualInstanceRow $inst
@@ -950,7 +952,7 @@ function Invoke-ServerCommandChecked {
     $fullCommand = "bash ${llamesaPath} ${command} 2>&1"
 
     try {
-        $result = ssh -o BatchMode=yes -o ConnectTimeout=5 "${sshUser}@${sshHost}" $fullCommand
+        $result = ssh -o BatchMode=yes -o ConnectTimeout=3 "${sshUser}@${sshHost}" $fullCommand
         return [PSCustomObject]@{ Output = $result; ExitCode = $LASTEXITCODE }
     } catch {
         return [PSCustomObject]@{ Output = @("SSH failed: $_"); ExitCode = 1 }
@@ -1257,7 +1259,7 @@ function Restart-SingleMode {
     $port        = $Script:ActiveServer.port
 
     # Read saved session so we know what to restart with
-    $sessionJson = ssh -o BatchMode=yes -o ConnectTimeout=5 "${sshUser}@${sshHost}" "cat ~/.llamesa/last_session.json 2>/dev/null" 2>$null
+    $sessionJson = ssh -o BatchMode=yes -o ConnectTimeout=3 "${sshUser}@${sshHost}" "cat ~/.llamesa/last_session.json 2>/dev/null" 2>$null
     if (-not $sessionJson) {
         Write-Host ("{0}No saved session found. Use /start instead.{1}" -f $red, $reset)
         return
@@ -1288,7 +1290,7 @@ function Restart-SingleMode {
         if ($rg) { $gpuArg = $rg.gpu_id }
     }
     $startCmd = "nohup bash ${llamesaPath} start --model `"${modelName}`" --gpu ${gpuArg} --thinking ${thinking} --ctx ${ctx} >> ~/.llamesa/restart.log 2>&1 &"
-    ssh -o BatchMode=yes -o ConnectTimeout=5 "${sshUser}@${sshHost}" $startCmd 2>$null | Out-Null
+    ssh -o BatchMode=yes -o ConnectTimeout=3 "${sshUser}@${sshHost}" $startCmd 2>$null | Out-Null
 
     # Poll /health directly over HTTP — no SSH held open during the long load wait
     Write-Host ("{0}Waiting for model to load...{1}" -f $cyan, $reset)
@@ -1953,8 +1955,19 @@ $Script:PaletteCommands = @(
     [PSCustomObject]@{ Name = "quit";     Desc = "exit LLaMesa" }
 )
 
+$Script:ServerDependentCommands = @("start", "stop", "restart", "health", "logs", "models", "download")
+
 function Invoke-PaletteCommand {
     param([string]$cmd)
+
+    # Fail fast instead of blocking on a doomed SSH attempt — $Script:ServerOnline
+    # is refreshed every cycle by Main, so this is at most one refresh interval
+    # stale. /servers, /config, /clear, /think, /nothink, and /quit don't touch
+    # the current server at all, so they're left free to run regardless.
+    if ($cmd -in $Script:ServerDependentCommands -and -not $Script:ServerOnline) {
+        Write-Host ("{0}Server unreachable — check the connection and try again.{1}" -f $red, $reset)
+        return
+    }
 
     switch ($cmd) {
         "start"    { Cmd-Start;    Read-Host "`nPress Enter to continue" | Out-Null }
@@ -2128,6 +2141,8 @@ function Main {
     $status = $null
     # MinValue forces an immediate status fetch on the first iteration
     $lastRefresh = [DateTime]::MinValue
+    $refreshInterval = 2
+    $offlineStreak = 0
 
     $inputBuffer = ""
     $paletteOpen = $false
@@ -2142,18 +2157,36 @@ function Main {
     try {
 
     while ($true) {
-        # Auto-refresh every 2s — fires on its own now, not just after a command
+        # Auto-refresh, cadence depends on $refreshInterval (see below)
         $elapsed = ([DateTime]::Now - $lastRefresh).TotalSeconds
-        if ($elapsed -ge 2) {
+        if ($elapsed -ge $refreshInterval) {
             try {
+                # A dead/unreachable server fails this ping fast; only pay for
+                # the second, mode-specific status round trip when it's
+                # actually reachable — avoids stacking two SSH timeouts back
+                # to back on every single refresh while offline.
                 $Script:ServerOnline = Test-ServerConnection
-                $status = Get-ActiveStatus
+                $status = if ($Script:ServerOnline) { Get-ActiveStatus } else { $null }
                 $Script:ServerStatus = $status
                 $Script:LastStatusRefresh = [DateTime]::Now
             } catch {
                 $Script:ServerOnline = $false
                 $status = $null
             }
+
+            if ($Script:ServerOnline) {
+                $offlineStreak = 0
+                $refreshInterval = 2
+            } else {
+                # Back off how often we retry while offline (capped at 15s)
+                # instead of hammering a dead connection every 2s — each
+                # attempt still blocks the UI for up to the SSH connect
+                # timeout, so this is what keeps typing/navigating responsive
+                # while the server is down.
+                $offlineStreak++
+                $refreshInterval = [Math]::Min(2 + ($offlineStreak * 3), 15)
+            }
+
             $lastRefresh = [DateTime]::Now
             $needsRedraw = $true
         }
@@ -2217,6 +2250,11 @@ function Main {
                             Clear-Host
                             $Script:PrevFrameLines = 0
                             $lastRefresh = [DateTime]::MinValue
+                        } elseif (-not $Script:ServerOnline) {
+                            # Skip Test-ModelLoaded here — in big/dual mode it's
+                            # its own fresh SSH call, no point making a second
+                            # doomed attempt right after the one that just failed.
+                            $Script:InputHint = "Server unreachable — check the connection."
                         } elseif (Test-ModelLoaded) {
                             $inputBuffer = ""; $Script:InputHint = $null
                             Clear-Host
