@@ -634,10 +634,10 @@ function Show-Header {
             } else {
                 $tsStr = "{0}h ago" -f [int]($elapsed / 3600)
             }
-            $stale = if ($elapsed -ge 15) { "${red}[stale]${r}" } else { "" }
-            Out-Line ("  ${dim}updated ${tsStr}${r} ${stale}")
+            $stale = if ($elapsed -ge 15) { "${red}[stale]${reset}" } else { "" }
+            Out-Line ("  ${dim}updated ${tsStr}${reset} ${stale}")
         } else {
-            Out-Line ("  ${dim}updated --${r}")
+            Out-Line ("  ${dim}updated --${reset}")
         }
     }
 
