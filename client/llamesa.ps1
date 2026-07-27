@@ -515,69 +515,33 @@ function Show-Header {
     # GPU rows
     Show-GpuRow $Script:GpuStatus
 
-    # Lines 3-7 — stat cards
+    # Lines 3-7 — stat cards. VRAM and per-GPU busy% are already shown above
+    # by Show-GpuRow (for every configured GPU, not just one) — repeating
+    # them here as cards would either just duplicate that on a single-GPU
+    # box, or on a multi-GPU box, misleadingly show only GPU0's numbers
+    # under a generic "VRAM"/"GPU" label. So this only covers what Show-GpuRow
+    # doesn't: host-level RAM and CPU. Mirrors Show-HeaderBig's card row.
     if ($status) {
-        $cpu        = [double]($status.cpu_percent)
-        $ramUsedGb  = [math]::Round($status.ram_used_mb   / 1024, 1)
-        $ramTotGb   = [math]::Round($status.ram_total_mb  / 1024, 1)
-        $gpu        = [double]($status.gpu_busy_percent)
-        $vramUsedGb = [math]::Round($status.vram_used_bytes  / 1GB, 1)
-        $vramTotGb  = [math]::Round($status.vram_total_bytes / 1GB, 1)
+        $cpu       = [double]($status.cpu_percent)
+        $ramUsedGb = [math]::Round($status.ram_used_mb  / 1024, 1)
+        $ramTotGb  = [math]::Round($status.ram_total_mb / 1024, 1)
 
-        $cpuCol  = if ($cpu -gt 20)        { $red   } elseif ($cpu -gt 5)        { $amber } else { $teal }
-        $ramCol  = if ($ramUsedGb -gt 20)  { $red   } elseif ($ramUsedGb -gt 10) { $amber } else { $teal }
-        $gpuCol  = if ($gpu -gt 0)         { $amber } else                       { $gray }
-        $vramCol = if ($vramUsedGb -lt 5)  { $red   } elseif ($vramUsedGb -lt 15){ $amber } else { $teal }
+        $cpuCol = if ($cpu -gt 20)       { $red }   elseif ($cpu -gt 5)        { $amber } else { $teal }
+        $ramCol = if ($ramUsedGb -gt 20) { $red }   elseif ($ramUsedGb -gt 10) { $amber } else { $teal }
 
-        $cpuBar  = New-Bar $cpu        100         12 $cpuCol
-        $ramBar  = New-Bar $ramUsedGb  $ramTotGb   12 $purple
-        $gpuBar  = New-Bar $gpu        100         12 $gpuCol
-        $vramBar = New-Bar $vramUsedGb $vramTotGb  12 $blue
-
-        # Card inner widths (visible chars between │ and │):
-        #   small cards (CPU/RAM/GPU): 15  →  outer 17  →  top = ┌───────────────┐
-        #   VRAM card:                 20  →  outer 22  →  top = ┌────────────────────┐
-        #
-        # Each content row: │ + leading_space + padded_content + │
-        # small: 1 + 1 + 13-char-content + 1 = 16... wait that's only 16 not 17.
-        # Correct: inner 15 means │ + 15 chars + │ = 17. Content = leading_space(1) + value.PadRight(14).
-        # VRAM inner 20: │ + 20 chars + │ = 22. Content = leading_space(1) + value.PadRight(19).
+        $cpuBar = New-Bar $cpu       100        12 $cpuCol
+        $ramBar = New-Bar $ramUsedGb $ramTotGb  12 $purple
 
         $b = $dim; $r = $reset
+        $cpuVal = "{0}%" -f $cpu
+        $ramVal = if ($ramTotGb -gt 0) { "{0} / {1} GB" -f $ramUsedGb, $ramTotGb } else { "{0} GB" -f $ramUsedGb }
 
-        # Plain-text values (no color codes) for PadRight
-        $cpuVal  = "{0}%" -f $cpu
-        $ramVal  = if ($ramTotGb -gt 0)  { "{0} / {1} GB" -f $ramUsedGb, $ramTotGb   } else { "{0} GB" -f $ramUsedGb }
-        $gpuVal  = "{0}%" -f $gpu
-        $vramVal = if ($vramTotGb -gt 0) { "{0} / {1} GB" -f $vramUsedGb, $vramTotGb } else { "{0} GB" -f $vramUsedGb }
-
-        # Card order: VRAM, GPU, RAM, CPU — "loaded memory to gpus" first, CPU last.
-        # Top border — VRAM=20 dashes, small=15 dashes
-        Out-Line ("  ${b}┌────────────────────┐${r} ${b}┌───────────────┐${r} ${b}┌───────────────┐${r} ${b}┌───────────────┐${r}")
-
-        # Label row: 1 leading space + label padded to 19 (VRAM) / 14 (small)
-        $lblRow  = "  ${b}│${r} ${gray}$("VRAM".PadRight(19))${r}${b}│${r} "
-        $lblRow += "${b}│${r} ${gray}$("GPU".PadRight(14))${r}${b}│${r} "
-        $lblRow += "${b}│${r} ${gray}$("RAM".PadRight(14))${r}${b}│${r} "
-        $lblRow += "${b}│${r} ${gray}$("CPU".PadRight(14))${r}${b}│${r}"
-        Out-Line $lblRow
-
-        # Value row: colored value padded to 19 (VRAM) / 14 (small) — PadRight on plain string, then wrap in color
-        $valRow  = "  ${b}│${r} ${vramCol}$($vramVal.PadRight(19))${r}${b}│${r} "
-        $valRow += "${b}│${r} ${gpuCol}$($gpuVal.PadRight(14))${r}${b}│${r} "
-        $valRow += "${b}│${r} ${ramCol}$($ramVal.PadRight(14))${r}${b}│${r} "
-        $valRow += "${b}│${r} ${cpuCol}$($cpuVal.PadRight(14))${r}${b}│${r}"
-        Out-Line $valRow
-
-        # Bar row: 12-char bar + padding to fill inner (VRAM: 7 spaces, small: 2 spaces)
-        $barRow  = "  ${b}│${r} ${vramBar}       ${b}│${r} "
-        $barRow += "${b}│${r} ${gpuBar}  ${b}│${r} "
-        $barRow += "${b}│${r} ${ramBar}  ${b}│${r} "
-        $barRow += "${b}│${r} ${cpuBar}  ${b}│${r}"
-        Out-Line $barRow
-
-        # Bottom border
-        Out-Line ("  ${b}└────────────────────┘${r} ${b}└───────────────┘${r} ${b}└───────────────┘${r} ${b}└───────────────┘${r}")
+        # Card order: RAM, CPU
+        Out-Line ("  ${b}┌───────────────┐${r} ${b}┌───────────────┐${r}")
+        Out-Line ("  ${b}│${r} ${gray}$("RAM".PadRight(14))${r}${b}│${r} ${b}│${r} ${gray}$("CPU".PadRight(14))${r}${b}│${r}")
+        Out-Line ("  ${b}│${r} ${ramCol}$($ramVal.PadRight(14))${r}${b}│${r} ${b}│${r} ${cpuCol}$($cpuVal.PadRight(14))${r}${b}│${r}")
+        Out-Line ("  ${b}│${r} ${ramBar}  ${b}│${r} ${b}│${r} ${cpuBar}  ${b}│${r}")
+        Out-Line ("  ${b}└───────────────┘${r} ${b}└───────────────┘${r}")
 
         # Model row with pill badges
         if ($status.running) {
@@ -615,11 +579,10 @@ function Show-Header {
         }
     } else {
         # Offline placeholder — same number of lines as card block so layout is stable
-        Out-Line ("  ${dim}┌────────────────────┐ ┌───────────────┐ ┌───────────────┐ ┌───────────────┐${reset}")
-        Out-Line ("  ${dim}│  offline           │ │               │ │               │ │               │${reset}")
-        Out-Line ("  ${dim}│                    │ │               │ │               │ │               │${reset}")
-        Out-Line ("  ${dim}│                    │ │               │ │               │ │               │${reset}")
-        Out-Line ("  ${dim}└────────────────────┘ └───────────────┘ └───────────────┘ └───────────────┘${reset}")
+        Out-Line ("  ${dim}┌───────────────┐ ┌───────────────┐${reset}")
+        Out-Line ("  ${dim}│  offline      │ │               │${reset}")
+        Out-Line ("  ${dim}│               │ │               │${reset}")
+        Out-Line ("  ${dim}└───────────────┘ └───────────────┘${reset}")
         Out-Line ("  ${gray}MODEL  none${reset}")
 
         # Last-updated timestamp (offline)
