@@ -1474,33 +1474,74 @@ function Get-ActiveGpuPort {
     return $Script:ActiveServer.port
 }
 
+# Which port(s) to check depends on the active mode — big/dual run on
+# entirely different ports than the v1 per-GPU path Get-ActiveGpuPort
+# resolves (e.g. combined-VRAM's vulkan_split.port), so this mirrors the
+# same mode dispatch Resolve-ChatEndpoint already uses for chat.
+function Get-HealthCheckTargets {
+    $targets = @()
+    switch ($Script:ActiveMode) {
+        "big" {
+            $bigStatus = Get-BigStatus
+            if ($bigStatus -and $bigStatus.port) {
+                $targets += [PSCustomObject]@{ Label = "combined VRAM"; Port = $bigStatus.port }
+            }
+        }
+        "dual" {
+            $dualStatus = Get-DualStatus
+            $instances = @()
+            if ($dualStatus -is [array]) { $instances = $dualStatus } elseif ($dualStatus) { $instances = @($dualStatus) }
+            foreach ($inst in @($instances | Where-Object { $_.running -eq $true -and $_.port })) {
+                $targets += [PSCustomObject]@{ Label = $inst.gpu_id; Port = $inst.port }
+            }
+        }
+        default {
+            $targets += [PSCustomObject]@{ Label = "GPU"; Port = (Get-ActiveGpuPort) }
+        }
+    }
+    return $targets
+}
+
 function Cmd-Health {
     Write-Host ("{0}Checking server health...{1}" -f $cyan, $reset)
 
-    $port = Get-ActiveGpuPort
     $hostAddr = $Script:ActiveServer.host
+    $targets = Get-HealthCheckTargets
 
-    # Check /health endpoint
-    try {
-        $health = Invoke-RestMethod -Uri "http://${hostAddr}:${port}/health" -TimeoutSec 5 -ErrorAction Stop
-        Write-Host ("{0}✓ /health endpoint OK{1}" -f $green, $reset)
-        Write-Host ($health | ConvertTo-Json)
-    } catch {
-        Write-Host ("{0}✗ /health endpoint failed: {1}{2}" -f $red, $_.Exception.Message, $reset)
+    if ($targets.Count -eq 0) {
+        Write-Host ("{0}Nothing running to check.{1}" -f $gray, $reset)
+        return
     }
 
-    Write-Host ""
+    foreach ($t in $targets) {
+        if ($targets.Count -gt 1) {
+            Write-Host ""
+            Write-Host ("{0}── {1} (port {2}) ──{3}" -f $teal, $t.Label, $t.Port, $reset)
+        }
+        $port = $t.Port
 
-    # Check /v1/models endpoint
-    try {
-        $models = Invoke-RestMethod -Uri "http://${hostAddr}:${port}/v1/models" -TimeoutSec 5 -ErrorAction Stop
-        Write-Host ("{0}✓ /v1/models endpoint OK{1}" -f $green, $reset)
-        Write-Host ($models | ConvertTo-Json -Depth 5)
-    } catch {
-        Write-Host ("{0}✗ /v1/models endpoint failed: {1}{2}" -f $red, $_.Exception.Message, $reset)
+        # Check /health endpoint
+        try {
+            $health = Invoke-RestMethod -Uri "http://${hostAddr}:${port}/health" -TimeoutSec 5 -ErrorAction Stop
+            Write-Host ("{0}✓ /health endpoint OK (port {1}){2}" -f $green, $port, $reset)
+            Write-Host ($health | ConvertTo-Json)
+        } catch {
+            Write-Host ("{0}✗ /health endpoint failed (port {1}): {2}{3}" -f $red, $port, $_.Exception.Message, $reset)
+        }
+
+        Write-Host ""
+
+        # Check /v1/models endpoint
+        try {
+            $models = Invoke-RestMethod -Uri "http://${hostAddr}:${port}/v1/models" -TimeoutSec 5 -ErrorAction Stop
+            Write-Host ("{0}✓ /v1/models endpoint OK (port {1}){2}" -f $green, $port, $reset)
+            Write-Host ($models | ConvertTo-Json -Depth 5)
+        } catch {
+            Write-Host ("{0}✗ /v1/models endpoint failed (port {1}): {2}{3}" -f $red, $port, $_.Exception.Message, $reset)
+        }
+
+        Write-Host ""
     }
-
-    Write-Host ""
 }
 
 # ── Command: /download ────────────────────────────────────────────────────
