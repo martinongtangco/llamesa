@@ -435,13 +435,22 @@ cmd_list_models() {
     fi
 }
 
-# Reads a model's native max context length directly from its GGUF metadata,
-# via llama.cpp's bundled gguf-py — no extra install; it ships as a plain
-# Python package alongside any llama.cpp checkout. Used by the client to
-# suggest the model's real max instead of the server's generic
-# default_context. Best-effort: emits {"context_length": null} instead of
-# erroring when gguf-py can't be located or reading fails, so the client can
-# just fall back to default_context.
+# Reads a model's native max context length straight out of its GGUF header.
+# Used by the client to offer the model's real max instead of the server's
+# generic default_context.
+#
+# This parses the header itself rather than going through llama.cpp's bundled
+# gguf-py. gguf-py looks dependency-free but imports numpy, which is not
+# installed for the host python3 on this box — so the import raised, the old
+# blanket "except Exception" turned that into {"context_length": null}, and
+# the client silently fell back to default_context. A 262144-context model
+# would quietly load at 131072 with nothing anywhere saying why.
+#
+# The GGUF header is a small, stable, documented format, so reading it needs
+# nothing beyond the standard library: magic, version, tensor count, then a
+# run of key/value pairs. We walk the pairs for *.context_length and stop.
+# Still best-effort — emits {"context_length": null} so the client can fall
+# back — but now the reason goes to stderr instead of vanishing.
 cmd_model_context() {
     read_config
 
@@ -454,38 +463,68 @@ cmd_model_context() {
     done
     [[ -z "$model_path" ]] && error "Model path required. Use --path <file>"
 
-    if [[ ! -f "$model_path" ]] || ! command -v python3 >/dev/null 2>&1; then
+    if [[ ! -f "$model_path" ]]; then
+        echo "[WARN] model-context: no such file: $model_path" >&2
+        echo '{"context_length":null}'
+        return 0
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "[WARN] model-context: python3 not found" >&2
         echo '{"context_length":null}'
         return 0
     fi
 
-    # gguf-py lives as a sibling of the configured llama.cpp checkout's
-    # build/bin/ — derive it from llama_binary rather than hardcoding a path.
-    # This runs at the host level, so strip a distrobox /run/host prefix if
-    # llama_binary is expressed as an in-container path.
-    local host_binary="${LLAMA_BINARY#/run/host}"
-    local gguf_py_dir
-    gguf_py_dir="$(dirname "$(dirname "$(dirname "$host_binary")")")/gguf-py"
+    # Model path goes in on argv, never interpolated into the program text —
+    # a quote or backslash in a filename would otherwise break the source.
+    python3 - "$model_path" <<'PYEOF'
+import json, struct, sys
 
-    if [[ ! -d "$gguf_py_dir" ]]; then
-        echo '{"context_length":null}'
-        return 0
-    fi
+# GGUF metadata value type ids, in spec order.
+U8, I8, U16, I16, U32, I32, F32, BOOL, STR, ARR, U64, I64, F64 = range(13)
+_FIXED = {U8: ("<B", 1), I8: ("<b", 1), U16: ("<H", 2), I16: ("<h", 2),
+          U32: ("<I", 4), I32: ("<i", 4), F32: ("<f", 4), BOOL: ("<?", 1),
+          U64: ("<Q", 8), I64: ("<q", 8), F64: ("<d", 8)}
 
-    PYTHONPATH="$gguf_py_dir" python3 -c "
-import json
+def read_context_length(path):
+    with open(path, "rb") as f:
+        if f.read(4) != b"GGUF":
+            raise ValueError("not a GGUF file")
+        version, = struct.unpack("<I", f.read(4))
+        if version < 2:
+            raise ValueError("unsupported GGUF version %d" % version)
+        struct.unpack("<Q", f.read(8))              # tensor count, unused here
+        kv_count, = struct.unpack("<Q", f.read(8))
+
+        def read_value(t):
+            if t in _FIXED:
+                fmt, size = _FIXED[t]
+                return struct.unpack(fmt, f.read(size))[0]
+            if t == STR:
+                n, = struct.unpack("<Q", f.read(8))
+                return f.read(n).decode("utf-8", "replace")
+            if t == ARR:
+                elem_type, = struct.unpack("<I", f.read(4))
+                n, = struct.unpack("<Q", f.read(8))
+                return [read_value(elem_type) for _ in range(n)]
+            raise ValueError("unknown GGUF value type %d" % t)
+
+        # Keys are namespaced by architecture (e.g. "qwen3.context_length"),
+        # so match on the suffix rather than guessing the arch.
+        for _ in range(kv_count):
+            n, = struct.unpack("<Q", f.read(8))
+            key = f.read(n).decode("utf-8", "replace")
+            value_type, = struct.unpack("<I", f.read(4))
+            value = read_value(value_type)
+            if key.endswith(".context_length"):
+                return int(value)
+    return None
+
 try:
-    import gguf
-    r = gguf.GGUFReader('${model_path}')
-    ctx = None
-    for k, f in r.fields.items():
-        if k.endswith('.context_length'):
-            ctx = int(f.parts[f.data[0]][0])
-            break
-    print(json.dumps({'context_length': ctx}))
-except Exception:
-    print(json.dumps({'context_length': None}))
-"
+    print(json.dumps({"context_length": read_context_length(sys.argv[1])}))
+except Exception as e:
+    sys.stderr.write("[WARN] model-context: %s: %s\n" % (type(e).__name__, e))
+    print(json.dumps({"context_length": None}))
+PYEOF
 }
 
 cmd_status() {
