@@ -37,47 +37,220 @@ $Script:ChatModeSnapshot   = $null   # ActiveMode at the time ChatPort was resol
 $Script:ThinkingEnabled    = $false  # toggled with /think, /nothink; seeded from server status on first resolve
 $Script:ThinkingSeeded     = $false
 $Script:RenderBuffer       = [System.Collections.Generic.List[string]]::new()
-$Script:PrevFrameLines     = 0
+$Script:PrevLines          = [System.Collections.Generic.List[string]]::new()   # last painted frame, for differential redraw
+$Script:FrameActive        = $false   # $false = nothing of ours is on screen; next paint anchors fresh
+$Script:FrameWidth         = 80       # usable columns, refreshed each Draw-Screen
+$Script:LastDims           = ""       # "WxH" of the last paint; a change forces a clean repaint
+
+# ── Display width (ANSI-aware) ────────────────────────────────────────────
+# Modelled on pi's TUI (packages/tui/src/utils.ts + tui-main-screen.ts).
+# The invariant that makes in-place terminal rendering work at all: one
+# buffered line must occupy exactly one physical terminal row. The moment a
+# line is allowed to soft-wrap, the renderer's row bookkeeping desyncs from
+# the real cursor — which is what made typed input spill onto the row below
+# and stop tracking the block cursor. pi enforces this by refusing to render
+# any line wider than the viewport; we enforce it by hard-wrapping ourselves.
+#
+# Width has to be measured ignoring ANSI SGR codes (every line here is full
+# of colour escapes, which occupy zero columns) and accounting for
+# double-width glyphs, since model output can contain CJK and emoji.
+
+$Script:AnsiRegex = [regex]::new('\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)')
+
+function Test-WideChar {
+    param([int]$cp)
+    return ($cp -ge 0x1100 -and $cp -le 0x115F) -or     # Hangul Jamo
+           ($cp -ge 0x2E80 -and $cp -le 0xA4CF) -or     # CJK radicals … Yi
+           ($cp -ge 0xAC00 -and $cp -le 0xD7A3) -or     # Hangul syllables
+           ($cp -ge 0xF900 -and $cp -le 0xFAFF) -or     # CJK compatibility ideographs
+           ($cp -ge 0xFE30 -and $cp -le 0xFE6F) -or     # CJK compatibility forms
+           ($cp -ge 0xFF00 -and $cp -le 0xFF60) -or     # Fullwidth forms
+           ($cp -ge 0xFFE0 -and $cp -le 0xFFE6)
+}
+
+function Get-VisibleWidth {
+    param([string]$text)
+    if ([string]::IsNullOrEmpty($text)) { return 0 }
+    $plain = $Script:AnsiRegex.Replace($text, '')
+    $w = 0
+    for ($i = 0; $i -lt $plain.Length; $i++) {
+        $ch = $plain[$i]
+        # Astral-plane code point (emoji and friends) — one grapheme, two columns
+        if ([char]::IsHighSurrogate($ch) -and $i + 1 -lt $plain.Length) { $w += 2; $i++; continue }
+        $cp = [int]$ch
+        if ($cp -lt 32 -or ($cp -ge 0x7F -and $cp -le 0x9F)) { continue }   # control chars
+        if ($cp -ge 0x0300 -and $cp -le 0x036F) { continue }                # combining marks
+        if (Test-WideChar $cp) { $w += 2 } else { $w++ }
+    }
+    return $w
+}
+
+# Hard-wraps one line to $width visible columns, re-emitting the SGR codes
+# still in effect at each break so colour survives the wrap (pi does this
+# with its AnsiCodeTracker). Escape sequences are copied through without
+# counting toward the column budget.
+function Split-ToWidth {
+    param([string]$text, [int]$width)
+
+    if ($width -lt 1) { $width = 1 }
+    if ((Get-VisibleWidth $text) -le $width) { return ,@($text) }
+
+    $rows   = [System.Collections.Generic.List[string]]::new()
+    $cur    = [System.Text.StringBuilder]::new()
+    $active = [System.Text.StringBuilder]::new()   # SGR state to replay on the next row
+    $curW   = 0
+    $i      = 0
+
+    while ($i -lt $text.Length) {
+        $m = $Script:AnsiRegex.Match($text, $i)
+        if ($m.Success -and $m.Index -eq $i) {
+            [void]$cur.Append($m.Value)
+            if ($m.Value -match '\x1b\[0?m$') { [void]$active.Clear() } else { [void]$active.Append($m.Value) }
+            $i += $m.Length
+            continue
+        }
+
+        $ch   = $text[$i]
+        $step = 1
+        if ([char]::IsHighSurrogate($ch) -and $i + 1 -lt $text.Length) {
+            $cw = 2; $step = 2
+        } else {
+            $cp = [int]$ch
+            if ($cp -lt 32 -or ($cp -ge 0x7F -and $cp -le 0x9F) -or ($cp -ge 0x0300 -and $cp -le 0x036F)) { $cw = 0 }
+            elseif (Test-WideChar $cp) { $cw = 2 }
+            else { $cw = 1 }
+        }
+
+        if ($curW + $cw -gt $width) {
+            $rows.Add($cur.ToString())
+            $cur = [System.Text.StringBuilder]::new()
+            [void]$cur.Append($active.ToString())
+            $curW = 0
+        }
+
+        [void]$cur.Append($text.Substring($i, $step))
+        $curW += $cw
+        $i += $step
+    }
+
+    $rows.Add($cur.ToString())
+    return $rows.ToArray()
+}
 
 # ── Buffered Rendering ────────────────────────────────────────────────────
 # Draw-Screen (and everything it calls) writes lines into $Script:RenderBuffer
 # via Out-Line instead of calling Write-Host directly. Render-Frame then
-# flushes the whole frame in one pass, overwriting the previous frame in
-# place (via ANSI "erase to end of line") instead of Clear-Host — Clear-Host
-# followed by a fresh repaint is what caused the visible flicker on every
-# keystroke while the palette was open. Only the main idle-redraw path uses
-# this; one-off command output (Cmd-Start, chat streaming, etc.) still uses
-# plain Write-Host and scrolls normally, unaffected.
+# repaints in place, rewriting only the rows that actually changed. Only the
+# main idle-redraw path uses this; one-off command output (Cmd-Start, chat
+# streaming, etc.) still uses plain Write-Host and scrolls normally.
 
 function Out-Line {
     param([string]$text = "")
-    # Split on embedded newlines (e.g. multi-line chat responses) so the
-    # buffer's line count always matches real terminal rows — otherwise
-    # Render-Frame would under-count how many rows a frame actually used.
+    # Split on embedded newlines (e.g. multi-line chat responses), then wrap
+    # each part to the viewport width, so one buffer entry is always exactly
+    # one physical terminal row.
     foreach ($part in ($text -split "\r?\n")) {
-        $Script:RenderBuffer.Add($part)
+        foreach ($row in (Split-ToWidth $part $Script:FrameWidth)) {
+            $Script:RenderBuffer.Add($row)
+        }
     }
 }
 
+# Call after anything has written to the terminal behind the renderer's back
+# (raw command output, chat streaming, Clear-Host) — the next paint then
+# anchors fresh instead of trying to diff against a frame that's no longer
+# where it thinks it is.
+function Reset-FrameState {
+    $Script:PrevLines.Clear()
+    $Script:FrameActive = $false
+}
+
+# [Console]::WindowWidth/Height throw "handle is invalid" when stdout isn't a
+# real console (piped, redirected, some remoting hosts). Fall back to a sane
+# default rather than taking the whole client down over a cosmetic query.
+function Get-ViewportWidth {
+    try { return [Console]::WindowWidth } catch { return 80 }
+}
+
+function Get-ViewportHeight {
+    try { return [Console]::WindowHeight } catch { return 24 }
+}
+
 function Render-Frame {
-    $top = [Console]::WindowTop
-    [Console]::SetCursorPosition(0, $top)
+    $winH    = Get-ViewportHeight
+    $maxRows = [Math]::Max($winH - 1, 4)
 
-    foreach ($line in $Script:RenderBuffer) {
-        [Console]::Out.Write($line)
-        [Console]::Out.Write("`e[K")   # erase to end of line — clears leftover chars regardless of ANSI codes in $line
-        [Console]::Out.Write("`r`n")
+    # Viewport clamp: keep the tail — status bar, input line, palette must
+    # always be on screen at an address we can reach. Older chat rows fall out
+    # of the viewport rather than pushing the input line off it, which is what
+    # let the frame outgrow the window and corrupt the cursor arithmetic.
+    $lines = $Script:RenderBuffer
+    if ($lines.Count -gt $maxRows) {
+        $lines = [System.Collections.Generic.List[string]]::new(
+            $Script:RenderBuffer.GetRange($Script:RenderBuffer.Count - $maxRows, $maxRows))
     }
 
-    # Clear any rows left over from a previous, taller frame
-    if ($Script:PrevFrameLines -gt $Script:RenderBuffer.Count) {
-        for ($i = $Script:RenderBuffer.Count; $i -lt $Script:PrevFrameLines; $i++) {
-            [Console]::Out.Write("`e[K`r`n")
+    $sb = [System.Text.StringBuilder]::new()
+    [void]$sb.Append("`e[?2026h")   # begin synchronized update — the repaint lands atomically, no tearing mid-keystroke
+    [void]$sb.Append("`e[?25l")     # keep the hardware cursor hidden while painting
+
+    if (-not $Script:FrameActive) {
+        # Nothing of ours is on screen (first paint, or raw output just
+        # scrolled the terminal). Claim the rows by printing them normally —
+        # letting the terminal scroll as needed — then anchor to that.
+        for ($i = 0; $i -lt $lines.Count; $i++) {
+            [void]$sb.Append("`r`e[2K")
+            [void]$sb.Append($lines[$i])
+            if ($i -lt $lines.Count - 1) { [void]$sb.Append("`r`n") }
         }
-        [Console]::SetCursorPosition(0, $top + $Script:RenderBuffer.Count)
+        $Script:FrameActive = $true
+    } else {
+        # Differential repaint. Cursor is parked at the start of the last row
+        # of the previous frame; all movement is relative, so it stays correct
+        # no matter how the terminal scrolled in between.
+        $prev = $Script:PrevLines
+        $row  = $prev.Count - 1     # where the cursor currently sits
+        $n    = [Math]::Max($lines.Count, $prev.Count)
+
+        for ($i = 0; $i -lt $n; $i++) {
+            $old = if ($i -lt $prev.Count)  { $prev[$i] }  else { $null }
+            $new = if ($i -lt $lines.Count) { $lines[$i] } else { "" }
+            # -ceq, not -eq: PowerShell string comparison is case-insensitive
+            # by default, which would skip repainting a row whose only change
+            # was letter case (typing "a" over "A", a model name changing case).
+            if ($old -ceq $new) { continue }
+
+            # Rows below the previous frame's last row don't exist yet — reach
+            # them by emitting newlines so the terminal allocates (and scrolls).
+            if ($i -gt $prev.Count - 1) {
+                [void]$sb.Append("`r`n" * ($i - $row))
+            } else {
+                $d = $i - $row
+                if ($d -gt 0)     { [void]$sb.Append("`e[${d}B") }
+                elseif ($d -lt 0) { [void]$sb.Append("`e[$(-$d)A") }
+            }
+            $row = $i
+
+            [void]$sb.Append("`r`e[2K")
+            [void]$sb.Append($new)
+            [void]$sb.Append("`r")
+        }
+
+        # Park the cursor on the new frame's last row so the next diff has a
+        # known origin.
+        $target = $lines.Count - 1
+        $d = $target - $row
+        if ($d -gt 0)     { [void]$sb.Append("`e[${d}B") }
+        elseif ($d -lt 0) { [void]$sb.Append("`e[$(-$d)A") }
+        [void]$sb.Append("`r")
     }
 
-    $Script:PrevFrameLines = $Script:RenderBuffer.Count
+    [void]$sb.Append("`e[?2026l")
+    [Console]::Out.Write($sb.ToString())
+    [Console]::Out.Flush()
+
+    $Script:PrevLines.Clear()
+    $Script:PrevLines.AddRange($lines)
     $Script:RenderBuffer.Clear()
 }
 
@@ -497,7 +670,7 @@ function Show-GpuRow {
 function Show-Header {
     param($status = $null)
 
-    $w = [Console]::WindowWidth
+    $w = Get-ViewportWidth
 
     # Line 1 — logo + tagline
     $logo    = "{0}LL{1}a{2}M{3}esa{4}" -f $teal, $amber, $teal, $amber, $reset
@@ -615,7 +788,7 @@ function Show-Header {
 function Show-HeaderBig {
     param($status = $null)
 
-    $w = [Console]::WindowWidth
+    $w = Get-ViewportWidth
 
     # Line 1 — logo + tagline
     $logo    = "{0}LL{1}a{2}M{3}esa{4}" -f $teal, $amber, $teal, $amber, $reset
@@ -779,7 +952,7 @@ function Show-DualInstanceRow {
 function Show-HeaderDual {
     param($status = $null)
 
-    $w = [Console]::WindowWidth
+    $w = Get-ViewportWidth
 
     $logo    = "{0}LL{1}a{2}M{3}esa{4}" -f $teal, $amber, $teal, $amber, $reset
     $tagline = "{0}local inference control plane · v0.2 · dual independent servers{1}" -f $dim, $reset
@@ -2079,7 +2252,7 @@ function Get-StatusBarThinking {
 function Show-StatusBar {
     param($status)
 
-    $w = [Console]::WindowWidth
+    $w = Get-ViewportWidth
     Out-Line ("{0}{1}{2}" -f $dim, ("─" * [Math]::Max($w - 1, 20)), $reset)
 
     $modelName = Get-StatusBarModelName $status
@@ -2097,55 +2270,119 @@ function Show-StatusBar {
 }
 
 # ── UI: Main Screen ───────────────────────────────────────────────────────
-# Everything is top-anchored — no padding to push the input to the last row.
-# Dashboard, chat scrollback, status bar, and input all flow directly one
-# after another; the palette (when open) drops down right under the input,
-# Pi Agent-style, instead of being pinned separately with dead space between.
+# Three bands, composed to exactly fill the viewport: the dashboard header is
+# pinned to the top, the status bar + input line (+ palette) are pinned to the
+# bottom, and the chat scrollback in between takes whatever rows are left,
+# showing its most recent end. Letting all three flow freely is what allowed a
+# long chat to push the input line off the bottom of the window — at which
+# point the renderer was addressing rows that weren't on screen any more.
+
+# Runs a block that emits via Out-Line and returns its lines, instead of
+# letting them land in the frame directly — lets Draw-Screen size each band
+# before deciding how to compose them.
+function Get-RenderedLines {
+    param([scriptblock]$block)
+    $saved = $Script:RenderBuffer
+    $Script:RenderBuffer = [System.Collections.Generic.List[string]]::new()
+    try {
+        & $block | Out-Null
+        # Leading comma: PowerShell unrolls a returned single-element array
+        # into a bare string, and then $band.Count blows up under StrictMode
+        # the moment a band happens to be exactly one line tall.
+        return ,$Script:RenderBuffer.ToArray()
+    } finally {
+        $Script:RenderBuffer = $saved
+    }
+}
 
 function Draw-Screen {
     param($status, [string]$inputBuffer, [bool]$paletteOpen, [string]$paletteFilter, [int]$paletteIndex)
 
     $Script:RenderBuffer.Clear()
+    # One column short of the real width: writing into the last cell makes
+    # some terminals auto-wrap and consume an extra row, which would put the
+    # row count back out of sync with what the renderer thinks it drew.
+    $Script:FrameWidth = [Math]::Max((Get-ViewportWidth) - 1, 20)
 
-    Show-ActiveHeader -status $status
-    Show-ChatHistory
-
-    if ($Script:InputHint) {
-        Out-Line ("  {0}{1}{2}" -f $amber, $Script:InputHint, $reset)
+    # A resize invalidates everything the renderer believes about the screen —
+    # the terminal reflows existing content on its own — so start clean.
+    $dims = "{0}x{1}" -f (Get-ViewportWidth), (Get-ViewportHeight)
+    if ($dims -ne $Script:LastDims) {
+        $Script:LastDims = $dims
+        Clear-Host
+        Reset-FrameState
     }
 
-    Show-StatusBar $status
+    $header = Get-RenderedLines { Show-ActiveHeader -status $status }
+    $chat   = Get-RenderedLines { Show-ChatHistory }
 
-    # Self-drawn block cursor instead of relying on the native terminal
-    # cursor — thicker, always visible regardless of terminal cursor style,
-    # and its position in the text is exact since it's just another glyph.
-    $prefix = if ($paletteOpen) { "/$paletteFilter" } else { $inputBuffer }
-    Out-Line ("  {0}›{1} {2}{3}█{4}" -f $teal, $reset, $white, $prefix, $reset)
+    $footer = Get-RenderedLines {
+        if ($Script:InputHint) {
+            Out-Line ("  {0}{1}{2}" -f $amber, $Script:InputHint, $reset)
+        }
 
-    if ($paletteOpen) {
-        $filtered = @($Script:PaletteCommands | Where-Object { $_.Name -like "*${paletteFilter}*" })
-        if ($filtered.Count -eq 0) {
-            Out-Line ("  {0}No matching commands.{1}" -f $gray, $reset)
-        } else {
-            for ($i = 0; $i -lt $filtered.Count; $i++) {
-                $c = $filtered[$i]
-                $nameCol = "{0,-16}" -f $c.Name
-                if ($i -eq $paletteIndex) {
-                    Out-Line ("  {0}→{1} {2}{3}{4}  {5}{6}{4}" -f $teal, $reset, $white, $nameCol, $reset, $gray, $c.Desc)
-                } else {
-                    Out-Line ("    {0}{1}{2}  {3}{4}{2}" -f $gray, $nameCol, $reset, $gray, $c.Desc)
+        Show-StatusBar $status
+
+        # Self-drawn block cursor instead of relying on the native terminal
+        # cursor — thicker, always visible regardless of terminal cursor style,
+        # and its position in the text is exact since it's just another glyph.
+        $prefix = if ($paletteOpen) { "/$paletteFilter" } else { $inputBuffer }
+        Out-Line ("  {0}›{1} {2}{3}█{4}" -f $teal, $reset, $white, $prefix, $reset)
+
+        if ($paletteOpen) {
+            $filtered = @($Script:PaletteCommands | Where-Object { $_.Name -like "*${paletteFilter}*" })
+            if ($filtered.Count -eq 0) {
+                Out-Line ("  {0}No matching commands.{1}" -f $gray, $reset)
+            } else {
+                for ($i = 0; $i -lt $filtered.Count; $i++) {
+                    $c = $filtered[$i]
+                    $nameCol = "{0,-16}" -f $c.Name
+                    if ($i -eq $paletteIndex) {
+                        Out-Line ("  {0}→{1} {2}{3}{4}  {5}{6}{4}" -f $teal, $reset, $white, $nameCol, $reset, $gray, $c.Desc)
+                    } else {
+                        Out-Line ("    {0}{1}{2}  {3}{4}{2}" -f $gray, $nameCol, $reset, $gray, $c.Desc)
+                    }
                 }
             }
+            $pageLabel = if ($filtered.Count -gt 0) { "({0}/{1})" -f ($paletteIndex + 1), $filtered.Count } else { "(0/0)" }
+            Out-Line ("  {0}{1}{2}" -f $gray, $pageLabel, $reset)
         }
-        $pageLabel = if ($filtered.Count -gt 0) { "({0}/{1})" -f ($paletteIndex + 1), $filtered.Count } else { "(0/0)" }
-        Out-Line ("  {0}{1}{2}" -f $gray, $pageLabel, $reset)
     }
+
+    $budget = [Math]::Max((Get-ViewportHeight) - 1, 4)
+
+    # The input line has to survive no matter how cramped things get, so the
+    # footer is allocated first, the header second, and chat gets the rest.
+    $footerRows = [Math]::Min($footer.Count, $budget)
+    if ($footerRows -lt $footer.Count) {
+        $footer = $footer[($footer.Count - $footerRows)..($footer.Count - 1)]
+    }
+
+    $headerRows = [Math]::Min($header.Count, $budget - $footerRows)
+    if ($headerRows -lt $header.Count) {
+        $header = if ($headerRows -gt 0) { $header[0..($headerRows - 1)] } else { @() }
+    }
+
+    $chatRows = $budget - $footerRows - $headerRows
+    if ($chat.Count -gt $chatRows) {
+        # Keep the tail — the newest turn is the one worth seeing.
+        $chat = if ($chatRows -gt 0) { $chat[($chat.Count - $chatRows)..($chat.Count - 1)] } else { @() }
+    }
+
+    foreach ($l in $header) { $Script:RenderBuffer.Add($l) }
+    foreach ($l in $chat)   { $Script:RenderBuffer.Add($l) }
+    foreach ($l in $footer) { $Script:RenderBuffer.Add($l) }
 
     Render-Frame
 }
 
 function Main {
     $host.UI.RawUI.WindowTitle = "LLaMesa"
+    # Render-Frame writes through [Console]::Out, which encodes with the raw
+    # console encoding rather than PowerShell's — without this the box-drawing
+    # and status glyphs (●, ›, ─, ⬡) come out as literal "?" and, worse, the
+    # byte-vs-column mismatch throws off the width accounting.
+    [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
     Read-Config
     Detect-ActiveMode
 
@@ -2251,7 +2488,7 @@ function Main {
                         # Render-Frame's row bookkeeping so the next buffered redraw
                         # doesn't leave any of it behind or miscount rows against it.
                         Clear-Host
-                        $Script:PrevFrameLines = 0
+                        Reset-FrameState
                         $lastRefresh = [DateTime]::MinValue
                     }
                 }
@@ -2274,7 +2511,7 @@ function Main {
                             # See the palette Enter handler above — clears the
                             # command's own raw output before the next buffered redraw.
                             Clear-Host
-                            $Script:PrevFrameLines = 0
+                            Reset-FrameState
                             $lastRefresh = [DateTime]::MinValue
                         } elseif (-not $Script:ServerOnline) {
                             # Skip Test-ModelLoaded here — in big/dual mode it's
@@ -2286,7 +2523,7 @@ function Main {
                             Clear-Host
                             Send-ChatMessage $text
                             Clear-Host
-                            $Script:PrevFrameLines = 0
+                            Reset-FrameState
                             $lastRefresh = [DateTime]::MinValue
                         } else {
                             $Script:InputHint = "No model loaded — press / then /start to load one."
