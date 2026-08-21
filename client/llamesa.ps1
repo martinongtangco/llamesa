@@ -27,7 +27,7 @@ $Script:LLAMESA_DIR    = Join-Path $env:USERPROFILE ".llamesa"
 $Script:CONFIG_FILE    = Join-Path $Script:LLAMESA_DIR "config.json"
 $Script:Config         = $null
 $Script:ActiveServer   = $null
-$Script:ChatHistory        = @()
+$Script:ChatHistory        = [System.Collections.Generic.List[object]]::new()   # List, not array — `+=` on an array copies the whole thing every append, which gets O(n^2) and visibly laggy over a long chat
 $Script:LastTokS           = $null   # updated after each chat response; shown in header badge
 $Script:LastStatusRefresh  = $null   # tracks when stat cards were last fetched
 $Script:GpuStatus         = $null   # parsed GPU status array from --gpu all
@@ -1010,7 +1010,11 @@ function Read-CtxArg {
         return "--ctx $ctx"
     }
 
-    Write-Host ("  {0}Context size — leave blank to use the server's configured max, or enter a smaller value.{1}" -f $gray, $reset)
+    # Couldn't read the model's real native max off its GGUF metadata (gguf-py
+    # missing/relocated, unsupported quant, etc.) — say so explicitly instead
+    # of silently falling back, since the server's configured default_context
+    # can be well below what the model actually supports.
+    Write-Host ("  {0}Couldn't detect the model's native max context — leave blank to use the server's configured default (may be lower than the model supports), or enter a value yourself.{1}" -f $amber, $reset)
     $ctx = Read-Host "Context size"
     if ($ctx) { return "--ctx $ctx" }
     return ""
@@ -1639,7 +1643,7 @@ function Show-ChatHistory {
 }
 
 function Cmd-ClearChat {
-    $Script:ChatHistory = @()
+    $Script:ChatHistory.Clear()
     Write-Host ("{0}Chat history cleared.{1}" -f $gray, $reset)
 }
 
@@ -1666,10 +1670,10 @@ function Send-ChatMessage {
     $port = $Script:ChatPort
     $hostAddr = $Script:ActiveServer.host
 
-    $Script:ChatHistory += [PSCustomObject]@{
+    $Script:ChatHistory.Add([PSCustomObject]@{
         role    = "user"
         content = $text
-    }
+    })
 
     $messages = @()
     foreach ($msg in $Script:ChatHistory) {
@@ -1705,8 +1709,11 @@ function Send-ChatMessage {
     $requestBody | Add-Member -NotePropertyName chat_template_kwargs -NotePropertyValue ([PSCustomObject]@{ enable_thinking = $Script:ThinkingEnabled })
     $body = $requestBody | ConvertTo-Json -Depth 5
 
-    $assistantContent = ""
-    $thinkingContent  = ""
+    # StringBuilder, not `+=` — a long thinking/response stream appends per
+    # token, and `+=` on a string copies the whole thing each time (O(n^2)
+    # over a long generation).
+    $assistantSb      = [System.Text.StringBuilder]::new()
+    $thinkingSb        = [System.Text.StringBuilder]::new()
     $promptToks       = 0
     $genToks          = 0
     $thinkingToks     = 0
@@ -1765,15 +1772,15 @@ function Send-ChatMessage {
 
                             if ($reasoningChunk) {
                                 $thinkingToks++
-                                $thinkingContent += $reasoningChunk
+                                [void]$thinkingSb.Append($reasoningChunk)
                                 Write-Host $reasoningChunk -NoNewline -ForegroundColor DarkGray
                             }
                             if ($contentChunk) {
-                                if (-not $assistantContent) {
+                                if ($assistantSb.Length -eq 0) {
                                     Write-Host ""
                                     Write-Host ""
                                 }
-                                $assistantContent += $contentChunk
+                                [void]$assistantSb.Append($contentChunk)
                                 Write-Host $contentChunk -NoNewline
                             }
                         }
@@ -1791,6 +1798,8 @@ function Send-ChatMessage {
         Write-Host ""
 
         $duration = [math]::Round(($streamEnd - $streamStart).TotalSeconds, 1)
+        $assistantContent = $assistantSb.ToString()
+        $thinkingContent  = $thinkingSb.ToString()
 
         # Fallback: if the server didn't send usage (stream_options not honoured), estimate
         if ($genToks -eq 0) {
@@ -1815,7 +1824,7 @@ function Send-ChatMessage {
         }
 
         # Add assistant message to history
-        $Script:ChatHistory += [PSCustomObject]@{
+        $Script:ChatHistory.Add([PSCustomObject]@{
             role         = "assistant"
             content      = $assistantContent
             thinking     = $thinkingContent
@@ -1824,7 +1833,7 @@ function Send-ChatMessage {
             gen_toks     = $genToks
             tok_s        = $tokS
             duration     = [math]::Round($duration, 1)
-        }
+        })
 
     } catch {
         Write-Host ("{0}Error: {1}{2}" -f $red, $_.Exception.Message, $reset)
@@ -2161,16 +2170,29 @@ function Main {
     try {
 
     while ($true) {
-        # Auto-refresh, cadence depends on $refreshInterval (see below)
+        # Auto-refresh, cadence depends on $refreshInterval (see below). Skip
+        # it entirely while a keystroke is already waiting — each refresh is
+        # a blocking SSH round trip, and running it mid-keystroke is what
+        # made typing feel broken (input sat queued until the SSH call
+        # returned). Deferring means we just check again next loop tick
+        # once the user pauses.
         $elapsed = ([DateTime]::Now - $lastRefresh).TotalSeconds
-        if ($elapsed -ge $refreshInterval) {
+        if ($elapsed -ge $refreshInterval -and -not [Console]::KeyAvailable) {
             try {
-                # A dead/unreachable server fails this ping fast; only pay for
-                # the second, mode-specific status round trip when it's
-                # actually reachable — avoids stacking two SSH timeouts back
-                # to back on every single refresh while offline.
-                $Script:ServerOnline = Test-ServerConnection
-                $status = if ($Script:ServerOnline) { Get-ActiveStatus } else { $null }
+                if ($Script:ServerOnline) {
+                    # Already known online — skip the extra "echo ok" ping and
+                    # let the status call itself double as the liveness check,
+                    # halving the blocking SSH round trips in the steady state.
+                    $status = Get-ActiveStatus
+                    $Script:ServerOnline = $null -ne $status
+                } else {
+                    # Coming back from offline (or first run): a dead/unreachable
+                    # server fails this ping fast; only pay for the heavier,
+                    # mode-specific status round trip once it's actually
+                    # reachable — avoids stacking two SSH timeouts back to back.
+                    $Script:ServerOnline = Test-ServerConnection
+                    $status = if ($Script:ServerOnline) { Get-ActiveStatus } else { $null }
+                }
                 $Script:ServerStatus = $status
                 $Script:LastStatusRefresh = [DateTime]::Now
             } catch {
