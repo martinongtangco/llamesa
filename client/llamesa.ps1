@@ -254,7 +254,42 @@ function Render-Frame {
     $Script:RenderBuffer.Clear()
 }
 
+# ── Diagnostics ───────────────────────────────────────────────────────────
+
+# Anything swallowed to keep the UI alive still gets recorded, so an
+# intermittent failure is diagnosable after the fact instead of just being a
+# flicker. Deliberately best-effort: logging must never itself throw.
+function Write-ClientError {
+    param([string]$context, $err)
+    try {
+        if (-not (Test-Path $Script:LLAMESA_DIR)) {
+            New-Item -ItemType Directory -Force -Path $Script:LLAMESA_DIR | Out-Null
+        }
+        $logPath = Join-Path $Script:LLAMESA_DIR "client-error.log"
+        $stamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+        $msg = if ($err) { "$($err.Exception.Message)`n$($err.ScriptStackTrace)" } else { "(no detail)" }
+        Add-Content -Path $logPath -Value "[$stamp] ${context}: $msg`n" -ErrorAction SilentlyContinue
+    } catch { }
+}
+
 # ── JSON Helpers ──────────────────────────────────────────────────────────
+
+# Set-StrictMode turns a read of a property the object doesn't have into a
+# terminating error. Server JSON is not guaranteed to carry every field —
+# a truncated response, an older server build, or a mode that simply doesn't
+# report a metric all produce objects with fields missing — so status reads
+# go through this instead of dotting straight into the object.
+function Get-Prop {
+    param($obj, [string]$name, $default = $null)
+    if ($null -eq $obj) { return $default }
+    try {
+        $p = $obj.PSObject.Properties[$name]
+        if ($null -eq $p -or $null -eq $p.Value) { return $default }
+        return $p.Value
+    } catch {
+        return $default
+    }
+}
 
 function ConvertFrom-InlineJson {
     param([string]$text)
@@ -635,12 +670,16 @@ function Show-GpuRow {
     if ($gpus -isnot [array]) { $gpus = @($gpus) }
 
     foreach ($gpu in $gpus) {
-        $gpuId          = if ($null -ne $gpu.gpu_id)           { $gpu.gpu_id }           else { 0 }
-        $gpuName        = if ($null -ne $gpu.gpu_name)          { $gpu.gpu_name }         else { "GPU${gpuId}" }
-        $vramUsedBytes  = if ($null -ne $gpu.vram_used_bytes)   { $gpu.vram_used_bytes }  else { 0 }
-        $vramTotalBytes = if ($null -ne $gpu.vram_total_bytes)  { $gpu.vram_total_bytes } else { 0 }
-        $gpuBusy        = if ($null -ne $gpu.gpu_busy_percent)  { $gpu.gpu_busy_percent } else { 0 }
-        $running        = ($gpu.running -eq $true)
+        # Get-Prop, not "if ($null -ne $gpu.x)" — testing a property that the
+        # object doesn't carry at all is itself a terminating error under
+        # StrictMode, so the guard used to throw on exactly the malformed
+        # payload it was written to defend against.
+        $gpuId          = Get-Prop $gpu 'gpu_id'           0
+        $gpuName        = Get-Prop $gpu 'gpu_name'         "GPU${gpuId}"
+        $vramUsedBytes  = Get-Prop $gpu 'vram_used_bytes'  0
+        $vramTotalBytes = Get-Prop $gpu 'vram_total_bytes' 0
+        $gpuBusy        = Get-Prop $gpu 'gpu_busy_percent' 0
+        $running        = ((Get-Prop $gpu 'running' $false) -eq $true)
 
         $vramUsedGb = [math]::Round($vramUsedBytes / 1GB, 1)
         $vramTotalGb = [math]::Round($vramTotalBytes / 1GB, 1)
@@ -695,9 +734,9 @@ function Show-Header {
     # under a generic "VRAM"/"GPU" label. So this only covers what Show-GpuRow
     # doesn't: host-level RAM and CPU. Mirrors Show-HeaderBig's card row.
     if ($status) {
-        $cpu       = [double]($status.cpu_percent)
-        $ramUsedGb = [math]::Round($status.ram_used_mb  / 1024, 1)
-        $ramTotGb  = [math]::Round($status.ram_total_mb / 1024, 1)
+        $cpu       = [double](Get-Prop $status 'cpu_percent' 0)
+        $ramUsedGb = [math]::Round([double](Get-Prop $status 'ram_used_mb'  0) / 1024, 1)
+        $ramTotGb  = [math]::Round([double](Get-Prop $status 'ram_total_mb' 0) / 1024, 1)
 
         $cpuCol = if ($cpu -gt 20)       { $red }   elseif ($cpu -gt 5)        { $amber } else { $teal }
         $ramCol = if ($ramUsedGb -gt 20) { $red }   elseif ($ramUsedGb -gt 10) { $amber } else { $teal }
@@ -717,18 +756,19 @@ function Show-Header {
         Out-Line ("  ${b}└───────────────┘${r} ${b}└───────────────┘${r}")
 
         # Model row with pill badges
-        if ($status.running) {
-            $thinkingPill = if ($status.thinking) { "${teal}[thinking on]${r}"  } else { "${gray}[thinking off]${r}" }
-            $ctxPill      = if ($status.ctx -gt 0){ "${teal}[ctx $($status.ctx)]${r}" } else { "" }
+        if (Get-Prop $status 'running' $false) {
+            $ctx          = [int](Get-Prop $status 'ctx' 0)
+            $thinkingPill = if (Get-Prop $status 'thinking' $false) { "${teal}[thinking on]${r}"  } else { "${gray}[thinking off]${r}" }
+            $ctxPill      = if ($ctx -gt 0)      { "${teal}[ctx $ctx]${r}" } else { "" }
             $toksPill     = if ($Script:LastTokS) { "${amber}[$($Script:LastTokS) tok/s]${r}" } else { "" }
             $gpuPill = ""
             if ($Script:GpuStatus -is [array]) {
-                $rg = $Script:GpuStatus | Where-Object { $_.running -eq $true } | Select-Object -First 1
-                if ($rg) { $gpuPill = "${gray}[GPU$($rg.gpu_id) $($rg.gpu_name)]${r}" }
-            } elseif ($Script:GpuStatus -and $Script:GpuStatus.running) {
-                $gpuPill = "${gray}[GPU$($Script:GpuStatus.gpu_id) $($Script:GpuStatus.gpu_name)]${r}"
+                $rg = $Script:GpuStatus | Where-Object { (Get-Prop $_ 'running' $false) -eq $true } | Select-Object -First 1
+                if ($rg) { $gpuPill = "${gray}[GPU$(Get-Prop $rg 'gpu_id' 0) $(Get-Prop $rg 'gpu_name' '')]${r}" }
+            } elseif ($Script:GpuStatus -and (Get-Prop $Script:GpuStatus 'running' $false)) {
+                $gpuPill = "${gray}[GPU$(Get-Prop $Script:GpuStatus 'gpu_id' 0) $(Get-Prop $Script:GpuStatus 'gpu_name' '')]${r}"
             }
-            Out-Line ("  ${gray}MODEL${r}  ${white}$(Get-FriendlyModelName $status.model)${r}  ${ctxPill}  ${thinkingPill}  ${toksPill}  ${gpuPill}")
+            Out-Line ("  ${gray}MODEL${r}  ${white}$(Get-FriendlyModelName (Get-Prop $status 'model' ''))${r}  ${ctxPill}  ${thinkingPill}  ${toksPill}  ${gpuPill}")
         } else {
             Out-Line ("  ${gray}MODEL  none${r}")
         }
@@ -798,26 +838,29 @@ function Show-HeaderBig {
     # Line 2 — server dot + name + host + port
     if ($Script:ActiveServerName) {
         $dot  = if ($Script:ServerOnline) { "{0}●{1}" -f $teal, $reset } else { "{0}●{1}" -f $red, $reset }
-        $port = if ($status -and $status.port) { $status.port } else { $Script:ActiveServer.port }
+        $port = Get-Prop $status 'port' $Script:ActiveServer.port
         Out-Line ("  {0} {1}{2}{3} · {4}{5}{3} · {4}{6}{3}" -f `
             $dot, $teal, $Script:ActiveServerName, $reset, $gray, $Script:ActiveServer.host, $port)
     }
 
     # Per-device mini-bars, side-by-side, sourced from status-big's devices[]
-    if ($status -and $status.devices) {
-        foreach ($dev in $status.devices) {
-            $vramUsedGb  = [math]::Round($dev.vram_used_bytes  / 1GB, 1)
-            $vramTotalGb = [math]::Round($dev.vram_total_bytes / 1GB, 1)
+    $devices = Get-Prop $status 'devices' $null
+    if ($devices) {
+        $bigRunning = Get-Prop $status 'running' $false
+        foreach ($dev in $devices) {
+            $vramUsedGb  = [math]::Round([double](Get-Prop $dev 'vram_used_bytes'  0) / 1GB, 1)
+            $vramTotalGb = [math]::Round([double](Get-Prop $dev 'vram_total_bytes' 0) / 1GB, 1)
+            $devBusy     = [double](Get-Prop $dev 'gpu_busy_percent' 0)
             $filled = if ($vramTotalGb -gt 0) { [int]([math]::Min(($vramUsedGb / $vramTotalGb) * 12, 12)) } else { 0 }
             $empty  = 12 - $filled
             $bar    = ("█" * $filled) + ("░" * $empty)
-            $barColor  = if ($status.running) { $blue } else { $gray }
-            $busyColor = if ($dev.gpu_busy_percent -gt 0) { $amber } else { $gray }
+            $barColor  = if ($bigRunning) { $blue } else { $gray }
+            $busyColor = if ($devBusy -gt 0) { $amber } else { $gray }
 
-            $devLabel = "{0}{1,-10}{2}" -f $teal, $dev.id, $reset
+            $devLabel = "{0}{1,-10}{2}" -f $teal, (Get-Prop $dev 'id' ''), $reset
             $barStr   = "{0} {1} {2}" -f $barColor, $bar, $reset
             $vramStr  = "{0,-5}/{1,-5} GB" -f $vramUsedGb, $vramTotalGb
-            $busyStr  = "{0}{1,-4}%{2}" -f $busyColor, $dev.gpu_busy_percent, $reset
+            $busyStr  = "{0}{1,-4}%{2}" -f $busyColor, $devBusy, $reset
 
             Out-Line ("  ${devLabel} ${barStr} ${vramStr}  ${busyStr}")
         }
@@ -828,9 +871,9 @@ function Show-HeaderBig {
 
     # CPU/RAM stat cards — host-level, single instance (one process spans both GPUs)
     if ($status) {
-        $cpu       = [double]($status.cpu_percent)
-        $ramUsedGb = [math]::Round($status.ram_used_mb  / 1024, 1)
-        $ramTotGb  = [math]::Round($status.ram_total_mb / 1024, 1)
+        $cpu       = [double](Get-Prop $status 'cpu_percent' 0)
+        $ramUsedGb = [math]::Round([double](Get-Prop $status 'ram_used_mb'  0) / 1024, 1)
+        $ramTotGb  = [math]::Round([double](Get-Prop $status 'ram_total_mb' 0) / 1024, 1)
 
         $cpuCol = if ($cpu -gt 20)       { $red }   elseif ($cpu -gt 5)        { $amber } else { $teal }
         $ramCol = if ($ramUsedGb -gt 20) { $red }   elseif ($ramUsedGb -gt 10) { $amber } else { $teal }
@@ -849,11 +892,12 @@ function Show-HeaderBig {
         Out-Line ("  ${b}│${r} ${ramBar}  ${b}│${r} ${b}│${r} ${cpuBar}  ${b}│${r}")
         Out-Line ("  ${b}└───────────────┘${r} ${b}└───────────────┘${r}")
 
-        if ($status.running) {
-            $thinkingPill = if ($status.thinking) { "${teal}[thinking on]${reset}" } else { "${gray}[thinking off]${reset}" }
-            $ctxPill      = if ($status.ctx -gt 0) { "${teal}[ctx $($status.ctx)]${reset}" } else { "" }
+        if (Get-Prop $status 'running' $false) {
+            $ctx          = [int](Get-Prop $status 'ctx' 0)
+            $thinkingPill = if (Get-Prop $status 'thinking' $false) { "${teal}[thinking on]${reset}" } else { "${gray}[thinking off]${reset}" }
+            $ctxPill      = if ($ctx -gt 0)       { "${teal}[ctx $ctx]${reset}" } else { "" }
             $toksPill     = if ($Script:LastTokS)  { "${amber}[$($Script:LastTokS) tok/s]${reset}" } else { "" }
-            Out-Line ("  ${gray}MODEL${reset}  ${white}$(Get-FriendlyModelName $status.model)${reset}  ${ctxPill}  ${thinkingPill}  ${toksPill}  ${gray}[vulkan · both GPUs]${reset}")
+            Out-Line ("  ${gray}MODEL${reset}  ${white}$(Get-FriendlyModelName (Get-Prop $status 'model' ''))${reset}  ${ctxPill}  ${thinkingPill}  ${toksPill}  ${gray}[vulkan · both GPUs]${reset}")
         } else {
             Out-Line ("  ${gray}MODEL  none${reset}")
         }
@@ -888,14 +932,14 @@ function Show-HeaderBig {
 function Show-DualInstanceRow {
     param($inst)
 
-    $running    = ($inst.running -eq $true)
-    $gpuId      = $inst.gpu_id
-    $cpu        = if ($null -ne $inst.cpu_percent)       { [double]$inst.cpu_percent } else { 0 }
-    $ramUsedGb  = if ($null -ne $inst.ram_used_mb)       { [math]::Round($inst.ram_used_mb  / 1024, 1) } else { 0 }
-    $ramTotGb   = if ($null -ne $inst.ram_total_mb)      { [math]::Round($inst.ram_total_mb / 1024, 1) } else { 0 }
-    $gpuBusy    = if ($null -ne $inst.gpu_busy_percent)  { [double]$inst.gpu_busy_percent } else { 0 }
-    $vramUsedGb = if ($null -ne $inst.vram_used_bytes)   { [math]::Round($inst.vram_used_bytes  / 1GB, 1) } else { 0 }
-    $vramTotGb  = if ($null -ne $inst.vram_total_bytes)  { [math]::Round($inst.vram_total_bytes / 1GB, 1) } else { 0 }
+    $running    = ((Get-Prop $inst 'running' $false) -eq $true)
+    $gpuId      = Get-Prop $inst 'gpu_id' 0
+    $cpu        = [double](Get-Prop $inst 'cpu_percent' 0)
+    $ramUsedGb  = [math]::Round([double](Get-Prop $inst 'ram_used_mb'  0) / 1024, 1)
+    $ramTotGb   = [math]::Round([double](Get-Prop $inst 'ram_total_mb' 0) / 1024, 1)
+    $gpuBusy    = [double](Get-Prop $inst 'gpu_busy_percent' 0)
+    $vramUsedGb = [math]::Round([double](Get-Prop $inst 'vram_used_bytes'  0) / 1GB, 1)
+    $vramTotGb  = [math]::Round([double](Get-Prop $inst 'vram_total_bytes' 0) / 1GB, 1)
 
     $cpuCol  = if ($cpu -gt 20)        { $red   } elseif ($cpu -gt 5)         { $amber } else { $teal }
     $ramCol  = if ($ramUsedGb -gt 20)  { $red   } elseif ($ramUsedGb -gt 10)  { $amber } else { $teal }
@@ -940,9 +984,10 @@ function Show-DualInstanceRow {
     Out-Line ("  ${b}└────────────────────┘${r} ${b}└───────────────┘${r} ${b}└───────────────┘${r} ${b}└───────────────┘${r}")
 
     if ($running) {
-        $thinkingPill = if ($inst.thinking) { "${teal}[thinking on]${r}" } else { "${gray}[thinking off]${r}" }
-        $ctxPill      = if ($inst.ctx -gt 0) { "${teal}[ctx $($inst.ctx)]${r}" } else { "" }
-        Out-Line ("  ${gray}MODEL${r}  ${white}$(Get-FriendlyModelName $inst.model)${r}  ${ctxPill}  ${thinkingPill}")
+        $ctx          = [int](Get-Prop $inst 'ctx' 0)
+        $thinkingPill = if (Get-Prop $inst 'thinking' $false) { "${teal}[thinking on]${r}" } else { "${gray}[thinking off]${r}" }
+        $ctxPill      = if ($ctx -gt 0)      { "${teal}[ctx $ctx]${r}" } else { "" }
+        Out-Line ("  ${gray}MODEL${r}  ${white}$(Get-FriendlyModelName (Get-Prop $inst 'model' ''))${r}  ${ctxPill}  ${thinkingPill}")
     } else {
         Out-Line ("  ${gray}MODEL  none${r}")
     }
@@ -2229,22 +2274,23 @@ function Get-StatusBarModelName {
     param($status)
     if (-not $status) { return "no model" }
     if ($status -is [array]) {
-        $running = @($status | Where-Object { $_.running -eq $true })
-        if ($running.Count -eq 2) { return "{0} + {1}" -f (Get-FriendlyModelName $running[0].model), (Get-FriendlyModelName $running[1].model) }
-        if ($running.Count -eq 1) { return Get-FriendlyModelName $running[0].model }
+        $running = @($status | Where-Object { (Get-Prop $_ 'running' $false) -eq $true })
+        if ($running.Count -eq 2) { return "{0} + {1}" -f (Get-FriendlyModelName (Get-Prop $running[0] 'model' '')), (Get-FriendlyModelName (Get-Prop $running[1] 'model' '')) }
+        if ($running.Count -eq 1) { return Get-FriendlyModelName (Get-Prop $running[0] 'model' '') }
         return "no model"
     }
-    if ($status.running -and $status.model) { return Get-FriendlyModelName $status.model }
+    $model = Get-Prop $status 'model' ''
+    if ((Get-Prop $status 'running' $false) -and $model) { return Get-FriendlyModelName $model }
     return "no model"
 }
 
 function Get-StatusBarThinking {
     param($status)
     if ($status -is [array]) {
-        $running = @($status | Where-Object { $_.running -eq $true })
-        if ($running.Count -gt 0) { return [bool]$running[0].thinking }
-    } elseif ($status -and $status.running) {
-        return [bool]$status.thinking
+        $running = @($status | Where-Object { (Get-Prop $_ 'running' $false) -eq $true })
+        if ($running.Count -gt 0) { return [bool](Get-Prop $running[0] 'thinking' $false) }
+    } elseif ($status -and (Get-Prop $status 'running' $false)) {
+        return [bool](Get-Prop $status 'thinking' $false)
     }
     return $Script:ThinkingEnabled
 }
@@ -2455,7 +2501,25 @@ function Main {
         }
 
         if ($needsRedraw) {
-            Draw-Screen -status $status -inputBuffer $inputBuffer -paletteOpen $paletteOpen -paletteFilter $paletteFilter -paletteIndex $paletteIndex
+            # A draw must never be able to kill the session. Under
+            # Set-StrictMode a single missing property on a status object —
+            # which happens whenever a refresh parses a truncated SSH
+            # response — throws, and with no catch here that exception
+            # unwound the whole loop and exited the client mid-keystroke,
+            # dropping the rest of what was being typed into the shell.
+            # Degrade to the offline layout and keep going instead.
+            try {
+                Draw-Screen -status $status -inputBuffer $inputBuffer -paletteOpen $paletteOpen -paletteFilter $paletteFilter -paletteIndex $paletteIndex
+            } catch {
+                Write-ClientError "draw failed" $_
+                $status = $null
+                $Script:ServerStatus = $null
+                try {
+                    Draw-Screen -status $null -inputBuffer $inputBuffer -paletteOpen $paletteOpen -paletteFilter $paletteFilter -paletteIndex $paletteIndex
+                } catch {
+                    Write-ClientError "fallback draw failed" $_
+                }
+            }
             $needsRedraw = $false
         }
 
