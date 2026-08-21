@@ -429,57 +429,44 @@ function Test-ServerConnection {
 
 # ── Status ────────────────────────────────────────────────────────────────
 
-function Get-ServerStatus {
-    $raw = Invoke-ServerCommand "status --gpu all" -raw
+# Shared parse for every status command: skip any [INFO]/[WARN] preamble the
+# server may print, then read the JSON that follows. Returns $null when the
+# output isn't parseable — which says nothing about whether the server is
+# reachable, only that this particular response was unusable.
+function ConvertFrom-ServerJson {
+    param($raw)
     if (-not $raw) { return $null }
     # PowerShell collapses a single-line SSH capture from [string[]] to a
-    # plain [string] — without this, $raw[0] below would index the first
-    # *character* of that line instead of the line itself, truncating any
-    # command whose JSON output happens to come back on exactly one line.
-    $raw = @($raw) -split "`r?`n"
-
+    # plain [string] — without this, indexing below would walk *characters*
+    # of that line instead of lines, truncating any command whose JSON comes
+    # back on exactly one line.
+    $lines = @($raw) -split "`r?`n"
     try {
-        # Find the first line starting with [ and collect from there — skips any [INFO] prefix lines
-        $jsonStartIndex = -1
-        for ($i = 0; $i -lt $raw.Count; $i++) {
-            if ($raw[$i] -match '^\s*[\[{]' -and $raw[$i] -notmatch '^\s*\[(INFO|WARN|ERROR)\]') {
-                $jsonStartIndex = $i
+        $start = -1
+        for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match '^\s*[\[{]' -and $lines[$i] -notmatch '^\s*\[(INFO|WARN|ERROR)\]') {
+                $start = $i
                 break
             }
         }
-        if ($jsonStartIndex -lt 0) { return $null }
-        $jsonText = $raw[$jsonStartIndex..($raw.Count - 1)] -join "`n"
-        $result = $jsonText | ConvertFrom-Json
-        $Script:GpuStatus = $result
-        # If result is an array, return first entry for backward compat
-        if ($result -is [array]) {
-            return $result[0]
-        }
-        return $result
+        if ($start -lt 0) { return $null }
+        return (($lines[$start..($lines.Count - 1)] -join "`n") | ConvertFrom-Json)
     } catch {
         return $null
     }
 }
 
-function Get-BigStatus {
-    $raw = Invoke-ServerCommand "status-big" -raw
-    if (-not $raw) { return $null }
-    $raw = @($raw) -split "`r?`n"   # see Get-ServerStatus — normalize a possible single-line collapse
+function Get-ServerStatus {
+    $result = ConvertFrom-ServerJson (Invoke-ServerCommand "status --gpu all" -raw)
+    if ($null -eq $result) { return $null }
+    $Script:GpuStatus = $result
+    # If result is an array, return first entry for backward compat
+    if ($result -is [array]) { return $result[0] }
+    return $result
+}
 
-    try {
-        $jsonStartIndex = -1
-        for ($i = 0; $i -lt $raw.Count; $i++) {
-            if ($raw[$i] -match '^\s*[\[{]' -and $raw[$i] -notmatch '^\s*\[(INFO|WARN|ERROR)\]') {
-                $jsonStartIndex = $i
-                break
-            }
-        }
-        if ($jsonStartIndex -lt 0) { return $null }
-        $jsonText = $raw[$jsonStartIndex..($raw.Count - 1)] -join "`n"
-        return $jsonText | ConvertFrom-Json
-    } catch {
-        return $null
-    }
+function Get-BigStatus {
+    return ConvertFrom-ServerJson (Invoke-ServerCommand "status-big" -raw)
 }
 
 function Get-ModelList {
@@ -1053,14 +1040,134 @@ function Show-ActiveHeader {
     }
 }
 
-function Get-ActiveStatus {
-    if ($Script:ActiveMode -eq "big") {
-        return Get-BigStatus
+# ── Async status polling ──────────────────────────────────────────────────
+# The idle refresh used to run its SSH round trip inline on the input loop.
+# ssh + remote bash costs a few hundred ms even on a healthy LAN, and for
+# every one of those milliseconds the loop was not reading the keyboard — so
+# typing stalled every couple of seconds, which is the "typing is broken"
+# symptom. The fetch now runs on its own runspace and the loop only ever
+# polls a handle, so keystrokes are serviced continuously.
+
+$Script:StatusRunspace = $null
+$Script:StatusPS       = $null
+$Script:StatusHandle   = $null
+$Script:StatusStarted  = $null
+$Script:StatusFailures = 0      # consecutive failed fetches; drives the offline flip
+
+function Get-StatusCommandForMode {
+    switch ($Script:ActiveMode) {
+        "big"  { return "status-big" }
+        "dual" { return "status-dual" }
+        default { return "status --gpu all" }
     }
-    if ($Script:ActiveMode -eq "dual") {
-        return Get-DualStatus
+}
+
+function Stop-StatusFetch {
+    if ($Script:StatusPS) {
+        try { $Script:StatusPS.Stop()    } catch { }
+        try { $Script:StatusPS.Dispose() } catch { }
     }
-    return Get-ServerStatus
+    $Script:StatusPS = $null
+    $Script:StatusHandle = $null
+    $Script:StatusStarted = $null
+}
+
+# Kicks off one non-blocking status fetch. The background side only shells
+# out and hands back raw text; JSON parsing stays on the main thread, where
+# it's cheap and where the existing helpers already live.
+function Start-StatusFetch {
+    if ($Script:StatusHandle) { return }          # one in flight is enough
+    if (-not $Script:ActiveServer)  { return }
+
+    if (-not $Script:StatusRunspace) {
+        $Script:StatusRunspace = [runspacefactory]::CreateRunspace()
+        $Script:StatusRunspace.Open()
+    }
+
+    $sshUser     = $Script:ActiveServer.ssh_user
+    $sshHost     = $Script:ActiveServer.host
+    $llamesaPath = $Script:ActiveServer.llamesa_path
+    $command     = Get-StatusCommandForMode
+
+    $ps = [PowerShell]::Create()
+    $ps.Runspace = $Script:StatusRunspace
+    [void]$ps.AddScript({
+        param($u, $h, $path, $cmd)
+        # ConnectTimeout bounds how long a dead host can tie up the fetch;
+        # it no longer blocks the UI either way, it just decides how soon we
+        # learn the server is gone.
+        $out = ssh -o BatchMode=yes -o ConnectTimeout=3 "$u@$h" "bash $path $cmd" 2>$null
+        return [PSCustomObject]@{ Code = $LASTEXITCODE; Output = $out }
+    }).AddArgument($sshUser).AddArgument($sshHost).AddArgument($llamesaPath).AddArgument($command) | Out-Null
+
+    $Script:StatusPS      = $ps
+    $Script:StatusStarted = [DateTime]::Now
+    try {
+        $Script:StatusHandle = $ps.BeginInvoke()
+    } catch {
+        Write-ClientError "status fetch failed to start" $_
+        Stop-StatusFetch
+    }
+}
+
+# Non-blocking. Returns $true when it consumed a completed fetch (so the
+# caller knows to redraw), $false while one is still in flight or idle.
+function Receive-StatusFetch {
+    if (-not $Script:StatusHandle) { return $false }
+
+    # A wedged ssh (unreachable host, hung session — see the known SSH quirks
+    # on this box) must not pin the poller forever.
+    if ($Script:StatusStarted -and ([DateTime]::Now - $Script:StatusStarted).TotalSeconds -gt 20) {
+        Write-ClientError "status fetch timed out after 20s" $null
+        Stop-StatusFetch
+        $Script:StatusFailures++
+        return $true
+    }
+
+    if (-not $Script:StatusHandle.IsCompleted) { return $false }
+
+    $result = $null
+    try {
+        $out = $Script:StatusPS.EndInvoke($Script:StatusHandle)
+        if ($out -and $out.Count -gt 0) { $result = $out[0] }
+    } catch {
+        Write-ClientError "status fetch failed" $_
+    }
+    Stop-StatusFetch
+
+    $code = Get-Prop $result 'Code' 1
+    $raw  = Get-Prop $result 'Output' $null
+
+    if ($code -ne 0) {
+        # Non-zero exit is a genuine connectivity/command failure.
+        $Script:StatusFailures++
+    } else {
+        $parsed = ConvertFrom-ServerJson $raw
+        if ($null -eq $parsed) {
+            # Reached the server fine, but this response wasn't parseable.
+            # That is NOT an offline signal — treating it as one is what made
+            # the indicator flap between online and offline every few seconds.
+            # Keep the previous status on screen and try again next tick.
+            Write-ClientError "status output unparseable (exit 0)" $null
+        } else {
+            $Script:StatusFailures = 0
+            if ($Script:ActiveMode -eq "single") {
+                $Script:GpuStatus = $parsed
+                $Script:ServerStatus = if ($parsed -is [array]) { $parsed[0] } else { $parsed }
+            } else {
+                $Script:ServerStatus = $parsed
+            }
+        }
+    }
+
+    # Hysteresis: one bad round trip is noise, two in a row is a real outage.
+    # Without this a single dropped packet repainted the whole header as
+    # offline and then immediately back again.
+    $Script:ServerOnline = ($Script:StatusFailures -lt 2)
+    if (-not $Script:ServerOnline) { $Script:ServerStatus = $null }
+
+    $Script:LastStatusRefresh = [DateTime]::Now
+    return $true
 }
 
 # One-time check at client startup: $Script:ActiveMode is local, in-memory state
@@ -1089,9 +1196,9 @@ function Detect-ActiveMode {
     $Script:ActiveMode = "single"
 }
 
-# $Script:GpuStatus is only kept fresh by Main's 2s loop while ActiveMode is
-# "single" — Get-ActiveStatus calls Get-BigStatus/Get-DualStatus instead in
-# those modes, which don't touch $Script:GpuStatus at all. A session that
+# $Script:GpuStatus is only kept fresh by the async poller while ActiveMode is
+# "single" — the other modes poll status-big/status-dual instead, which don't
+# carry per-GPU entries and so never touch $Script:GpuStatus. A session that
 # launches straight into (or was ever in) -big/-dual mode would otherwise
 # leave $Script:GpuStatus stale or $null, and anything computing "how many
 # GPUs does this box have" from it would wrongly see 1. GPU count is static
@@ -1143,24 +1250,7 @@ function Invoke-ServerCommandChecked {
 function Get-DualStatus {
     param([string]$gpu = "")
     $cmdStr = if ($gpu) { "status-dual --gpu $gpu" } else { "status-dual" }
-    $raw = Invoke-ServerCommand $cmdStr -raw
-    if (-not $raw) { return $null }
-    $raw = @($raw) -split "`r?`n"   # see Get-ServerStatus — normalize a possible single-line collapse
-
-    try {
-        $jsonStartIndex = -1
-        for ($i = 0; $i -lt $raw.Count; $i++) {
-            if ($raw[$i] -match '^\s*[\[{]' -and $raw[$i] -notmatch '^\s*\[(INFO|WARN|ERROR)\]') {
-                $jsonStartIndex = $i
-                break
-            }
-        }
-        if ($jsonStartIndex -lt 0) { return $null }
-        $jsonText = $raw[$jsonStartIndex..($raw.Count - 1)] -join "`n"
-        return $jsonText | ConvertFrom-Json
-    } catch {
-        return $null
-    }
+    return ConvertFrom-ServerJson (Invoke-ServerCommand $cmdStr -raw)
 }
 
 function Wait-BigLoaded {
@@ -2432,7 +2522,11 @@ function Main {
     Read-Config
     Detect-ActiveMode
 
-    $Script:ServerOnline = $false
+    # One synchronous probe before the loop starts, so the very first frame
+    # shows the real connection state instead of flashing "offline" until the
+    # first async fetch lands. Blocking is fine here — nothing is typing yet.
+    $Script:ServerOnline = Test-ServerConnection
+    $Script:StatusFailures = if ($Script:ServerOnline) { 0 } else { 2 }
     $Script:InputHint = $null
     $status = $null
     # MinValue forces an immediate status fetch on the first iteration
@@ -2453,50 +2547,27 @@ function Main {
     try {
 
     while ($true) {
-        # Auto-refresh, cadence depends on $refreshInterval (see below). Skip
-        # it entirely while a keystroke is already waiting — each refresh is
-        # a blocking SSH round trip, and running it mid-keystroke is what
-        # made typing feel broken (input sat queued until the SSH call
-        # returned). Deferring means we just check again next loop tick
-        # once the user pauses.
+        # Kick off a refresh when one is due. This only *starts* the SSH call;
+        # it returns immediately, so the loop keeps reading the keyboard for
+        # the entire time the round trip is in flight.
         $elapsed = ([DateTime]::Now - $lastRefresh).TotalSeconds
-        if ($elapsed -ge $refreshInterval -and -not [Console]::KeyAvailable) {
-            try {
-                if ($Script:ServerOnline) {
-                    # Already known online — skip the extra "echo ok" ping and
-                    # let the status call itself double as the liveness check,
-                    # halving the blocking SSH round trips in the steady state.
-                    $status = Get-ActiveStatus
-                    $Script:ServerOnline = $null -ne $status
-                } else {
-                    # Coming back from offline (or first run): a dead/unreachable
-                    # server fails this ping fast; only pay for the heavier,
-                    # mode-specific status round trip once it's actually
-                    # reachable — avoids stacking two SSH timeouts back to back.
-                    $Script:ServerOnline = Test-ServerConnection
-                    $status = if ($Script:ServerOnline) { Get-ActiveStatus } else { $null }
-                }
-                $Script:ServerStatus = $status
-                $Script:LastStatusRefresh = [DateTime]::Now
-            } catch {
-                $Script:ServerOnline = $false
-                $status = $null
-            }
+        if ($elapsed -ge $refreshInterval -and -not $Script:StatusHandle) {
+            Start-StatusFetch
+            $lastRefresh = [DateTime]::Now
+        }
 
+        # Collect a finished refresh, if there is one. Also non-blocking.
+        if (Receive-StatusFetch) {
+            $status = $Script:ServerStatus
             if ($Script:ServerOnline) {
-                $offlineStreak = 0
                 $refreshInterval = 2
             } else {
-                # Back off how often we retry while offline (capped at 15s)
-                # instead of hammering a dead connection every 2s — each
-                # attempt still blocks the UI for up to the SSH connect
-                # timeout, so this is what keeps typing/navigating responsive
-                # while the server is down.
+                # Back off while the server is down (capped at 15s) rather
+                # than reconnecting every 2s to a host that isn't answering.
                 $offlineStreak++
                 $refreshInterval = [Math]::Min(2 + ($offlineStreak * 3), 15)
             }
-
-            $lastRefresh = [DateTime]::Now
+            if ($Script:ServerOnline) { $offlineStreak = 0 }
             $needsRedraw = $true
         }
 
@@ -2524,7 +2595,11 @@ function Main {
         }
 
         if (-not [Console]::KeyAvailable) {
-            Start-Sleep -Milliseconds 50
+            # Short idle tick: nothing in this loop blocks any more, so the
+            # only thing standing between a keypress and its echo is this
+            # sleep. 15ms keeps fast typing feeling immediate while still
+            # leaving the process essentially idle.
+            Start-Sleep -Milliseconds 15
             continue
         }
 
@@ -2553,6 +2628,10 @@ function Main {
                         # doesn't leave any of it behind or miscount rows against it.
                         Clear-Host
                         Reset-FrameState
+                        # A command may have changed the active mode; drop any
+                        # fetch still in flight so its now-wrong-mode result
+                        # can't land on top of the new state.
+                        Stop-StatusFetch
                         $lastRefresh = [DateTime]::MinValue
                     }
                 }
@@ -2576,6 +2655,7 @@ function Main {
                             # command's own raw output before the next buffered redraw.
                             Clear-Host
                             Reset-FrameState
+                            Stop-StatusFetch
                             $lastRefresh = [DateTime]::MinValue
                         } elseif (-not $Script:ServerOnline) {
                             # Skip Test-ModelLoaded here — in big/dual mode it's
@@ -2588,6 +2668,7 @@ function Main {
                             Send-ChatMessage $text
                             Clear-Host
                             Reset-FrameState
+                            Stop-StatusFetch
                             $lastRefresh = [DateTime]::MinValue
                         } else {
                             $Script:InputHint = "No model loaded — press / then /start to load one."
@@ -2616,6 +2697,14 @@ function Main {
 
     } finally {
         [Console]::CursorVisible = $true
+        # Tear down the polling runspace so the process can actually exit
+        # rather than lingering on a live background thread.
+        Stop-StatusFetch
+        if ($Script:StatusRunspace) {
+            try { $Script:StatusRunspace.Close()   } catch { }
+            try { $Script:StatusRunspace.Dispose() } catch { }
+            $Script:StatusRunspace = $null
+        }
     }
 }
 
