@@ -508,15 +508,37 @@ def read_context_length(path):
                 return [read_value(elem_type) for _ in range(n)]
             raise ValueError("unknown GGUF value type %d" % t)
 
-        # Keys are namespaced by architecture (e.g. "qwen3.context_length"),
+        # Seek past a value we don't want. Worth doing rather than reading and
+        # discarding: the tokenizer keys hold arrays of the whole vocabulary,
+        # so materialising them to find a key that happens to sit after them
+        # would cost seconds and hundreds of MB for a number we already know
+        # how to skip to.
+        def skip_value(t):
+            if t in _FIXED:
+                f.seek(_FIXED[t][1], 1)
+            elif t == STR:
+                n, = struct.unpack("<Q", f.read(8))
+                f.seek(n, 1)
+            elif t == ARR:
+                elem_type, = struct.unpack("<I", f.read(4))
+                n, = struct.unpack("<Q", f.read(8))
+                if elem_type in _FIXED:
+                    f.seek(_FIXED[elem_type][1] * n, 1)     # fixed stride, one seek
+                else:
+                    for _ in range(n):
+                        skip_value(elem_type)
+            else:
+                raise ValueError("unknown GGUF value type %d" % t)
+
+        # Keys are namespaced by architecture (e.g. "qwen35.context_length"),
         # so match on the suffix rather than guessing the arch.
         for _ in range(kv_count):
             n, = struct.unpack("<Q", f.read(8))
             key = f.read(n).decode("utf-8", "replace")
             value_type, = struct.unpack("<I", f.read(4))
-            value = read_value(value_type)
             if key.endswith(".context_length"):
-                return int(value)
+                return int(read_value(value_type))
+            skip_value(value_type)
     return None
 
 try:
