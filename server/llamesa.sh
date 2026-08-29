@@ -288,6 +288,18 @@ read_vulkan_config() {
     VULKAN_GPU_LAYERS=$(jq -r '.vulkan_split.default_gpu_layers // 999' "$CONFIG_FILE")
     VULKAN_ENV=$(jq -r '(.vulkan_split.env // {}) | to_entries[] | "\(.key)=\(.value)"' "$CONFIG_FILE" 2>/dev/null || true)
     read_perf_config "vulkan_split"
+
+    # -big has roughly twice the VRAM of a single card, so its usable context
+    # ceiling is a different number from the one that fits on one GPU — a
+    # 27B's cache costs ~64MiB per 1K tokens at f16, which is 16GiB at a full
+    # 262144 window. Sharing one top-level default_context between the two
+    # means either -big is capped at what one card can hold or start/-dual
+    # defaults to something that won't fit. Optional; falls through to the
+    # top-level default_context when unset.
+    local vulkan_ctx
+    vulkan_ctx=$(jq -r '.vulkan_split.default_context // empty' "$CONFIG_FILE" 2>/dev/null || true)
+    [[ -n "$vulkan_ctx" ]] && DEFAULT_CTX="$vulkan_ctx"
+    return 0
 }
 
 # Read the dual_gpu config block for -dual commands. Populates R9700A_PORT,
