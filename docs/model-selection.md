@@ -89,8 +89,83 @@ Both resident, no reloading between them, each at full single-card speed.
 Neither `-big`'s cross-GPU split nor its Vulkan requirement applies.
 
 Note `Qwen3-Coder-Next` at ~46 GB does **not** fit a single card, so it's a
-`-big` model. `Qwen3-Coder-30B-A3B` does, and there's a `-1M` variant of it if
-you want a very long window on card B specifically.
+`-big` model. `Qwen3-Coder-30B-A3B` does — see
+[below](#the-qwen3-coder-30b-a3b-you-already-have) for what it fits.
+
+## The Qwen3-Coder-30B-A3B you already have
+
+### The "1M" is a separate repo, not a quant
+
+There are two repositories:
+
+| Repo | Native max in GGUF metadata |
+|---|---|
+| `unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF` | 262144 |
+| `unsloth/Qwen3-Coder-30B-A3B-Instruct-1M-GGUF` | 1048576 |
+
+Same weights, and every quant tier exists in both. The difference is that the
+1M repo carries the YaRN rope config in its metadata, so llama.cpp reads a 1M
+native maximum and you need no `rope_scaling` flags to use a window that large.
+Check which one is on the box:
+
+```bash
+llamesa.sh model-context --path /var/mnt/games/models/<dir>/<file>.gguf
+```
+
+262144 means the standard repo, ~1048576 means the 1M one.
+
+For any window **at or below 262144, prefer the standard repo.** The 1M repo's
+scaling is baked in, which makes it static in the same way `rope_scaling` in
+config is — it applies to short prompts too. Downloading the 1M repo to run a
+128K window costs quality for nothing.
+
+### Its context is more expensive than Qwen3.8-27B's
+
+The counterintuitive part. Qwen3-Coder-30B-A3B has 48 layers, 32 query heads
+and 4 KV heads, and **all 48 layers cache**, at head_dim 128:
+
+`2 × 4 heads × 128 dim × 2 bytes × 48 layers = 98,304 bytes` — **96 KB per
+token**, against Qwen3.8-27B's 64 KB. The smaller, faster model has the pricier
+context, because Qwen3.8-27B's gated attention only caches 16 of its 64 layers.
+
+| Context | f16 | q8_0 | q4_0 |
+|---|---|---|---|
+| 131072 | 12 GiB | 6 | 3 |
+| 262144 | 24 GiB | 12 | 6 |
+| 524288 | 48 GiB | 24 | 12 |
+| 1048576 | **96 GiB** | 48 | 24 |
+
+### What fits
+
+Weights plus a ~2 GiB buffer allowance, against ~30.5 GiB on one card and ~61
+GiB on `-big`. Totals use a **q8_0 cache**:
+
+| Quant | Weights + buffers | 131072 | 262144 | 524288 | 1048576 |
+|---|---|---|---|---|---|
+| `UD-Q4_K_XL` (17.7 GB) | ~18 GiB | ~24 | ~30 | ~42 | ~66 ✗ |
+| `Q6_K` (25.1 GB) | ~25 GiB | ~31 | ~37 | ~49 | ~73 ✗ |
+| `Q8_0` (32.5 GB) | ~32 GiB | ~38 | ~44 | **~56** | ~80 ✗ |
+
+**1048576 needs a q4_0 cache at any quant** (24 GiB, putting `Q8_0` at ~56 GiB
+and `UD-Q4_K_XL` at ~42). That's the catch: a 4-bit KV cache is the wrong
+economy for repo-scale code retrieval, which is the only reason to want 1M in
+the first place. You'd be quantising away the recall you're paying for.
+
+The good news is what this model *can* do, which the 27B can't: because the
+weights are small, **`Q8_0` is affordable** — no quantisation compromise at all
+— and still leaves room for a very large window.
+
+- **`-big`, best overall:** `Q8_0` at **524288** with a q8_0 cache, ~56 GiB.
+  Full-precision-grade weights and a half-megabyte window.
+- **`-big`, no YaRN at all:** `Q8_0` at 262144 with an **f16** cache, ~56 GiB.
+  Native window, lossless cache, no rope distortion on short prompts. This is
+  the one to run if you want zero compromises.
+- **One card (for `-dual`):** `UD-Q4_K_XL` at 262144, ~30 GiB. Tight but
+  plausible, and it makes this the card-B model in the `-dual` pairing above.
+
+Note 524288 still needs YaRN 2× on the standard repo — or the 1M repo, which
+has it baked in. That's the one case where downloading the 1M repo earns its
+keep.
 
 ## Constraints to carry over
 
