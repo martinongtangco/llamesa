@@ -99,6 +99,7 @@ read_config() {
     DEFAULT_CTX=$(jq -r '.default_context // 131072' "$CONFIG_FILE")
     DEFAULT_GPU_LAYERS=$(jq -r '.default_gpu_layers // 99' "$CONFIG_FILE")
     DEFAULT_THINKING=$(jq -r '.default_thinking // true' "$CONFIG_FILE")
+    read_perf_config
 
 
     # Backward compat: if gpus array exists, use GPU-specific port; otherwise fall back to legacy port field
@@ -205,6 +206,65 @@ read_base_config() {
     DEFAULT_CTX=$(jq -r '.default_context // 131072' "$CONFIG_FILE")
     DEFAULT_GPU_LAYERS=$(jq -r '.default_gpu_layers // 99' "$CONFIG_FILE")
     DEFAULT_THINKING=$(jq -r '.default_thinking // true' "$CONFIG_FILE")
+    read_perf_config
+}
+
+# KV-cache and attention settings, read from config. All are optional and
+# unset by default, so a config written before these keys existed produces
+# exactly the command line it produced before.
+#
+# Why they matter: generation on a dense model is memory-bandwidth bound, and
+# the KV cache is the part of the VRAM budget that grows with context. At f16
+# a 27B's cache costs roughly 64MiB per 1K tokens, so a full 131072-token
+# context is ~8GiB on top of the weights — enough to push a ~25GB Q6 off a
+# single 32GB card and into a cross-GPU split. cache_type_k/v of q8_0 roughly
+# halves that, which is usually the difference between "fits on one GPU" and
+# "needs -big". See docs/quantization.md.
+#
+# flash_attn accepts either a boolean (true emits a bare --flash-attn, for
+# older builds that take no argument) or a string (emitted as
+# --flash-attn <value>, for builds that expect on|off|auto). A quantised V
+# cache requires flash attention, so if cache_type_v is set and flash_attn
+# isn't, it defaults to "on".
+#
+# Populates CACHE_TYPE_K, CACHE_TYPE_V, FLASH_ATTN. Pass a config key name
+# (e.g. "vulkan_split") to let that block override the top-level values.
+read_perf_config() {
+    local scope="${1:-}"
+    CACHE_TYPE_K=$(jq -r '.cache_type_k // empty' "$CONFIG_FILE" 2>/dev/null || true)
+    CACHE_TYPE_V=$(jq -r '.cache_type_v // empty' "$CONFIG_FILE" 2>/dev/null || true)
+    FLASH_ATTN=$(jq -r 'if has("flash_attn") and .flash_attn != null then (.flash_attn | tostring) else empty end' "$CONFIG_FILE" 2>/dev/null || true)
+
+    if [[ -n "$scope" ]]; then
+        local override
+        override=$(jq -r --arg s "$scope" '.[$s].cache_type_k // empty' "$CONFIG_FILE" 2>/dev/null || true)
+        [[ -n "$override" ]] && CACHE_TYPE_K="$override"
+        override=$(jq -r --arg s "$scope" '.[$s].cache_type_v // empty' "$CONFIG_FILE" 2>/dev/null || true)
+        [[ -n "$override" ]] && CACHE_TYPE_V="$override"
+        override=$(jq -r --arg s "$scope" 'if (.[$s] | type) == "object" and (.[$s] | has("flash_attn")) and .[$s].flash_attn != null then (.[$s].flash_attn | tostring) else empty end' "$CONFIG_FILE" 2>/dev/null || true)
+        [[ -n "$override" ]] && FLASH_ATTN="$override"
+    fi
+
+    # A quantised V cache is only supported with flash attention on.
+    if [[ -n "$CACHE_TYPE_V" ]] && [[ -z "$FLASH_ATTN" ]]; then
+        FLASH_ATTN="on"
+    fi
+}
+
+# Emit the llama-server flags for the settings read_perf_config found, one
+# token per line, so callers can splat them into their cmd_args array. Emits
+# nothing when none of the keys are configured.
+perf_cmd_args() {
+    if [[ -n "$FLASH_ATTN" ]]; then
+        if [[ "$FLASH_ATTN" == "true" ]]; then
+            printf '%s\n' "--flash-attn"
+        elif [[ "$FLASH_ATTN" != "false" ]]; then
+            printf '%s\n%s\n' "--flash-attn" "$FLASH_ATTN"
+        fi
+    fi
+    [[ -n "$CACHE_TYPE_K" ]] && printf '%s\n%s\n' "--cache-type-k" "$CACHE_TYPE_K"
+    [[ -n "$CACHE_TYPE_V" ]] && printf '%s\n%s\n' "--cache-type-v" "$CACHE_TYPE_V"
+    return 0
 }
 
 # Read the vulkan_split config block for -big commands. Populates VULKAN_BINARY,
@@ -227,6 +287,7 @@ read_vulkan_config() {
     VULKAN_TENSOR_SPLIT=$(jq -r '(.vulkan_split.tensor_split // []) | join(",")' "$CONFIG_FILE")
     VULKAN_GPU_LAYERS=$(jq -r '.vulkan_split.default_gpu_layers // 999' "$CONFIG_FILE")
     VULKAN_ENV=$(jq -r '(.vulkan_split.env // {}) | to_entries[] | "\(.key)=\(.value)"' "$CONFIG_FILE" 2>/dev/null || true)
+    read_perf_config "vulkan_split"
 }
 
 # Read the dual_gpu config block for -dual commands. Populates R9700A_PORT,
@@ -791,6 +852,10 @@ cmd_start() {
     if [[ -n "$parallel" ]]; then
         cmd_args+=("--parallel" "$parallel")
     fi
+    local perf_arg
+    while IFS= read -r perf_arg; do
+        [[ -n "$perf_arg" ]] && cmd_args+=("$perf_arg")
+    done < <(perf_cmd_args)
 
     # Add mmproj if found
     local mmproj_file=""
@@ -1204,6 +1269,10 @@ cmd_start_big() {
         "--host" "0.0.0.0"
         "--jinja"
     )
+    local perf_arg
+    while IFS= read -r perf_arg; do
+        [[ -n "$perf_arg" ]] && cmd_args+=("$perf_arg")
+    done < <(perf_cmd_args)
 
     local mmproj_file=""
     if [[ -n "$model_dir_path" ]]; then
@@ -1548,6 +1617,10 @@ _start_dual_instance() {
         "--host" "0.0.0.0"
         "--jinja"
     )
+    local perf_arg
+    while IFS= read -r perf_arg; do
+        [[ -n "$perf_arg" ]] && cmd_args+=("$perf_arg")
+    done < <(perf_cmd_args)
 
     local mmproj_file=""
     if [[ -n "$model_dir_path" ]]; then

@@ -5,6 +5,11 @@
   "default_context": 131072,
   "default_gpu_layers": 99,
   "default_thinking": true,
+
+  "_kv_cache_note": "flash_attn/cache_type_k/cache_type_v are optional and apply to start, -dual and -big alike; omit them entirely and the command line is exactly what it was before these keys existed. A quantised KV cache roughly halves what context costs in VRAM (~64MiB -> ~32MiB per 1K tokens on a 27B), which is what keeps a ~25GB Q6 27B plus a real context inside one 32GB R9700 instead of forcing a cross-GPU -big split. flash_attn is required for cache_type_v and is assumed 'on' when you set it; use true instead of \"on\" if your llama.cpp build is old enough that --flash-attn takes no argument. Override per-backend by putting the same keys inside the vulkan_split block. See docs/quantization.md.",
+  "flash_attn": "on",
+  "cache_type_k": "q8_0",
+  "cache_type_v": "q8_0",
   "gpus": [
     {
       "id": 0,

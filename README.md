@@ -86,7 +86,7 @@ press / → /start → pick a model (or two, one per GPU) → watch it fire up �
 | **Windows** | PowerShell 7 + OpenSSH Client |
 | **Network** | SSH keys (password auth will break stats refresh) |
 
-Full setup guides: [Bazzite](docs/bazzite-setup.md) · [Windows](docs/windows-setup.md)
+Full setup guides: [Bazzite](docs/bazzite-setup.md) · [Windows](docs/windows-setup.md) · [Picking a quant](docs/quantization.md)
 
 ## Commands
 
@@ -124,9 +124,17 @@ Server config lives at `~/.llamesa/config.json` on Bazzite:
   "default_context": 131072,
   "default_gpu_layers": 99,
   "default_thinking": true,
-  "port": 1234
+  "port": 1234,
+
+  "flash_attn": "on",
+  "cache_type_k": "q8_0",
+  "cache_type_v": "q8_0"
 }
 ```
+
+The last three are optional — they quantise the KV cache, which roughly halves
+what context costs in VRAM and is usually what decides whether a model fits on
+one GPU or needs a cross-GPU split. See [docs/quantization.md](docs/quantization.md).
 
 Client config lives at `~/.llamesa/config.json` on Windows — see [config/client.example.json](config/client.example.json).
 

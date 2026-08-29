@@ -1822,11 +1822,11 @@ function Cmd-Health {
 # ── Command: /download ────────────────────────────────────────────────────
 
 function Cmd-Download {
-    $repo = Read-Host "HuggingFace repo ID (e.g., unsloth/Qwen3.6-27B-GGUF)"
+    $repo = Read-Host "HuggingFace repo ID (e.g., unsloth/Qwen3.8-27B-GGUF)"
 
     if (-not $repo) { return }
 
-    $file = Read-Host "Filename pattern (e.g., *UD-Q4_K_XL*, press Enter to list first)"
+    $file = Read-Host "Filename pattern (e.g., *UD-Q6_K_XL*, press Enter to list first)"
 
     if (-not $file) {
         # List files first
