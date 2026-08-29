@@ -234,12 +234,28 @@ read_base_config() {
 # specifically need a window larger than the model's native max, which for
 # Qwen3.8-27B is already 262144. See docs/quantization.md.
 #
+# spec_type enables speculative decoding. Qwen3.8 was trained with
+# multi-token-prediction heads and Unsloth's GGUFs carry them as blk.*.nextn.*
+# tensors, so "draft-mtp" needs no separate draft model — the head is already
+# in the file you loaded. It is opt-in: a build that supports it still ignores
+# those tensors without the flag, and a build older than llama.cpp PR #22673
+# (July 2026, b10335) ignores them even with it, silently. Reported gains run
+# +33% to +120% depending on the card. spec_draft_n_max is worth sweeping 2-4;
+# spec_draft_p_min (0.60-0.75) helps on bandwidth-limited rigs.
+#
+# batch_size / ubatch_size govern prompt processing rather than generation.
+# They matter at large windows, where prefilling the prompt dominates the wait
+# before the first token; a larger ubatch trades compute-buffer VRAM for
+# prefill throughput.
+#
 # Populates CACHE_TYPE_K, CACHE_TYPE_V, FLASH_ATTN, ROPE_SCALING, ROPE_SCALE,
-# YARN_ORIG_CTX. Pass a config key name (e.g. "vulkan_split") to let that
-# block override the top-level values.
+# YARN_ORIG_CTX, SPEC_TYPE, SPEC_DRAFT_N_MAX, SPEC_DRAFT_P_MIN, BATCH_SIZE,
+# UBATCH_SIZE. Pass a config key name (e.g. "vulkan_split") to let that block
+# override the top-level values.
 read_perf_config() {
     local scope="${1:-}" key
-    for key in cache_type_k cache_type_v flash_attn rope_scaling rope_scale yarn_orig_ctx; do
+    for key in cache_type_k cache_type_v flash_attn rope_scaling rope_scale yarn_orig_ctx \
+               spec_type spec_draft_n_max spec_draft_p_min batch_size ubatch_size; do
         local value
         value=$(jq -r --arg k "$key" 'if has($k) and .[$k] != null then (.[$k] | tostring) else empty end' "$CONFIG_FILE" 2>/dev/null || true)
         if [[ -n "$scope" ]]; then
@@ -270,6 +286,17 @@ perf_cmd_args() {
     fi
     [[ -n "$CACHE_TYPE_K" ]] && printf '%s\n%s\n' "--cache-type-k" "$CACHE_TYPE_K"
     [[ -n "$CACHE_TYPE_V" ]] && printf '%s\n%s\n' "--cache-type-v" "$CACHE_TYPE_V"
+
+    [[ -n "$BATCH_SIZE" ]] && printf '%s\n%s\n' "--batch-size" "$BATCH_SIZE"
+    [[ -n "$UBATCH_SIZE" ]] && printf '%s\n%s\n' "--ubatch-size" "$UBATCH_SIZE"
+
+    if [[ -n "$SPEC_TYPE" ]]; then
+        printf '%s\n%s\n' "--spec-type" "$SPEC_TYPE"
+        [[ -n "$SPEC_DRAFT_N_MAX" ]] && printf '%s\n%s\n' "--spec-draft-n-max" "$SPEC_DRAFT_N_MAX"
+        [[ -n "$SPEC_DRAFT_P_MIN" ]] && printf '%s\n%s\n' "--spec-draft-p-min" "$SPEC_DRAFT_P_MIN"
+    elif [[ -n "$SPEC_DRAFT_N_MAX" ]] || [[ -n "$SPEC_DRAFT_P_MIN" ]]; then
+        warn "spec_draft_* are set but spec_type is not — ignoring them. Set spec_type to \"draft-mtp\" to enable."
+    fi
 
     if [[ -n "$ROPE_SCALING" ]] && [[ "$ROPE_SCALING" != "none" ]]; then
         printf '%s\n%s\n' "--rope-scaling" "$ROPE_SCALING"
@@ -879,6 +906,13 @@ cmd_start() {
     )
     if [[ -n "$parallel" ]]; then
         cmd_args+=("--parallel" "$parallel")
+        # Speculative decoding's win comes from batching a drafted run through
+        # one forward pass; splitting the batch across slots eats it, and it is
+        # reportedly gone by --parallel 4. Serve concurrent requests or draft
+        # ahead, not both.
+        if [[ -n "$SPEC_TYPE" ]] && [[ "$parallel" != "1" ]]; then
+            warn "spec_type=${SPEC_TYPE} with --parallel ${parallel}: speculative decoding gains shrink with concurrent slots and are gone by 4. Use --parallel 1 to measure them."
+        fi
     fi
     local perf_arg
     while IFS= read -r perf_arg; do

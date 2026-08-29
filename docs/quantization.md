@@ -148,6 +148,121 @@ You don't have to pick once, either — `default_context` is only a default, and
 day-to-day speed and switching to `-big` when you actually need the full window
 is a reasonable way to live.
 
+## Going faster at a big window
+
+Ranked by what they're actually worth. The first two are the same job.
+
+### 1. MTP speculative decoding — it's already in your GGUF
+
+Qwen trained multi-token-prediction heads into Qwen3.8, and Unsloth's GGUFs
+carry them as `blk.*.nextn.*` tensors. There is **no separate draft model to
+download** — the head is in the file you already have, and llama.cpp loads and
+silently ignores it unless you ask for it:
+
+```
+--spec-type draft-mtp --spec-draft-n-max 2 --parallel 1
+```
+
+Reported gains run **+33% to +120%** depending on the card. The closest AMD
+datapoint published is a Radeon RX 9060 XT going 15.2 → 28.7 tok/s (+89%) —
+the same card this rig used to have in slot 2, which makes it a better
+predictor here than the NVIDIA numbers.
+
+It should help *more* at a long window, not less. The win is that one target
+forward pass verifies several drafted tokens at once, so the weights-plus-cache
+read amortises across every token accepted — and at 524288 that read is the
+whole cost. The counter-pressure is that a rejected draft also wastes a bigger
+read, so measure rather than assume.
+
+Four caveats:
+
+- **Needs a current llama.cpp.** `draft-mtp` landed in PR #22673 (July 2026,
+  build b10335). Older builds ignore the MTP tensors even with the flag, with
+  no error. This rig's Vulkan binary predates the entire dual-GPU git history
+  (see [dual-gpu.md](dual-gpu.md#two-backends-why-dual-is-rocm-and-big-is-vulkan)),
+  so it is certainly too old. Rebuild first.
+- **`--parallel 1`.** The gain shrinks with concurrent slots and is reportedly
+  gone by 4. `llamesa` warns if you combine them.
+- **Sweep `spec_draft_n_max` 2-4.** The sweet spot is card- and
+  topology-dependent. On bandwidth-limited rigs `spec_draft_p_min` at 0.60-0.75
+  is the other dial.
+- **Short generations can lose.** Full gain shows up around 400 output tokens;
+  below that the drafting overhead can cost more than it saves.
+
+### 2. Rebuild llama.cpp
+
+Required for MTP anyway, and worth it independently. The binary in use is older
+than this repo's dual-GPU history, which is a lot of upstream Vulkan and ROCm
+work — including long-context and flash-attention paths — left on the table.
+
+### 3. Try ROCm for `-big`
+
+Already measured on this hardware: **21.08 tok/s vs Vulkan's 20.05, and ~6s
+model load vs ~26s** ([dual-gpu.md](dual-gpu.md#rocm-vs-vulkan-speed-on-the-new-symmetric-hardware)).
+`-big` defaults to Vulkan to dodge the ROCm split-mode bug, but that bug only
+affects MoE / hybrid-recurrent architectures. **Qwen3.8-27B is dense**, so it
+doesn't apply — that doc already says ROCm is a legitimate thing to try for
+dense models. Point `vulkan_split.llama_binary` at the ROCm build and compare.
+
+### 4. Split the cache types: K at q8_0, V at q4_0
+
+K is more sensitive to quantisation than V, so quantising them asymmetrically
+buys most of the saving at a fraction of the quality cost. At 524288 that's 8 +
+4 = **12 GiB of cache instead of 16**, or ~25% less cache traffic per token —
+worth roughly 10% at a full window.
+
+```json
+"cache_type_k": "q8_0",
+"cache_type_v": "q4_0"
+```
+
+Try it before dropping both to q4_0, and watch long-range recall.
+
+### 5. Raise the ubatch for prefill
+
+At this window the wait is usually *prefill*, not generation — ingesting a huge
+prompt before the first token appears. `ubatch_size` (default 512) trades
+compute-buffer VRAM for prefill throughput, and at 524288 you have 13-20 GiB
+spare to trade:
+
+```json
+"ubatch_size": 1024
+```
+
+This does nothing for tok/s once generation starts. It's the other half of the
+latency you feel.
+
+### 6. Don't re-prefill what you already prefilled
+
+The cheapest long-context win is not paying for the prompt twice. Keep a
+conversation on one slot so its prefix stays cached, and avoid editing early
+history — a change near the top invalidates everything after it. llama.cpp also
+has prompt-cache reuse and slot save/restore options that go further; check
+what your rebuilt binary's `--help` offers, since the flags have moved around.
+
+### 7. Remember what the numbers describe
+
+The 11-13 tok/s figures are at a **full** 524288 window. Generation reads only
+the cache you've actually used, so a normal turn early in a conversation runs
+at the short-context speed in the same table. Sizing the window at 524288
+doesn't cost tok/s — filling it does.
+
+### Stacking them
+
+Starting from `Q8_0` at a full 524288 (~11.2 tok/s estimated): MTP at the
+conservative end (+33%) puts you near 15 tok/s, and the asymmetric cache adds
+roughly another 10%. The optimistic end of the MTP range would be better than
+the short-context speed you have today. All of that is estimate — the paired
+benchmark below is how you'd actually know.
+
+```bash
+# same model, same context, same prompt — change one flag between runs
+llamesa.sh logs-big    # the launch line records every flag in use
+curl -s localhost:1236/completion -d '{"prompt":"...","n_predict":400}' | jq .timings
+```
+
+`n_predict` of at least 400 matters: below that, MTP hasn't paid for itself yet.
+
 ## What about YaRN
 
 Anything past 262144 needs it, so both 524288 and 1048576 land here. The two
@@ -291,10 +406,22 @@ jq '.flash_attn = "on"
   && mv /tmp/llamesa-config.json ~/.llamesa/config.json
 ```
 
+Once you're on a llama.cpp new enough for it (see
+[Going faster](#1-mtp-speculative-decoding--its-already-in-your-gguf)), add
+speculative decoding — this is the single biggest lever here:
+
+```bash
+jq '.spec_type = "draft-mtp" | .spec_draft_n_max = 2' \
+  ~/.llamesa/config.json > /tmp/llamesa-config.json \
+  && mv /tmp/llamesa-config.json ~/.llamesa/config.json
+```
+
 All of these keys are optional. Omit them and the command line is
 byte-for-byte what it was before they existed, so this is safe to add to an
 existing config. `flash_attn`, `cache_type_k`, `cache_type_v`, `rope_scaling`,
-`rope_scale` and `yarn_orig_ctx` apply to `start`, `-dual` and `-big` alike;
+`rope_scale`, `yarn_orig_ctx`, `spec_type`, `spec_draft_n_max`,
+`spec_draft_p_min`, `batch_size` and `ubatch_size` apply to `start`, `-dual`
+and `-big` alike;
 put any of them inside `vulkan_split` to override for `-big` only, which is
 how you confine YaRN to the sessions that need it.
 `vulkan_split.default_context` overrides the top-level `default_context` the
