@@ -227,28 +227,34 @@ read_base_config() {
 # cache requires flash attention, so if cache_type_v is set and flash_attn
 # isn't, it defaults to "on".
 #
-# Populates CACHE_TYPE_K, CACHE_TYPE_V, FLASH_ATTN. Pass a config key name
-# (e.g. "vulkan_split") to let that block override the top-level values.
+# rope_scaling / rope_scale / yarn_orig_ctx push the context window past what
+# the model was trained for. llama.cpp's YaRN is *static* — the scale applies
+# to every request, not just long ones — so turning it on trades quality on
+# ordinary short prompts for reach on long ones. Leave it unset unless you
+# specifically need a window larger than the model's native max, which for
+# Qwen3.8-27B is already 262144. See docs/quantization.md.
+#
+# Populates CACHE_TYPE_K, CACHE_TYPE_V, FLASH_ATTN, ROPE_SCALING, ROPE_SCALE,
+# YARN_ORIG_CTX. Pass a config key name (e.g. "vulkan_split") to let that
+# block override the top-level values.
 read_perf_config() {
-    local scope="${1:-}"
-    CACHE_TYPE_K=$(jq -r '.cache_type_k // empty' "$CONFIG_FILE" 2>/dev/null || true)
-    CACHE_TYPE_V=$(jq -r '.cache_type_v // empty' "$CONFIG_FILE" 2>/dev/null || true)
-    FLASH_ATTN=$(jq -r 'if has("flash_attn") and .flash_attn != null then (.flash_attn | tostring) else empty end' "$CONFIG_FILE" 2>/dev/null || true)
-
-    if [[ -n "$scope" ]]; then
-        local override
-        override=$(jq -r --arg s "$scope" '.[$s].cache_type_k // empty' "$CONFIG_FILE" 2>/dev/null || true)
-        [[ -n "$override" ]] && CACHE_TYPE_K="$override"
-        override=$(jq -r --arg s "$scope" '.[$s].cache_type_v // empty' "$CONFIG_FILE" 2>/dev/null || true)
-        [[ -n "$override" ]] && CACHE_TYPE_V="$override"
-        override=$(jq -r --arg s "$scope" 'if (.[$s] | type) == "object" and (.[$s] | has("flash_attn")) and .[$s].flash_attn != null then (.[$s].flash_attn | tostring) else empty end' "$CONFIG_FILE" 2>/dev/null || true)
-        [[ -n "$override" ]] && FLASH_ATTN="$override"
-    fi
+    local scope="${1:-}" key
+    for key in cache_type_k cache_type_v flash_attn rope_scaling rope_scale yarn_orig_ctx; do
+        local value
+        value=$(jq -r --arg k "$key" 'if has($k) and .[$k] != null then (.[$k] | tostring) else empty end' "$CONFIG_FILE" 2>/dev/null || true)
+        if [[ -n "$scope" ]]; then
+            local override
+            override=$(jq -r --arg s "$scope" --arg k "$key" 'if (.[$s] | type) == "object" and (.[$s] | has($k)) and .[$s][$k] != null then (.[$s][$k] | tostring) else empty end' "$CONFIG_FILE" 2>/dev/null || true)
+            [[ -n "$override" ]] && value="$override"
+        fi
+        printf -v "${key^^}" '%s' "$value"
+    done
 
     # A quantised V cache is only supported with flash attention on.
     if [[ -n "$CACHE_TYPE_V" ]] && [[ -z "$FLASH_ATTN" ]]; then
         FLASH_ATTN="on"
     fi
+    return 0
 }
 
 # Emit the llama-server flags for the settings read_perf_config found, one
@@ -264,6 +270,16 @@ perf_cmd_args() {
     fi
     [[ -n "$CACHE_TYPE_K" ]] && printf '%s\n%s\n' "--cache-type-k" "$CACHE_TYPE_K"
     [[ -n "$CACHE_TYPE_V" ]] && printf '%s\n%s\n' "--cache-type-v" "$CACHE_TYPE_V"
+
+    if [[ -n "$ROPE_SCALING" ]] && [[ "$ROPE_SCALING" != "none" ]]; then
+        printf '%s\n%s\n' "--rope-scaling" "$ROPE_SCALING"
+        [[ -n "$ROPE_SCALE" ]] && printf '%s\n%s\n' "--rope-scale" "$ROPE_SCALE"
+        [[ -n "$YARN_ORIG_CTX" ]] && printf '%s\n%s\n' "--yarn-orig-ctx" "$YARN_ORIG_CTX"
+        # stderr, so it doesn't land in the captured argument stream
+        warn "rope_scaling=${ROPE_SCALING} is active — llama.cpp applies it statically, to short prompts as well as long ones."
+    elif [[ -n "$ROPE_SCALE" ]] || [[ -n "$YARN_ORIG_CTX" ]]; then
+        warn "rope_scale/yarn_orig_ctx are set but rope_scaling is not — ignoring them. Set rope_scaling to \"yarn\" to enable."
+    fi
     return 0
 }
 

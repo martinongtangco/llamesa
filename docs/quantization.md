@@ -114,6 +114,87 @@ You don't have to pick once, either — `default_context` is only a default, and
 day-to-day speed and switching to `-big` when you actually need the full window
 is a reasonable way to live.
 
+## What about YaRN to 1M?
+
+It fits, barely, and it's the wrong trade for a rig you're trying to make
+faster. The numbers, then the reasons.
+
+A 1048576-token window costs `1048576 × 64 KB` of cache: **64 GiB at f16, 32
+GiB at q8_0, 16 GiB at q4_0**. Against `-big`'s ~61 GiB:
+
+| Quant | Weights + buffers | + q8_0 cache @ 1M | Verdict |
+|---|---|---|---|
+| `Q6_K` | ~24.3 GiB | ~56.3 | fits, ~4.7 GiB spare |
+| `UD-Q6_K_XL` | ~26.5 GiB | ~58.5 | ~2.5 GiB spare — too thin to trust |
+| either | | + f16 cache: ~88-90 | no |
+
+So the only version of this with real margin is **`Q6_K` with a q8_0 cache** —
+the plain Q6, not the `UD` one. Note that's a straight reversal of the
+recommendation above: at 1M you no longer have the VRAM to spend on quantisation
+quality, so you spend it on cache instead.
+
+Four things to weigh before you do:
+
+**Generation gets ~3× slower at full context.** Attention reads the used cache
+on every token. At 1M filled that's 32 GiB of cache traffic on top of 21.3 GiB
+of weights — ~53 GiB per token, against ~21 GiB at short context. Against
+measured ~20-21 tok/s on `-big` today, expect roughly 7-11 tok/s with the
+window full. This started as a tok/s exercise; 1M is the most expensive thing
+you can do to tok/s.
+
+**The VRAM is spent whether you use it or not.** llama.cpp allocates the whole
+KV cache at load, so `-c 1048576` means 32 GiB gone at startup even for a
+two-line prompt.
+
+**Prefill is measured in tens of minutes.** Ingesting an actual 1M-token prompt
+is a long wait before the first token, and you pay it again on any cache miss.
+
+**Static YaRN degrades short prompts too.** llama.cpp applies the rope scale to
+every request, not just long ones — it has no idea how long your prompt is
+going to be. A 4× scale to reach 1M is in force on a "hey, fix this function"
+turn as well.
+
+That last one is fixable, and it's why the config keys are scoped: put the rope
+keys **inside `vulkan_split`**, not at the top level, and only `-big` sessions
+pay for them while `start` and `-dual` stay on the native window.
+
+```bash
+jq '.vulkan_split.default_context = 1048576
+    | .vulkan_split.rope_scaling = "yarn"
+    | .vulkan_split.rope_scale = 4
+    | .vulkan_split.yarn_orig_ctx = 262144' \
+  ~/.llamesa/config.json > /tmp/llamesa-config.json \
+  && mv /tmp/llamesa-config.json ~/.llamesa/config.json
+```
+
+`llamesa` warns on stderr whenever `rope_scaling` is active, so a session that's
+running scaled is never running scaled silently.
+
+One more thing worth knowing: Qwen ships 1M for Qwen3.8-27B only on the
+**hosted** version. The open weights are 262144 native, and pushing 4× past
+that with YaRN is unvalidated territory — expect recall at 1M to be a lot worse
+than the number suggests. Models generally degrade well before their nominal
+window, and stacking a 4× extension on a quantised cache compounds it.
+
+### A saner middle ground
+
+If you want reach beyond 262144 without any of the above being ruinous, try
+**2× to 524288** first:
+
+| Quant | + q8_0 cache @ 524288 (16 GiB) |
+|---|---|
+| `Q6_K` | ~40.3 GiB — comfortable |
+| `UD-Q6_K_XL` | ~42.5 GiB — comfortable |
+
+Half the reach, half the cache, real headroom on both cards, `UD-Q6_K_XL` stays
+viable, and a 2× rope scale distorts short prompts less than 4×. Set
+`rope_scale` to 2 and `default_context` to 524288 in the same `vulkan_split`
+block.
+
+My recommendation: stay at 262144. It's native, needs no YaRN, costs no
+short-prompt quality, and is already a very large window. Reach for 524288 if
+you hit the wall, and treat 1M as an experiment rather than a daily driver.
+
 ## Configuring it
 
 Download on the Bazzite box:
@@ -143,10 +224,12 @@ jq '.flash_attn = "on"
 
 All of these keys are optional. Omit them and the command line is
 byte-for-byte what it was before they existed, so this is safe to add to an
-existing config. `flash_attn` / `cache_type_k` / `cache_type_v` apply to
-`start`, `-dual` and `-big` alike; put the same keys inside `vulkan_split` to
-override them for `-big` only. `vulkan_split.default_context` overrides the
-top-level `default_context` for `-big` only.
+existing config. `flash_attn`, `cache_type_k`, `cache_type_v`, `rope_scaling`,
+`rope_scale` and `yarn_orig_ctx` apply to `start`, `-dual` and `-big` alike;
+put any of them inside `vulkan_split` to override for `-big` only, which is
+how you confine YaRN to the sessions that need it.
+`vulkan_split.default_context` overrides the top-level `default_context` the
+same way.
 
 `flash_attn` takes either a string (emitted as `--flash-attn <value>`, for
 builds expecting `on|off|auto`) or `true` (a bare `--flash-attn`, for older
