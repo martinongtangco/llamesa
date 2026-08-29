@@ -86,7 +86,7 @@ press / → /start → pick a model (or two, one per GPU) → watch it fire up �
 | **Windows** | PowerShell 7 + OpenSSH Client |
 | **Network** | SSH keys (password auth will break stats refresh) |
 
-Full setup guides: [Bazzite](docs/bazzite-setup.md) · [Windows](docs/windows-setup.md) · [Picking a quant](docs/quantization.md)
+Full setup guides: [Bazzite](docs/bazzite-setup.md) · [Windows](docs/windows-setup.md) · [Picking a quant](docs/quantization.md) · [Picking a model](docs/model-selection.md)
 
 ## Commands
 
