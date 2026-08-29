@@ -37,6 +37,11 @@ whole weight set, so bytes per token scale directly with quant size. Dropping
 from `UD-Q8_K_XL` (31.5 GB) to `UD-Q6_K_XL` (25.3 GB) is ~25% fewer bytes to
 move; from `Q8_0` (29.0 GB) it's ~15%. That's roughly the tok/s you get back.
 
+That gap is at its widest on short turns, though. Once a very large window is
+actually full the cache read dominates and the quants converge — see
+[the tok/s table](#what-it-costs-in-toks) before assuming Q8 is always the
+wrong call.
+
 Splitting across both R9700s doesn't buy the speed back. Under `-sm layer` the
 cards run their layers in sequence, not in parallel — each reads only its own
 half, so two identical cards land at about single-card speed plus the handoff,
@@ -69,30 +74,59 @@ that's the real ceiling, not a stretched one. Check yours directly:
 llamesa.sh model-context --path /var/mnt/games/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q6_K_XL.gguf
 ```
 
-## Max context: use `-big`
+## The whole matrix
 
 Weights plus compute buffers, then the cache on top. A 32GB R9700 gives you
-~30.5 GiB to work with in practice; both cards under `-big` give ~61 GiB.
+~30.5 GiB in practice; both cards under `-big` give ~61 GiB. Totals below
+assume a **q8_0 cache** (32 MiB per 1K tokens); double the cache portion for
+f16.
 
-Full 262144 context:
-
-| Quant | Weights + buffers | + f16 cache | + q8_0 cache | One card | `-big` |
+| Quant | Weights + buffers | 131072 | 262144 | 524288 | 1048576 |
 |---|---|---|---|---|---|
-| `Q6_K` | ~24.3 GiB | ~40.3 | ~32.3 | no | yes |
-| `UD-Q6_K_XL` | ~26.5 GiB | ~42.5 | **~34.5** | no | **yes** |
-| `Q8_0` | ~30.0 GiB | ~46.0 | ~38.0 | no | yes |
-| `UD-Q8_K_XL` | ~32.3 GiB | ~48.3 | ~40.3 | no | yes |
+| `Q6_K` | ~24.3 GiB | ~28.3 | ~32.3 | ~40.3 | ~56.3 |
+| `UD-Q6_K_XL` | ~26.6 GiB | ~30.6 | ~34.6 | ~42.6 | ~58.6 |
+| `UD-Q8_K_L` | ~29.1 GiB | ~33.1 | ~37.1 | ~45.1 | ~61.1 |
+| `Q8_0` | ~30.0 GiB | ~34.0 | ~38.0 | ~46.0 | ~62.0 |
+| `UD-Q8_K_XL` | ~32.3 GiB | ~36.3 | ~40.3 | ~48.3 | ~64.3 |
 
-Every quant fits the full window on `-big`, so the choice there is purely
-speed — which is what makes `UD-Q6_K_XL` the pick. At ~34.5 GiB of ~61 you
-have a lot of room left; f16 cache (~42.5 GiB) also fits if you'd rather not
-quantise it at all.
+Read it against two lines: **~30.5 GiB** fits one card, **~61 GiB** fits
+`-big`. Only the 131072 column has anything that fits a single GPU. Everything
+through 524288 fits `-big` with room; at 1048576 only the two Q6 rows clear it.
 
-Quantising the cache is worth it anyway at this context length, for a reason
-beyond fitting: attention reads the *used* portion of the cache on every token.
-A full f16 window means 16 GiB of cache traffic per token on top of 23.6 GiB of
-weights. At q8_0 that's 8 GiB. It costs nothing while the conversation is
-short and roughly halves the long-context penalty once it isn't.
+Anything past 262144 needs YaRN — see [below](#what-about-yarn).
+
+### What it costs in tok/s
+
+Generation is bandwidth-bound, so tok/s tracks bytes read per token: the
+weights every time, plus the *used* portion of the cache. Calibrating against
+this rig's measured 20.05 tok/s (`UD-Q6_K_XL` on `-big`, Vulkan) gives ~480
+GiB/s effective, which puts the rest at:
+
+| Quant | Short context | Full 524288 (q8_0 cache) |
+|---|---|---|
+| `Q6_K` | ~22.5 tok/s | ~12.9 |
+| `UD-Q6_K_XL` | ~20.4 tok/s | ~12.1 |
+| `UD-Q8_K_L` | ~18.4 tok/s | ~11.4 |
+| `Q8_0` | ~17.8 tok/s | ~11.2 |
+| `UD-Q8_K_XL` | ~16.4 tok/s | ~10.6 |
+
+Two things fall out of that. First, the quant gap is widest when the cache is
+empty — `Q8_0` is ~15% behind `UD-Q6_K_XL` on a short turn, but only ~9%
+behind once a 524288 window is actually full, because by then the cache is the
+larger read. **If you genuinely work at enormous context most of the time, the
+quant matters less.** If your turns are mostly short, which is typical, you pay
+the full gap constantly.
+
+Second, everything converges to 11-13 tok/s at a full 524288 window regardless
+of quant. Context length dominates quant choice for speed, so pick the window
+you'll actually use rather than the largest one that fits.
+
+### Why quantise the cache
+
+Beyond fitting: attention reads the used cache on every token. A full 262144
+window is 16 GiB of cache traffic per token at f16 and 8 GiB at q8_0. It costs
+nothing while the conversation is short, and roughly halves the long-context
+penalty once it isn't.
 
 ### If you'd rather stay on one GPU
 
@@ -114,10 +148,36 @@ You don't have to pick once, either — `default_context` is only a default, and
 day-to-day speed and switching to `-big` when you actually need the full window
 is a reasonable way to live.
 
-## What about YaRN to 1M?
+## What about YaRN
 
-It fits, barely, and it's the wrong trade for a rig you're trying to make
-faster. The numbers, then the reasons.
+Anything past 262144 needs it, so both 524288 and 1048576 land here. The two
+are very different propositions.
+
+### 524288 (2×) — comfortable, and Q8 survives it
+
+Every quant fits, with 12-20 GiB to spare on `-big`:
+
+| Quant | + q8_0 cache @ 524288 (16 GiB) | Spare of ~61 GiB |
+|---|---|---|
+| `Q6_K` | ~40.3 GiB | ~20.7 |
+| `UD-Q6_K_XL` | ~42.6 GiB | ~18.4 |
+| `UD-Q8_K_L` | ~45.1 GiB | ~15.9 |
+| `Q8_0` | ~46.0 GiB | ~15.0 |
+| `UD-Q8_K_XL` | ~48.3 GiB | ~12.7 |
+
+So keeping a Q8 *and* doubling the window is a real option — this is the one
+place the Q8-vs-Q6 argument softens. At a full 524288 window `Q8_0` is only
+~9% behind `UD-Q6_K_XL` rather than ~15%, because the 16 GiB cache read
+dominates the weight difference (see [the tok/s table](#what-it-costs-in-toks)).
+An f16 cache does not fit at this window for any Q8 — `Q8_0` + f16 is ~62 GiB,
+just over — so q8_0 cache is mandatory here.
+
+The catch is that the ~15% gap is still there on every *short* turn, which is
+most turns, and you're paying the static-YaRN short-prompt tax on top. Q8 at
+524288 makes sense if you genuinely live at long context; if your turns are
+mixed, Q6 at 524288 gives you the same window and is faster at both ends.
+
+### 1048576 (4×) — fits, barely, and costs a lot
 
 A 1048576-token window costs `1048576 × 64 KB` of cache: **64 GiB at f16, 32
 GiB at q8_0, 16 GiB at q4_0**. Against `-big`'s ~61 GiB:
@@ -167,6 +227,17 @@ jq '.vulkan_split.default_context = 1048576
   && mv /tmp/llamesa-config.json ~/.llamesa/config.json
 ```
 
+For 2× to 524288, the same block with `rope_scale` at 2:
+
+```bash
+jq '.vulkan_split.default_context = 524288
+    | .vulkan_split.rope_scaling = "yarn"
+    | .vulkan_split.rope_scale = 2
+    | .vulkan_split.yarn_orig_ctx = 262144' \
+  ~/.llamesa/config.json > /tmp/llamesa-config.json \
+  && mv /tmp/llamesa-config.json ~/.llamesa/config.json
+```
+
 `llamesa` warns on stderr whenever `rope_scaling` is active, so a session that's
 running scaled is never running scaled silently.
 
@@ -176,24 +247,22 @@ that with YaRN is unvalidated territory — expect recall at 1M to be a lot wors
 than the number suggests. Models generally degrade well before their nominal
 window, and stacking a 4× extension on a quantised cache compounds it.
 
-### A saner middle ground
+### Picking between them
 
-If you want reach beyond 262144 without any of the above being ruinous, try
-**2× to 524288** first:
+| | 262144 | 524288 | 1048576 |
+|---|---|---|---|
+| YaRN | none | 2× | 4× |
+| q8_0 cache | 8 GiB | 16 GiB | 32 GiB |
+| Quants that fit `-big` | all | all | Q6 only |
+| f16 cache an option? | yes, all quants | Q6 only | no |
+| tok/s, window full | ~14-15 | ~11-13 | ~7-9 |
+| Short-prompt quality | untouched | 2× rope tax | 4× rope tax |
 
-| Quant | + q8_0 cache @ 524288 (16 GiB) |
-|---|---|
-| `Q6_K` | ~40.3 GiB — comfortable |
-| `UD-Q6_K_XL` | ~42.5 GiB — comfortable |
-
-Half the reach, half the cache, real headroom on both cards, `UD-Q6_K_XL` stays
-viable, and a 2× rope scale distorts short prompts less than 4×. Set
-`rope_scale` to 2 and `default_context` to 524288 in the same `vulkan_split`
-block.
-
-My recommendation: stay at 262144. It's native, needs no YaRN, costs no
-short-prompt quality, and is already a very large window. Reach for 524288 if
-you hit the wall, and treat 1M as an experiment rather than a daily driver.
+**262144 is the default worth keeping.** It's native, needs no YaRN, costs no
+short-prompt quality, leaves f16 cache on the table, and is already a very
+large window. Take **524288** if you actually hit that wall — it's the one
+extension that stays comfortable, and it's where a Q8 remains defensible.
+Treat **1048576** as an experiment rather than a daily driver.
 
 ## Configuring it
 
