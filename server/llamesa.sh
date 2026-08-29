@@ -248,14 +248,21 @@ read_base_config() {
 # before the first token; a larger ubatch trades compute-buffer VRAM for
 # prefill throughput.
 #
+# parallel sets llama-server's concurrent request slots. It is read here but
+# deliberately not emitted by perf_cmd_args, because v1's start already passes
+# --parallel from its own CLI flag and would otherwise pass it twice; the
+# start paths apply it themselves. It matters mainly with spec_type: a build
+# that defaults to 4 slots will make speculative decoding measure as though it
+# did nothing at all.
+#
 # Populates CACHE_TYPE_K, CACHE_TYPE_V, FLASH_ATTN, ROPE_SCALING, ROPE_SCALE,
 # YARN_ORIG_CTX, SPEC_TYPE, SPEC_DRAFT_N_MAX, SPEC_DRAFT_P_MIN, BATCH_SIZE,
-# UBATCH_SIZE. Pass a config key name (e.g. "vulkan_split") to let that block
-# override the top-level values.
+# UBATCH_SIZE, PARALLEL. Pass a config key name (e.g. "vulkan_split") to let
+# that block override the top-level values.
 read_perf_config() {
     local scope="${1:-}" key
     for key in cache_type_k cache_type_v flash_attn rope_scaling rope_scale yarn_orig_ctx \
-               spec_type spec_draft_n_max spec_draft_p_min batch_size ubatch_size; do
+               spec_type spec_draft_n_max spec_draft_p_min batch_size ubatch_size parallel; do
         local value
         value=$(jq -r --arg k "$key" 'if has($k) and .[$k] != null then (.[$k] | tostring) else empty end' "$CONFIG_FILE" 2>/dev/null || true)
         if [[ -n "$scope" ]]; then
@@ -413,6 +420,45 @@ run_in_container() {
     local cmd="$1"
     ensure_container_running >/dev/null
     distrobox enter -T "$CONTAINER" -- bash -c "$cmd"
+}
+
+# Resolve the container's id without a pipe.
+#
+# `podman ps ... | head -1` is unsafe here: head exits after one line, and if
+# podman is still writing it takes SIGPIPE. Under `set -o pipefail` that makes
+# the whole pipeline non-zero, and under `set -e` the assignment it feeds is
+# fatal — which is how a stop could abort the script after announcing it was
+# stopping but before anything got started again. It is a race, so it only
+# bites sometimes. Read the whole output, then take the first line in-shell.
+_container_id() {
+    local ids
+    ids=$(podman ps --filter "name=^${CONTAINER}$" --format "{{.ID}}" 2>/dev/null) || ids=""
+    printf '%s' "${ids%%$'\n'*}"
+}
+
+# Stop whatever llama-server is listening on a port inside the container.
+#
+# Two hazards, both of which have bitten:
+#
+#   - `pkill -f` matches whole command lines, and distrobox shares the host PID
+#     namespace, so a plain "llama-server.*--port N" pattern can match the very
+#     `podman exec ... pkill ...` chain issuing it and kill its own caller. The
+#     bracket in "[l]lama-server" is the usual defence: it matches a literal
+#     "llama-server" while the pattern's own text does not contain that string.
+#
+#   - a `podman exec` that returns non-zero (its shell killed, the container
+#     gone) is fatal under `set -e`. The `|| true` therefore sits outside the
+#     exec, not only inside the shell it runs — the inner one cannot help if
+#     the exec itself is what failed.
+_kill_llama_on_port() {
+    local port="$1" cid
+    cid=$(_container_id)
+    [[ -z "$cid" ]] || {
+        podman exec "$cid" bash -c "pkill -f -- '[l]lama-server.*--port ${port}' 2>/dev/null || true" 2>/dev/null || true
+        sleep 2
+        podman exec "$cid" bash -c "pkill -9 -f -- '[l]lama-server.*--port ${port}' 2>/dev/null || true" 2>/dev/null || true
+    }
+    return 0
 }
 
 # Launch a detached daemon inside the container via podman exec -d
@@ -1043,18 +1089,11 @@ _do_stop() {
     fi
 
     info "Stopping llama-server on GPU ${_d_id} inside container '${CONTAINER}'..."
-    local container_id
-    container_id=$(podman ps --filter "name=^${CONTAINER}$" --format "{{.ID}}" 2>/dev/null | head -1)
-
-    if [[ -n "$container_id" ]]; then
-        get_gpu_config "$_d_id"
-        local _d_port
-        _d_port=$(gpu_port)
-        # Kill only the instance on this GPU's port
-        podman exec "$container_id" bash -c "pkill -f 'llama-server.*--port ${_d_port}' 2>/dev/null || true"
-        sleep 2
-        podman exec "$container_id" bash -c "pkill -9 -f 'llama-server.*--port ${_d_port}' 2>/dev/null || true"
-    fi
+    get_gpu_config "$_d_id"
+    local _d_port
+    _d_port=$(gpu_port)
+    # Kill only the instance on this GPU's port
+    _kill_llama_on_port "$_d_port"
 
     rm -f "$_d_pid_file"
     info "GPU ${_d_id}: Server stopped."
@@ -1264,12 +1303,18 @@ cmd_start_big() {
     local model_name=""
     local thinking="$DEFAULT_THINKING"
     local ctx="$DEFAULT_CTX"
+    local parallel="${PARALLEL:-}"
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --model) model_name="$2"; shift 2 ;;
             --thinking) thinking="$2"; shift 2 ;;
             --ctx) ctx="$2"; shift 2 ;;
+            --parallel) parallel="$2"
+                        if ! [[ "$parallel" =~ ^[1-9][0-9]*$ ]]; then
+                            error "--parallel must be a positive integer"
+                        fi
+                        shift 2 ;;
             *) error "Unknown option: $1" ;;
         esac
     done
@@ -1331,6 +1376,18 @@ cmd_start_big() {
         "--host" "0.0.0.0"
         "--jinja"
     )
+    if [[ -n "$parallel" ]]; then
+        cmd_args+=("--parallel" "$parallel")
+        # Speculative decoding batches a drafted run through one forward pass;
+        # splitting that batch across slots eats the win, and it is reportedly
+        # gone by 4. Left unset, a recent llama.cpp defaults to 4 slots, so
+        # measuring MTP without pinning this reads as "it did nothing".
+        if [[ -n "$SPEC_TYPE" ]] && [[ "$parallel" != "1" ]]; then
+            warn "spec_type=${SPEC_TYPE} with --parallel ${parallel}: speculative decoding gains shrink with concurrent slots and are gone by 4. Use --parallel 1 to measure them."
+        fi
+    elif [[ -n "$SPEC_TYPE" ]]; then
+        warn "spec_type=${SPEC_TYPE} with no parallel set: this build may default to 4 slots, which hides the speculative-decoding gain. Set \"parallel\": 1 in config."
+    fi
     local perf_arg
     while IFS= read -r perf_arg; do
         [[ -n "$perf_arg" ]] && cmd_args+=("$perf_arg")
@@ -1414,14 +1471,7 @@ cmd_stop_big() {
     fi
 
     info "Stopping Vulkan llama-server inside container '${CONTAINER}'..."
-    local container_id
-    container_id=$(podman ps --filter "name=^${CONTAINER}$" --format "{{.ID}}" 2>/dev/null | head -1)
-
-    if [[ -n "$container_id" ]]; then
-        podman exec "$container_id" bash -c "pkill -f 'llama-server.*--port ${VULKAN_PORT}' 2>/dev/null || true"
-        sleep 2
-        podman exec "$container_id" bash -c "pkill -9 -f 'llama-server.*--port ${VULKAN_PORT}' 2>/dev/null || true"
-    fi
+    _kill_llama_on_port "$VULKAN_PORT"
 
     rm -f "$BIG_PID_FILE"
     info "Vulkan combined-VRAM server stopped."
@@ -1755,14 +1805,7 @@ _stop_dual_instance() {
     fi
 
     info "[${gpu_key}] Stopping llama-server inside container '${CONTAINER}'..."
-    local container_id
-    container_id=$(podman ps --filter "name=^${CONTAINER}$" --format "{{.ID}}" 2>/dev/null | head -1)
-
-    if [[ -n "$container_id" ]]; then
-        podman exec "$container_id" bash -c "pkill -f 'llama-server.*--port ${port}' 2>/dev/null || true"
-        sleep 2
-        podman exec "$container_id" bash -c "pkill -9 -f 'llama-server.*--port ${port}' 2>/dev/null || true"
-    fi
+    _kill_llama_on_port "$port"
 
     rm -f "$pid_file"
     info "[${gpu_key}] Server stopped."
@@ -2132,6 +2175,9 @@ Commands:
     --thinking <bool>   Enable thinking mode (default: ${DEFAULT_THINKING:-true})
     --ctx <n>           Context size (default: ${DEFAULT_CTX:-131072})
   stop-big    Stop the Vulkan combined-VRAM server
+    --parallel <n>      Concurrent request slots (default: llama.cpp's own, often 4).
+                        Pin to 1 when measuring spec_type/MTP.
+
   restart-big Restart the Vulkan combined-VRAM server
     --model <name>      Model name (required — not remembered between restarts)
     --thinking <bool>   Enable thinking mode (default: ${DEFAULT_THINKING:-true})
