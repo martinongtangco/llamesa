@@ -65,7 +65,7 @@
       "max_num_seqs": 8,
       "kv_cache_dtype": "fp8",
       "speculative": true,
-      "extra_args": [],
+      "extra_args": ["--gpu-headroom-mib", "1024"],
       "instances": {
         "r9700a": { "gpu": 0, "port": 1234 },
         "r9700b": { "gpu": 1, "port": 1235 }

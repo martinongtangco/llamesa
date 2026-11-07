@@ -515,6 +515,7 @@ What to know before using it (details and benchmarks in `docs/radiance-evaluatio
   #415), so `-rad` refuses other values.
 - `start-rad` refuses to start if free RAM is below about 12 GiB per instance plus 4 GiB.
 - `radiance.speculative: false` passes `--num-speculative-tokens 0`.
+- Radiance reserves nearly all VRAM on its GPU at start (weights plus a KV cache sized to fill the card), leaving only 96 MiB unclaimed by default. The example config adds `--gpu-headroom-mib 1024` through `radiance.extra_args` so the GPU keeps about 1 GiB free for kernel first-launch needs and the desktop, at the cost of roughly 1 GiB less KV cache.
 - Client: `/engine` switches which running engine the client follows, and `/stop`, `/restart`,
   `/health`, `/logs`, `/models` follow the `rad` mode.
 - Rollback: `stop-rad`, then remove the `radiance` block and the models directory. Nothing else
