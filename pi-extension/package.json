@@ -1,0 +1,7 @@
+{
+  "name": "llamesa-pi",
+  "version": "0.1.0",
+  "pi": {
+    "extensions": ["./index.ts"]
+  }
+}
