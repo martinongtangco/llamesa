@@ -1,14 +1,6 @@
-import { pathToFileURL } from "node:url";
+import { createJiti } from "jiti";
 
-const JITI_PATH = "C:/Users/Admin/AppData/Roaming/npm/node_modules/@earendil-works/pi-coding-agent/node_modules/jiti/lib/jiti.mjs";
-const { createJiti } = await import(pathToFileURL(JITI_PATH).href);
-
-const jiti = createJiti(import.meta.url, {
-  interopDefault: true,
-  alias: {
-    "@earendil-works/pi-tui": "C:/Users/Admin/AppData/Roaming/npm/node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-tui",
-  },
-});
+const jiti = createJiti(import.meta.url, { interopDefault: true });
 
 const commands = new Map();
 const events = new Map();
@@ -17,7 +9,7 @@ const pi = {
   registerCommand: (name, opts) => commands.set(name, opts),
 };
 
-const mod = jiti(pathToFileURL("C:/Development/llamesa/pi-extension/index.ts").href);
+const mod = jiti(new URL("./index.ts", import.meta.url).href);
 const factory = mod.default ?? mod;
 factory(pi);
 
