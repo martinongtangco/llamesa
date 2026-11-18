@@ -1,0 +1,3 @@
+# SC2001: sed 's/^/export /' prefixes every line of a multi-line string;
+# a ${var//...} rewrite would be less readable.
+disable=SC2001
