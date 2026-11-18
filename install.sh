@@ -55,6 +55,7 @@ info "Detecting environment..."
 
 # Check for Bazzite (or fallback to any Fedora-based system)
 if [[ -f /etc/os-release ]]; then
+    # shellcheck source=/dev/null
     . /etc/os-release
     os_name="$NAME"
     info "OS: ${os_name}"
@@ -125,7 +126,7 @@ fi
 # Validate container exists
 if ! distrobox list 2>/dev/null | tail -n +2 | awk -F'|' '{gsub(/^ +| +$/, "", $2); print $2}' | grep -q "^${container}$"; then
     warn "Container '${container}' not found in distrobox list. It may still exist."
-    read -p "Continue anyway? (y/N): " confirm
+    read -r -p "Continue anyway? (y/N): " confirm
     if [[ "$confirm" != "y" ]] && [[ "$confirm" != "Y" ]]; then
         error "Aborted."
     fi
@@ -187,9 +188,13 @@ models_dir=$(prompt "Where are your models stored?" "/var/mnt/games/models")
 
 if [[ ! -d "$models_dir" ]]; then
     warn "Models directory does not exist yet: ${models_dir}"
-    read -p "Create it? (Y/n): " create_dir
+    read -r -p "Create it? (Y/n): " create_dir
     if [[ "$create_dir" != "n" ]] && [[ "$create_dir" != "N" ]]; then
-        mkdir -p "$models_dir" 2>/dev/null && success "Created ${models_dir}" || warn "Could not create directory"
+        if mkdir -p "$models_dir" 2>/dev/null; then
+            success "Created ${models_dir}"
+        else
+            warn "Could not create directory"
+        fi
     fi
 else
     # Count models
@@ -310,12 +315,15 @@ fi
 # ── Shell Integration (optional) ─────────────────────────────────────────
 
 echo ""
-read -p "Add llamesa to PATH in ~/.bashrc? (Y/n): " add_path
+read -r -p "Add llamesa to PATH in ~/.bashrc? (Y/n): " add_path
 if [[ "$add_path" != "n" ]] && [[ "$add_path" != "N" ]]; then
     if ! grep -q ".llamesa" "${HOME}/.bashrc" 2>/dev/null; then
-        echo "" >> "${HOME}/.bashrc"
-        echo "# LLaMesa" >> "${HOME}/.bashrc"
-        echo 'export PATH="$HOME/.llamesa:$PATH"' >> "${HOME}/.bashrc"
+        {
+            echo ""
+            echo "# LLaMesa"
+            # shellcheck disable=SC2016  # $HOME/$PATH must stay literal in .bashrc
+            echo 'export PATH="$HOME/.llamesa:$PATH"'
+        } >> "${HOME}/.bashrc"
         success "Added to ~/.bashrc"
     else
         info "Already in ~/.bashrc"

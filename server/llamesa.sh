@@ -1071,7 +1071,7 @@ for i, f in enumerate(sorted(gguf_files)):
 
         echo "$files"
         echo ""
-        read -p "Enter file number (0 to cancel): " choice
+        read -r -p "Enter file number (0 to cancel): " choice
 
         if [[ "$choice" == "0" ]]; then
             info "Download cancelled."
@@ -1107,7 +1107,7 @@ for f in mmprojs:
         if [[ -n "$mmproj_files" ]]; then
             echo "Found mmproj files:"
             echo "$mmproj_files"
-            read -p "Download mmproj? (y/N): " download_mmproj
+            read -r -p "Download mmproj? (y/N): " download_mmproj
             if [[ "$download_mmproj" == "y" ]] || [[ "$download_mmproj" == "Y" ]]; then
                 local mmproj_file
                 mmproj_file=$(echo "$mmproj_files" | head -1)
