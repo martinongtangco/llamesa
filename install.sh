@@ -14,7 +14,6 @@ BOLD='\033[1m'
 RESET='\033[0m'
 
 check_mark="✓"
-cross_mark="✗"
 warn_mark="⚠"
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -139,14 +138,7 @@ echo ""
 
 info "Locating llama-server binary inside ${container}..."
 
-# Try common locations
 llama_binary=""
-common_paths=(
-    "/run/host/home/*/llama.cpp/build/bin/llama-server"
-    "/home/*/llama.cpp/build/bin/llama-server"
-    "/opt/llama.cpp/build/bin/llama-server"
-    "/usr/local/bin/llama-server"
-)
 
 # First try to find it automatically
 auto_detected=$(distrobox enter "$container" -- bash -c "
