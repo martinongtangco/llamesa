@@ -208,7 +208,7 @@ read_base_config() {
 }
 
 # Read the vulkan_split config block for -big commands. Populates VULKAN_BINARY,
-# VULKAN_PORT, VULKAN_SPLIT_MODE, VULKAN_TENSOR_SPLIT, VULKAN_GPU_LAYERS, VULKAN_ENV.
+# VULKAN_PORT, VULKAN_SPLIT_MODE, VULKAN_TENSOR_SPLIT, VULKAN_ENV.
 # Fails fast if the block is missing — -big never falls back to defaults.
 read_vulkan_config() {
     check_config
@@ -225,7 +225,6 @@ read_vulkan_config() {
     VULKAN_PORT=$(jq -r '.vulkan_split.port // 1236' "$CONFIG_FILE")
     VULKAN_SPLIT_MODE=$(jq -r '.vulkan_split.split_mode // "layer"' "$CONFIG_FILE")
     VULKAN_TENSOR_SPLIT=$(jq -r '(.vulkan_split.tensor_split // []) | join(",")' "$CONFIG_FILE")
-    VULKAN_GPU_LAYERS=$(jq -r '.vulkan_split.default_gpu_layers // 999' "$CONFIG_FILE")
     VULKAN_ENV=$(jq -r '(.vulkan_split.env // {}) | to_entries[] | "\(.key)=\(.value)"' "$CONFIG_FILE" 2>/dev/null || true)
 }
 
@@ -595,8 +594,7 @@ cmd_status_single_gpu() {
         running=true
     fi
     if [[ "$running" == "true" ]]; then
-        local health_response
-        if health_response=$(curl -s --max-time 3 "http://localhost:${_sg_port}/health" 2>/dev/null); then
+        if curl -s --max-time 3 "http://localhost:${_sg_port}/health" >/dev/null 2>&1; then
             info "Server healthy on port ${_sg_port} (GPU ${GPU_NAME})"
         fi
         local models_response
@@ -706,7 +704,7 @@ cmd_start() {
     # Parse CLI args
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --gpu) gpu_cli_id="$2"; shift 2 ;;   # already consumed globally
+            --gpu) shift 2 ;;   # already consumed globally
             --model) model_name="$2"; shift 2 ;;
             --thinking) thinking="$2"; shift 2 ;;
             --ctx) ctx="$2"; shift 2 ;;
