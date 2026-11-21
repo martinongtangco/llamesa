@@ -320,9 +320,87 @@ Additive and reversible. Backups use a timestamp suffix.
 - No sudo, no system files, no live service left changed.
 - The repo's `server/llamesa.sh` is the repo's older base plus the `-rad` block. The host's script is the live script (which has the KV-cache and speculative-decoding options from commit 5cd45a3, on another branch) plus the same block, so the two files differ outside `-rad` until those branches are merged.
 
+## Like-for-like single-GPU test: Q4 GGUF on llama.cpp vs Radiance MXFP4 (2026-11-08)
+
+Added after the first report, because the first llama.cpp baseline used a Q8_0 file (27 GiB, two GPUs, 131072 context) against Radiance's 4-bit file at 262144. This run removes that mismatch.
+
+**Setup.** llama.cpp Vulkan build 10680 (d7bd3bfca), `Qwen3.8-27B-UD-Q4_K_XL.gguf` (unsloth, 16.35 GiB, hash not checked), first GPU only (Vulkan device 0; VRAM readings confirmed card1 was the loaded card), flash attention, Q8_0 KV, context 262144. Both GPUs were free (a Radiance session had been stopped by the user); nothing else ran on the host except the benchmark. Radiance figures are from 2026-11-07 on the same host and card (TP1, MXFP4 `.rad`, FP8 KV, 262144), not rerun the same day. Same scripts as the Radiance runs (`load.py`, `longtest.py`, `ctx250one.py`, `tools_test.py`); scripts in `~/radiance-eval` on the host, results in `~/radiance-eval/out/q4`.
+
+Context handling differs: llama.cpp divides the context across slots, so the concurrency runs used 8 slots (32768 each) with 262144 total, and the long-prompt runs used 1 slot with the full 262144. Radiance shares one KV pool across sequences.
+
+| Test | llama.cpp Q4, plain | llama.cpp Q4 + MTP (n=3) | Radiance, speculation off | Radiance, speculation on |
+|---|---|---|---|---|
+| llama-bench pp512 / pp4096 / pp16384 (tok/s, Q8_0 KV) | 415 / 399 / 365 | n/a | n/a | n/a |
+| llama-bench tg128 (tok/s) | 29.1 (f16 KV: 29.5) | n/a | n/a | n/a |
+| Short agent prompt, 1 stream (tok/s) | 31.0 | 52.8 to 58.8 | about 40 | 170 to 205 |
+| Short agent prompt, 2 streams, per stream | 27 to 28 | not run | not run | not run |
+| Short agent prompt, 4 streams, per stream | 23.6 to 23.9 | not run | 31 | about 75 |
+| Code reply 1,024 tokens, 1 stream (tok/s) | 19.0 (warm reruns 19.0, 18.9, 19.0) | 44.3 | 27.3 | 145.2 |
+| Code reply 1,024 tokens, 4 streams, per stream | 21.5 | not run | 30.8 | 73 to 77 |
+| 30k prompt: time to first token / decode after | 89.9 s / 19.0 | 92.9 s / 33.9 | 10.1 s / 35.5 | 10.3 s / 71.2 |
+| 100k prompt: time to first token / decode after | 422.0 s / 16.7 | 440.3 s / 18.9 | 54.0 s / 31.6 | 53.2 s / 70.6 |
+| 250k prompt, needle at 50%: time to first token / decode after | 1703.1 s / 14.3, code found | not run | not run | 223.6 s / 21.0, code found |
+| Tool-call test | 35/40 | 35/40 | 35/40 | 35/40 |
+| VRAM at 262144 context | 25.7 GiB (1 slot), 26.5 GiB (8 slots) | 25.7 GiB (1 slot) | about 31 GiB | about 31 GiB |
+
+What the numbers say:
+
+- Prompt processing is the largest gap: Radiance's first token came 7.6 to 9 times sooner at 30k, 100k and 250k tokens. llama.cpp's prompt speed fell as context grew (415 tok/s at 512 tokens, about 237 at 100k, about 147 at 250k).
+- With speculation off on both, Radiance decoded about 30 to 40 percent faster at 1 and 4 streams, and about 1.9 times faster after a 100k prompt. The first report's Q8_0 comparison overstated the decode gap.
+- With speculation on both sides, Radiance was about 3.3 times faster on a single code stream (145.2 vs 44.3 tok/s). Speculation figures depend on how predictable the text is; acceptance rate was not measured.
+- MTP does not help llama.cpp's prompt processing.
+- The MTP head is inside the Q4_K_XL file, so no separate MTP download was needed.
+- Tool-call accuracy and the 250k needle test were equal. The one failing prompt ("replace foo_old with foo_new") fails 0/5 on every setup, so it may be the test's check.
+
+Not explained or not verified:
+
+- llama.cpp's single-stream code reply (19.0 tok/s, stable over four runs including three after warm-up) is much lower than llama-bench tg128 (29.1) and the short-prompt rate (31.0), and below its own 4-stream per-stream rate (21.5). Radiance shows the same pattern in a milder form (27.3 single vs 30.8 per stream at 4). I do not know the cause.
+- The vision check returned HTTP 500 on llama.cpp (no mmproj was loaded for this server); not investigated.
+- The Radiance and llama.cpp runs are from different days. The hash of the downloaded GGUF was not compared with the repo's. Quality was only checked with the 40-call tool test and one needle test, so MXFP4 vs Q4_K_XL output quality is unmeasured.
+
+## Upgrade to Radiance 2.2.0 with selectable Q4 and Q5 files (2026-11-22)
+
+Radiance 2.0 dropped every command-line flag (one `--config FILE` YAML instead) and refuses MXFP4 and FP8 `.rad` files. `start-rad` now picks the engine per model:
+
+| Config key (`radiance` block) | Value on the host | Effect |
+|---|---|---|
+| `image` | `docker.io/stilldeadcode/radiance:2.2.0` | default engine |
+| `model_images` | `{"qwen3.8-27b-mxfp4": "...radiance:1.17.0"}` | that file keeps running on 1.17.0 with the old flags |
+| `gpu_headroom_mib` | 1024 | written into the 2.x YAML (falls back to `--gpu-headroom-mib` in `extra_args`) |
+| `model_max_num_seqs` | `{"qwen3.8-27b-iq5r-v4": 4}` | sequence cap when `--parallel` is not given |
+
+For a 2.x image the script writes `~/.llamesa/rad-<gpu>.yaml`, validates it with `--check`, then starts the container with it. KV `fp8` is written as `i8` (2.x's name for the Qwen 8-bit cache). The session file records the image, so `restart-rad` and `--like` reuse the right engine.
+
+Model names: 1.17.0 answered any model name; 2.x answers only names it serves (`no model '...' is served here`, 404). Each instance's YAML therefore lists the base name (`qwen3.8-27b`), the file name and the other GPU's served name as aliases. A request with no model field, or an empty one, is served. The Windows client reads the name from `/v1/models`, so it is unaffected. An agent configured with any other name gets a 404.
+
+Results on the host (both GPUs, 262144 context, 1 GiB headroom, speculation on):
+
+| Test | Result |
+|---|---|
+| Q5 (IQ5R) at 8 sequences | KV 10.07 GiB, 246,368 tokens for one sequence; a 249,895-token prompt was refused (400) |
+| Q5 at 4 sequences | KV 10.08 GiB, a full 262,144 session fits; 250k needle found, 205.8 s to first token, 21.4 tok/s |
+| Q4 (IQ4R-S) at 8 sequences | KV 14.47 GiB, 1.5 full-length sessions |
+| Free VRAM after start | 1.30 to 1.33 GiB on each card |
+| Tool test, both GPUs at once | 35/40 on each; vision "Red" on each |
+| Short agent prompt, 4 streams on Q4 while Q5 ran the 250k prompt | 183 to 234 tok/s per stream |
+| MXFP4 on 1.17.0 via `model_images` | starts, answers (`radiance-1.17.0` fingerprint) |
+| `restart-rad`, `--like`, replacing a running instance | work |
+| Errors, GPU faults, resets | none in the container logs or the kernel log |
+
+Two existing faults found and fixed during the test:
+
+1. `start-rad` replacing a running instance refused with "VRAM in use by another process", because the stopped container's VRAM is released a few seconds after `podman stop` returns. It now waits up to 30 s.
+2. The server's `start-big` did not refuse while Radiance was running (only the Windows client checked). It started llama.cpp across both GPUs next to two Radiance instances; I stopped it within a minute, and Radiance stayed healthy. `start-big` now refuses while any Radiance instance is running.
+
+Also deleted on the host (user approved): `Qwen3.8-27B-Q8_0.gguf` (29.0 GB) and a 19.3 GB incomplete download in the same folder's `.cache`. The Q4_K_XL GGUF and its mmproj stay as the llama.cpp fallback; `list-models` now resolves `Qwen3.8-27B-GGUF` to the Q4 file.
+
+The host test folder `~/radiance-eval` (benchmark scripts, raw logs and the evaluation copies of the model files, 53 GB) was deleted afterwards at the user's request, so the scripts and raw output named in earlier sections no longer exist; the tables here are the record.
+
+Rollback: `cp ~/.llamesa/llamesa.sh.bak-20261122-rad22 ~/.llamesa/llamesa.sh`, the same for `config.json`, then `llamesa.sh restart-rad`. The new `.rad` files can stay.
+
 ## Open items
 
-1. The repo changes are uncommitted.
+1. The repo changes are uncommitted. The repo copy of `llamesa.sh` has the new `-rad` block and the `start-big` guard; the host copy is still ahead of the repo in other places (KV and spec options from another branch).
 2. Not tested: TP2 (documented to wedge on this hardware), hours of sustained load, a real Pi or Cline session, quality of MXFP4 and of speculation against your usual prompts, a shared single port with sticky routing.
 3. Optional: send two or three of your real tool-calling prompts or a captured session so I can compare outputs with speculation on and off, and Q8_0 against MXFP4.
 

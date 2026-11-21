@@ -1162,6 +1162,19 @@ cmd_start_big() {
         error "Model name required. Use --model <name>"
     fi
 
+    # -big spans both GPUs. A running Radiance instance holds nearly all of a
+    # GPU's VRAM, and llama.cpp would still start (spilling into system RAM),
+    # so refuse here instead of relying on the client to check.
+    if jq -e '.radiance' "$CONFIG_FILE" >/dev/null 2>&1; then
+        local rp rad_ports
+        rad_ports=$(jq -r 'if .radiance.instances then [.radiance.instances[].port] else [.radiance.port // 1237] end | .[]' "$CONFIG_FILE" 2>/dev/null || true)
+        for rp in $rad_ports; do
+            if port_owned_by_radiance "$rp"; then
+                error "Radiance is running (port ${rp}) and holds that GPU. Run 'stop-rad' first."
+            fi
+        done
+    fi
+
     if is_big_running >/dev/null 2>&1; then
         warn "Vulkan combined-VRAM server is already running. Use 'restart-big' to change models."
         cmd_stop_big
@@ -2004,6 +2017,12 @@ read_radiance_config() {
     RAD_TP=$(jq -r '.radiance.tp // 1' "$CONFIG_FILE")
     RAD_EXTRA=$(jq -r '(.radiance.extra_args // []) | join(" ")' "$CONFIG_FILE")
     RAD_HOST=$(jq -r '.radiance.host // "0.0.0.0"' "$CONFIG_FILE")
+    # VRAM left unclaimed per card. 2.x takes it from the YAML; when the key is
+    # absent, fall back to a --gpu-headroom-mib N in extra_args (the 1.x form).
+    RAD_HEADROOM=$(jq -r '.radiance.gpu_headroom_mib // empty' "$CONFIG_FILE")
+    if [[ -z "$RAD_HEADROOM" ]]; then
+        RAD_HEADROOM=$(jq -r '(.radiance.extra_args // []) as $a | ($a | index("--gpu-headroom-mib")) as $i | if $i == null then empty else $a[$i+1] end' "$CONFIG_FILE")
+    fi
     if [[ "$RAD_TP" != "1" ]]; then
         error "radiance.tp=${RAD_TP}: multi-GPU Radiance wedges on 2x R9700 (upstream issues #356/#409/#415, see docs/radiance-evaluation.md). -rad runs one TP1 instance per GPU; set tp to 1."
     fi
@@ -2058,6 +2077,69 @@ rad_served_name() {
     base="${RAD_SERVED_BASE:-$model}"
     suffix="${key#r9700}"
     echo "${base}-${suffix}"
+}
+
+# Image for a model: radiance.model_images[<model>] when set, else radiance.image.
+# Lets one file stay on an older engine (2.x refuses MXFP4/FP8 .rad files, so
+# those map to 1.17.0) while the rest use the default.
+rad_image_for() {
+    jq -r --arg m "$1" --arg d "$RAD_IMAGE" '.radiance.model_images[$m] // $d' "$CONFIG_FILE"
+}
+
+# Major version from an image tag (…/radiance:2.2.0 -> 2). A tag that is not a
+# version (latest, a digest) counts as 2: 2.x is the only current format.
+rad_image_major() {
+    local tag="${1##*:}"
+    [[ "$1" == *@* ]] && { echo 2; return 0; }
+    if [[ "$tag" =~ ^v?([0-9]+)\. ]]; then echo "${BASH_REMATCH[1]}"; else echo 2; fi
+}
+
+# Write the 2.x YAML for one instance. Radiance 2.0 dropped every CLI flag;
+# a process is configured only by --config FILE. The container sees one GPU
+# (ROCR_VISIBLE_DEVICES), so cards is always [0]. The served name is the
+# model key; the base name and the file name are aliases, so clients that send
+# either keep working (2.x routes requests by model name, 1.x ignored it).
+_write_rad_yaml() {
+    local out="$1" served="$2" model_name="$3" model_file="$4" ctx="$5" seqs="$6" thinking="$7" port="$8"
+    local kv="$RAD_KV_DTYPE" base="${RAD_SERVED_BASE:-$model_name}"
+    # 1.x "fp8" KV is "i8" in 2.x for Qwen (2.x fp8 is the GLM latent cache).
+    [[ "$kv" == "fp8" ]] && kv="i8"
+    local -a aliases=()
+    [[ "$base" != "$served" ]] && aliases+=("\"${base}\"")
+    [[ "$model_name" != "$served" && "$model_name" != "$base" ]] && aliases+=("\"${model_name}\"")
+    # The other instances' served names too (qwen3.8-27b-b on the first GPU's
+    # port, and so on): an agent pointed at the "wrong" port still gets served,
+    # as it did on 1.x.
+    local ok other
+    for ok in "${RAD_KEYS[@]}"; do
+        other=$(rad_served_name "$ok" "$model_name")
+        [[ "$other" != "$served" && "$other" != "$base" && "$other" != "$model_name" ]] && aliases+=("\"${other}\"")
+    done
+    {
+        echo "# written by llamesa.sh start-rad; regenerated on every start"
+        echo "server:"
+        echo "  host: ${RAD_HOST}"
+        echo "  port: ${port}"
+        echo "cards: [0]"
+        if [[ -n "$RAD_HEADROOM" ]]; then
+            echo "memory:"
+            echo "  gpu-headroom-mib: ${RAD_HEADROOM}"
+        fi
+        echo "models:"
+        echo "  \"${served}\":"
+        if [[ ${#aliases[@]} -gt 0 ]]; then
+            local IFS=,
+            echo "    aliases: [${aliases[*]}]"
+        fi
+        echo "    model: /models/$(basename "$model_file")"
+        echo "    tp: ${RAD_TP}"
+        echo "    max-model-len: ${ctx}"
+        echo "    kv-cache-dtype: ${kv}"
+        echo "    max-num-seqs: ${seqs}"
+        [[ "$RAD_SPEC" == "false" ]] && echo "    num-speculative-tokens: 0"
+        [[ "$thinking" == "false" ]] && echo "    chat-template-kwargs: '{\"enable_thinking\": false}'"
+        true
+    } > "$out"
 }
 
 is_rad_running() {
@@ -2142,6 +2224,40 @@ _launch_rad_instance() {
     served=$(rad_served_name "$key" "$model_name")
     model_dir=$(dirname "$model_file")
     logf=$(rad_log_file "$key")
+    local image major
+    image=$(rad_image_for "$model_name")
+    major=$(rad_image_major "$image")
+    local -a run_opts=(--network host --init --ulimit memlock=-1
+        --device /dev/kfd --device /dev/dri
+        --security-opt seccomp=unconfined --security-opt label=disable --group-add keep-groups
+        -e "ROCR_VISIBLE_DEVICES=${gpu}"
+        -v "${model_dir}:/models:ro")
+
+    if [[ "$major" -ge 2 ]]; then
+        local yaml; yaml="${LLAMESA_DIR}/rad-${key}.yaml"
+        _write_rad_yaml "$yaml" "$served" "$model_name" "$model_file" "$ctx" "$seqs" "$thinking" "$port"
+        # extra_args are 1.x CLI flags; 2.x has none. Only the headroom carries
+        # over (RAD_HEADROOM). Say so when anything else would be dropped.
+        local rest="${RAD_EXTRA/--gpu-headroom-mib ${RAD_HEADROOM}/}"
+        [[ -n "${rest// /}" ]] && warn "radiance.extra_args '${rest}' is ignored by Radiance ${major}.x (config file only)."
+        {
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting (radiance/-rad ${key}, GPU ${gpu}): ${image} --config ${yaml}"
+            cat "$yaml"
+        } > "$logf"
+        run_opts+=(-v "${yaml}:/cfg/radiance.yaml:ro")
+        info "Launching Radiance ${key} (${image##*:}, GPU ${gpu}, port ${port}, name '${served}')..."
+        timeout 60 podman rm -f "$cname" >/dev/null 2>&1 || true
+        # Validate first: a bad key or a refused model fails here with a clear
+        # message instead of a container that exits during the health wait.
+        if ! timeout 180 podman run --rm "${run_opts[@]}" "$image" --config /cfg/radiance.yaml --check >> "$logf" 2>&1; then
+            warn "Radiance ${key}: config check failed — see ${logf}"
+            return 1
+        fi
+        timeout 120 podman run -d --name "$cname" "${run_opts[@]}" \
+            "$image" --config /cfg/radiance.yaml >> "$logf" 2>&1 \
+            || return 1
+        return 0
+    fi
 
     local -a args=(
         --model "/models/$(basename "$model_file")"
@@ -2159,15 +2275,11 @@ _launch_rad_instance() {
     # shellcheck disable=SC2206
     [[ -n "$RAD_EXTRA" ]] && args+=($RAD_EXTRA)
 
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting (radiance/-rad ${key}, GPU ${gpu}): ${RAD_IMAGE} ${args[*]}" > "$logf"
-    info "Launching Radiance ${key} (GPU ${gpu}, port ${port}, name '${served}')..."
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting (radiance/-rad ${key}, GPU ${gpu}): ${image} ${args[*]}" > "$logf"
+    info "Launching Radiance ${key} (${image##*:}, GPU ${gpu}, port ${port}, name '${served}')..."
     timeout 60 podman rm -f "$cname" >/dev/null 2>&1 || true
-    timeout 120 podman run -d --name "$cname" --network host --init --ulimit memlock=-1 \
-        --device /dev/kfd --device /dev/dri \
-        --security-opt seccomp=unconfined --security-opt label=disable --group-add keep-groups \
-        -e "ROCR_VISIBLE_DEVICES=${gpu}" \
-        -v "${model_dir}:/models:ro" \
-        "$RAD_IMAGE" "${args[@]}" >> "$logf" 2>&1 \
+    timeout 120 podman run -d --name "$cname" "${run_opts[@]}" \
+        "$image" "${args[@]}" >> "$logf" 2>&1 \
         || return 1
 }
 
@@ -2210,6 +2322,15 @@ cmd_start_rad() {
     esac
     [[ "$ctx" =~ ^[0-9]+$ ]] || error "--ctx must be a number"
     [[ -n "$model_name" ]] || error "Model name required. Use --model <name> (see list-models-rad)"
+    # Per-model sequence cap (radiance.model_max_num_seqs) when --parallel was
+    # not given. Each sequence reserves per-sequence state; a larger model file
+    # can need fewer sequences for one full-length session to fit (IQ5R at
+    # 262144 with 1 GiB headroom holds 246368 tokens at 8, the full 262144 at 4).
+    if [[ -z "$p_set" ]]; then
+        local mseqs
+        mseqs=$(jq -r --arg m "$model_name" '.radiance.model_max_num_seqs[$m] // empty' "$CONFIG_FILE")
+        [[ -n "$mseqs" && "$mseqs" -lt "$seqs" ]] && seqs="$mseqs"
+    fi
     [[ "$seqs" =~ ^[0-9]+$ ]] || error "--parallel must be a number"
 
     local model_file="${RAD_MODELS_DIR}/${model_name}.rad"
@@ -2236,9 +2357,16 @@ cmd_start_rad() {
     fi
     # Any other process holding VRAM on a target GPU (a llama.cpp server on that
     # GPU, for example) would make Radiance fail to allocate; say so up front.
-    local used_mib
+    # A container stopped just above (replacing a running instance) frees its
+    # VRAM a few seconds after podman returns, so wait up to 30 s before
+    # deciding something else holds it.
+    local used_mib w
     for key in "${RAD_SEL[@]}"; do
         used_mib=$(_rad_gpu_vram_used_mib "${RAD_INST_GPU[$key]}")
+        for (( w = 0; w < 15 && used_mib > 2048; w++ )); do
+            sleep 2
+            used_mib=$(_rad_gpu_vram_used_mib "${RAD_INST_GPU[$key]}")
+        done
         if [[ "$used_mib" -gt 2048 ]]; then
             error "GPU ${key} already has ${used_mib} MiB of VRAM in use by another process. Stop the server using it first."
         fi
@@ -2289,7 +2417,8 @@ cmd_start_rad() {
   "thinking": ${thinking},
   "ctx": ${ctx},
   "parallel": ${seqs},
-  "speculative": ${RAD_SPEC}
+  "speculative": ${RAD_SPEC},
+  "image": "$(rad_image_for "$model_name")"
 }
 EOF
             done
