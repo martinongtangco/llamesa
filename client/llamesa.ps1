@@ -2620,17 +2620,27 @@ function Get-VideoPromptWriter {
     return $null
 }
 
+# The video model reads at most 1024 prompt tokens and draws whatever written
+# words the prompt holds on screen (an instruction with file paths came out as
+# a caption), so every prompt the writer makes follows this rule.
+$Script:VideoTextRule = "Describe only what is seen and heard. Never put instructions, file names, paths, URLs, hashtags, " +
+    "titles, captions, subtitles, signs, logos or quoted words into the prompt, unless the user explicitly " +
+    "asks for that text to appear on screen; the video model renders written words as on-screen text. " +
+    "Describe speech by who speaks and how it sounds, not by quoting the words."
+$Script:VideoImageTypes = @{ ".png" = "image/png"; ".jpg" = "image/jpeg"; ".jpeg" = "image/jpeg"; ".webp" = "image/webp" }
+
 function Expand-VideoPrompt {
     param($Writer, [string]$Idea)
     $system = "You write prompts for a text-to-video model that also generates the soundtrack. " +
-        "Rewrite the user's idea as ONE paragraph of 80 to 140 words describing: the subject and setting, " +
-        "the motion and action over a few seconds, the camera shot and movement, the light and colour, " +
-        "and the sounds heard. Concrete visual language, present tense, no lists, no title, no quotes, " +
-        "no text overlays unless asked. Output only the paragraph."
+        "Turn the user's idea or brief into ONE paragraph of 80 to 160 words describing ONE continuous shot " +
+        "of a few seconds: the subject and setting, the motion and action, the camera shot and movement, " +
+        "the light and colour, and the sounds heard. If the input is a long brief, pick the single most " +
+        "representative shot it asks for. Concrete visual language, present tense, no lists. " +
+        $Script:VideoTextRule + " Output only the paragraph."
     $body = @{
         model = $Writer.Model
         messages = @(@{ role = "system"; content = $system }, @{ role = "user"; content = $Idea })
-        max_tokens = 400
+        max_tokens = 500
         temperature = 0.7
         chat_template_kwargs = @{ enable_thinking = $false }
     } | ConvertTo-Json -Depth 5
@@ -2639,6 +2649,52 @@ function Expand-VideoPrompt {
     $text = "$($res.choices[0].message.content)".Trim().Trim('"')
     if (-not $text) { throw "the prompt writer returned nothing" }
     return $text
+}
+
+# Existing .md/.txt/image paths named in the description (quoted or bare).
+function Find-VideoPaths {
+    param([string]$Text)
+    $found = [System.Collections.Generic.List[string]]::new()
+    $re = '"([^"]+)"|''([^'']+)''|(@?(?:[A-Za-z]:)?[\\/]?[\w.\-\\/ ]+\.(?:md|txt|png|jpe?g|webp))'
+    foreach ($m in [regex]::Matches($Text, $re, 'IgnoreCase')) {
+        $raw = ($m.Groups[1].Value + $m.Groups[2].Value + $m.Groups[3].Value).Trim().TrimStart('@')
+        if (-not $raw) { continue }
+        $p = if ([IO.Path]::IsPathRooted($raw)) { $raw } else { Join-Path (Get-Location) $raw }
+        if ((Test-Path -LiteralPath $p -PathType Leaf) -and -not $found.Contains($p)) { $found.Add($p) }
+    }
+    return @($found)
+}
+
+# Images a markdown brief links to, resolved against the brief's folder.
+function Get-MarkdownImage {
+    param([string]$Markdown, [string]$MdPath)
+    $dir = Split-Path -Parent $MdPath
+    $found = [System.Collections.Generic.List[string]]::new()
+    foreach ($m in [regex]::Matches($Markdown, '!\[[^\]]*\]\(([^)\s]+)\)|`([^`]+\.(?:png|jpe?g|webp))`', 'IgnoreCase')) {
+        $raw = [uri]::UnescapeDataString(($m.Groups[1].Value + $m.Groups[2].Value).Trim())
+        $p = if ([IO.Path]::IsPathRooted($raw)) { $raw } else { Join-Path $dir $raw }
+        if ((Test-Path -LiteralPath $p -PathType Leaf) -and -not $found.Contains($p)) { $found.Add($p) }
+    }
+    return @($found)
+}
+
+# POST one video job. A prompt over the encoder's limit comes back as a 400
+# "the prompt is N tokens; this model takes at most 1024"; that is thrown with
+# a TOOLONG: prefix so Cmd-Video can condense and retry.
+function Submit-VideoJob {
+    param([string]$Base, [hashtable]$Request)
+    try {
+        return Invoke-RestMethod -Method Post -Uri $Base -ContentType "application/json" `
+            -Body ([Text.Encoding]::UTF8.GetBytes(($Request | ConvertTo-Json -Depth 4))) -TimeoutSec 60
+    } catch {
+        $msg = $_.Exception.Message
+        if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
+            $msg = $_.ErrorDetails.Message
+            try { $msg = ($msg | ConvertFrom-Json).error.message } catch { Write-Verbose "error body is not JSON" }
+        }
+        if ($msg -match 'prompt is \d+ tokens') { throw "TOOLONG:$msg" }
+        throw $msg
+    }
 }
 
 function Get-VideoFileBase {
@@ -2657,8 +2713,42 @@ function Cmd-Video {
     }
 
     Write-Host ""
+    Write-Host ("  {0}You can name a brief (.md or .txt) and reference images (.png, .jpg, .webp) by path.{1}" -f $dim, $reset)
     $idea = (Read-Host "Describe the video (a shot, what moves, the mood, any sound)").Trim()
     if (-not $idea) { Write-Host ("{0}Cancelled.{1}" -f $gray, $reset); return }
+
+    # Files named in the description: a brief's text (not its path) goes to the
+    # prompt writer; images, and the images the brief links to, can be the first frame.
+    $writer = Get-VideoPromptWriter
+    $paths = @(Find-VideoPaths -Text $idea)
+    $briefs = @($paths | Where-Object { $_ -match '\.(md|txt)$' })
+    $images = [System.Collections.Generic.List[string]]::new()
+    foreach ($p in $paths) { if ($Script:VideoImageTypes.ContainsKey([IO.Path]::GetExtension($p).ToLower())) { $images.Add($p) } }
+    $source = $idea
+    $label = $idea
+    if ($briefs.Count -gt 0) {
+        if (-not $writer) {
+            Write-Host ("{0}Reading a brief needs a Qwen chat instance running (/start) to turn it into a video prompt.{1}" -f $red, $reset)
+            return
+        }
+        $parts = @()
+        foreach ($b in $briefs) {
+            $text = Get-Content -LiteralPath $b -Raw
+            foreach ($img in (Get-MarkdownImage -Markdown $text -MdPath $b)) { if (-not $images.Contains($img)) { $images.Add($img) } }
+            $parts += "Brief ($b):`n$text"
+        }
+        $source = "$idea`n`n" + ($parts -join "`n`n")
+        $label = [IO.Path]::GetFileNameWithoutExtension($briefs[0])
+        Write-Host ("{0}Read {1} brief file(s){2}.{3}" -f $cyan, $briefs.Count, $(if ($images.Count) { ", found $($images.Count) image(s)" } else { "" }), $reset)
+    }
+    $firstFrame = $null
+    if ($images.Count -gt 0) {
+        $noneLabel = "no first frame (text only)"
+        $pick = Read-SelectList -Items (@($images) + $noneLabel) -LabelFn { param($x) $x } `
+            -HeaderFn { Write-Host ("  {0}Start the video from an image? (keeps a person or product looking the same){1}" -f $white, $reset) }
+        if (-not $pick) { Write-Host ("{0}Cancelled.{1}" -f $gray, $reset); return }
+        if ($pick -ne $noneLabel) { $firstFrame = $pick }
+    }
 
     $sizes = @(
         [PSCustomObject]@{ Label = "960x544 landscape (about 22 s for 5 s of video)"; Size = "960x544" },
@@ -2682,15 +2772,19 @@ function Cmd-Video {
     if (-not $length) { Write-Host ("{0}Cancelled.{1}" -f $gray, $reset); return }
 
     $prompt = $idea
-    $writer = Get-VideoPromptWriter
     if ($writer) {
-        $expand = Read-SelectList -Items @("yes, let Qwen expand my idea", "no, use my text as is") -LabelFn { param($x) $x } `
-            -HeaderFn { Write-Host ("  {0}Let Qwen write the detailed prompt? (LTX works best with a long description){1}" -f $white, $reset) }
-        if (-not $expand) { Write-Host ("{0}Cancelled.{1}" -f $gray, $reset); return }
+        # A brief always goes through the writer: its raw text is neither a shot
+        # description nor under the 1024-token limit.
+        $expand = "yes"
+        if ($briefs.Count -eq 0) {
+            $expand = Read-SelectList -Items @("yes, let Qwen expand my idea", "no, use my text as is") -LabelFn { param($x) $x } `
+                -HeaderFn { Write-Host ("  {0}Let Qwen write the detailed prompt? (LTX works best with a long description){1}" -f $white, $reset) }
+            if (-not $expand) { Write-Host ("{0}Cancelled.{1}" -f $gray, $reset); return }
+        }
         if ($expand -like "yes*") {
             Write-Host ("{0}Qwen is writing the prompt...{1}" -f $cyan, $reset)
             try {
-                $expanded = Expand-VideoPrompt -Writer $writer -Idea $idea
+                $expanded = Expand-VideoPrompt -Writer $writer -Idea $source
                 Write-Host ""
                 Write-Host ("  {0}{1}{2}" -f $white, $expanded, $reset)
                 Write-Host ""
@@ -2698,6 +2792,10 @@ function Cmd-Video {
                 if ($use -match '^[cC]') { Write-Host ("{0}Cancelled.{1}" -f $gray, $reset); return }
                 if ($use -notmatch '^[nN]') { $prompt = $expanded }
             } catch {
+                if ($briefs.Count -gt 0) {
+                    Write-Host ("{0}Prompt writer failed: {1}{2}" -f $red, $_.Exception.Message, $reset)
+                    return
+                }
                 Write-Host ("{0}Prompt writer failed ({1}); using your text.{2}" -f $amber, $_.Exception.Message, $reset)
             }
         }
@@ -2730,11 +2828,27 @@ function Cmd-Video {
     $base = "http://{0}:{1}/v1/videos" -f $Script:ActiveServer.host, $gen.port
     $req = @{ prompt = $prompt; size = $size.Size; seed = $seed }
     if ($length.Seconds) { $req.seconds = $length.Seconds }
-    Write-Host ("{0}Making video: {1}, {2}, seed {3}{4}" -f $cyan, $size.Size, $(if ($length.Seconds) { "$($length.Seconds) s" } else { "auto length" }), $seed, $reset)
+    if ($firstFrame) {
+        # Sent as a data URL; verified on the server that frame 0 becomes the image.
+        $type = $Script:VideoImageTypes[[IO.Path]::GetExtension($firstFrame).ToLower()]
+        $req.input_reference = "data:{0};base64,{1}" -f $type, [Convert]::ToBase64String([IO.File]::ReadAllBytes($firstFrame))
+    }
+    Write-Host ("{0}Making video: {1}, {2}, seed {3}{4}{5}" -f $cyan, $size.Size, $(if ($length.Seconds) { "$($length.Seconds) s" } else { "auto length" }), $seed, $(if ($firstFrame) { ", first frame $firstFrame" } else { "" }), $reset)
     $started = Get-Date
     try {
-        $job = Invoke-RestMethod -Method Post -Uri $base -ContentType "application/json" `
-            -Body ([Text.Encoding]::UTF8.GetBytes(($req | ConvertTo-Json -Depth 4))) -TimeoutSec 60
+        try {
+            $job = Submit-VideoJob -Base $base -Request $req
+        } catch {
+            $why = "$($_.Exception.Message)"
+            if ($why -notlike "TOOLONG:*") { throw }
+            $why = $why.Substring(8)
+            if (-not $writer) { throw "$why. Shorten the text, or start Qwen (/start) so it can condense it." }
+            Write-Host ("{0}{1}; asking Qwen to condense it...{2}" -f $amber, $why, $reset)
+            $prompt = Expand-VideoPrompt -Writer $writer -Idea $prompt
+            Write-Host ("  {0}{1}{2}" -f $white, $prompt, $reset)
+            $req.prompt = $prompt
+            $job = Submit-VideoJob -Base $base -Request $req
+        }
         $state = $job
         # Fields appear as the job advances (a queued job has no steps yet), and
         # the client runs under strict mode, so read every one through Get-Prop.
@@ -2754,11 +2868,12 @@ function Cmd-Video {
         }
         Write-Host ""
         New-Item -ItemType Directory -Force -Path $Script:VideoDir | Out-Null
-        $fileBase = Get-VideoFileBase -Idea $idea
+        $fileBase = Get-VideoFileBase -Idea $label
         Invoke-WebRequest -Uri ("{0}/{1}/content" -f $base, $job.id) -OutFile "$fileBase.mp4" -TimeoutSec 300 -UseBasicParsing
         $secs = [int]((Get-Date) - $started).TotalSeconds
         @(
-            "idea: $idea", "prompt: $prompt", "size: $($size.Size)", "seconds: $(Get-Prop $state 'seconds' 'auto')",
+            "idea: $idea", "prompt: $prompt", "first frame: $(if ($firstFrame) { $firstFrame } else { 'none' })",
+            "size: $($size.Size)", "seconds: $(Get-Prop $state 'seconds' 'auto')",
             "seed: $seed", "model: $(Get-Prop $state 'model' '')", "made in: $secs s"
         ) | Set-Content -Path "$fileBase.txt" -Encoding UTF8
         Write-Host ("{0}✓ Saved {1}.mp4 ({2} s){3}" -f $green, $fileBase, $secs, $reset)

@@ -430,6 +430,15 @@ Pi extension: `/llamesa-video [description]` asks for size and length, optionall
 
 Windows client: `/video` and `/video-stop` in the command palette, the same flow (size, length, optional Qwen prompt, asks before starting the server or stopping a chat instance, live step progress, MP4 + `.txt` saved to the Videos folder, offers to open it). Tested by running `Cmd-Video` with scripted answers (server not running, Qwen on GPU 0 writing the prompt); the client's own screens were not driven. The client's `/stop` does not stop the video server; use `/video-stop`.
 
+### Video from Pi's normal prompt, briefs, reference images (2026-11-22)
+
+Found in use: a long prompt is refused (`the prompt is 1555 tokens; this model takes at most 1024`; the limit is the LTX text encoder's), and an instruction typed as the prompt ("read the brief in C:\...md ... save it in ...") was rendered by LTX as on-screen text.
+
+- Pi tool `llamesa_make_video` (prompt, optional `image_path`, size, seconds, seed, `output_dir`, `file_name`). Pi's own model reads the brief and views the images with its built-in tools, writes one shot description, and calls the tool; its guidelines say to keep to one paragraph and to put no instructions, paths, titles, captions or quoted words in the prompt. An over-long prompt returns an error asking the model to shorten it. The tool never stops a chat instance (it may be the one calling it).
+- First frame: `input_reference` as a JSON data URL. Verified on the server: frame 0 of the clip is the given image (a solid test image came back pixel-exact), and the brief's model photo carried through a 5 s portrait clip.
+- `/llamesa-video` (Pi) and `/video` (client): a `.md`/`.txt` path in the description is read and always condensed by Qwen into one shot; images named in it or linked from the brief are offered as the first frame; a refused over-long prompt is condensed by Qwen and retried once. The prompt writer gets the same no-on-screen-text rule.
+- `negative_prompt` is accepted by the server, but the distilled model runs unguided (`guidance_scale` 1.0), so it is not used.
+
 ## Open items
 
 1. The repo changes are uncommitted. The repo copy of `llamesa.sh` has the new `-rad` block and the `start-big` guard; the host copy is still ahead of the repo in other places (KV and spec options from another branch).
