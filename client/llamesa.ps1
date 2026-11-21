@@ -2426,8 +2426,8 @@ function Send-ChatMessage {
                         if ($usage) {
                             $pv = $usage.PSObject.Properties['prompt_tokens']?.Value
                             $gv = $usage.PSObject.Properties['completion_tokens']?.Value
-                            if ($pv -ne $null) { $promptToks = [int]$pv }
-                            if ($gv -ne $null) { $genToks = [int]$gv }
+                            if ($null -ne $pv) { $promptToks = [int]$pv }
+                            if ($null -ne $gv) { $genToks = [int]$gv }
                         }
 
                         # Handle content deltas — safe property access required under Set-StrictMode
@@ -2807,6 +2807,8 @@ function Get-RenderedLines {
 }
 
 function Draw-Screen {
+    # Params are used inside scriptblocks passed to Get-RenderedLines; the analyzer can't see that.
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '')]
     param($status, [string]$inputBuffer, [bool]$paletteOpen, [string]$paletteFilter, [int]$paletteIndex)
 
     $Script:RenderBuffer.Clear()

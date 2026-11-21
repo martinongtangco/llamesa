@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  shell:
+    name: Bash lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax check
+        run: |
+          bash -n server/llamesa.sh
+          bash -n install.sh
+      - name: ShellCheck
+        run: shellcheck server/llamesa.sh install.sh
+
+  extension:
+    name: Extension load test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: pi-extension
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: pi-extension/package-lock.json
+      - run: npm ci
+      - run: npm test
+
+  powershell:
+    name: PowerShell lint
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse check
+        shell: pwsh
+        run: |
+          $failed = $false
+          Get-ChildItem client -Recurse -Include *.ps1,*.psm1 | ForEach-Object {
+            $errs = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$null, [ref]$errs) | Out-Null
+            foreach ($e in $errs) {
+              Write-Output "::error file=$($_.FullName),line=$($e.Extent.StartLineNumber)::$($e.Message)"
+              $failed = $true
+            }
+          }
+          if ($failed) { exit 1 }
+      - name: PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          $results = Invoke-ScriptAnalyzer -Path client -Recurse -Settings ./PSScriptAnalyzerSettings.psd1 -Severity Error,Warning
+          $results | Format-Table -AutoSize
+          if ($results) { exit 1 }
