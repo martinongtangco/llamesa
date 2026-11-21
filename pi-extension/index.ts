@@ -1,9 +1,10 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { execFile } from "node:child_process";
-import { mkdir, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, extname, isAbsolute, join, resolve } from "node:path";
 
 // Single transport: SSH, key-based, to the Tailscale IP.
 // On the server box itself, ssh to the same IP (or 127.0.0.1) with the same key.
@@ -556,22 +557,34 @@ async function findChatPort(): Promise<{ port: number; model: string } | null> {
   return null;
 }
 
+// The video model's text encoder takes at most 1024 tokens of prompt, and it
+// draws on screen whatever written words the prompt contains (an instruction
+// with file paths came out as a caption). Both rules go to every prompt writer.
+const VIDEO_PROMPT_TOKEN_LIMIT = 1024;
+const VIDEO_TEXT_RULE =
+  "Describe only what is seen and heard. Never put instructions, file names, paths, URLs, hashtags, " +
+  "titles, captions, subtitles, signs, logos or quoted words into the prompt, unless the user explicitly " +
+  "asks for that text to appear on screen; the video model renders written words as on-screen text. " +
+  "Describe speech by who speaks and how it sounds, not by quoting the words.";
+
 // LTX-2.5 was trained on long single-paragraph captions; short prompts give
-// generic results. Ask the chat model to write one from the user's idea.
+// generic results. Ask the chat model to write one from the user's idea, or
+// to condense a long brief (an .md file) into one.
 async function expandVideoPrompt(chat: { port: number; model: string }, idea: string): Promise<string> {
   const system =
     "You write prompts for a text-to-video model that also generates the soundtrack. " +
-    "Rewrite the user's idea as ONE paragraph of 80 to 140 words describing: the subject and setting, " +
-    "the motion and action over a few seconds, the camera shot and movement, the light and colour, " +
-    "and the sounds heard. Concrete visual language, present tense, no lists, no title, no quotes, " +
-    "no text overlays unless asked. Output only the paragraph.";
+    "Turn the user's idea or brief into ONE paragraph of 80 to 160 words describing ONE continuous shot " +
+    "of a few seconds: the subject and setting, the motion and action, the camera shot and movement, " +
+    "the light and colour, and the sounds heard. If the input is a long brief, pick the single most " +
+    "representative shot it asks for. Concrete visual language, present tense, no lists. " +
+    VIDEO_TEXT_RULE + " Output only the paragraph.";
   const res = await fetch(`http://${SSH_HOST}:${chat.port}/v1/chat/completions`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       model: chat.model,
       messages: [{ role: "system", content: system }, { role: "user", content: idea }],
-      max_tokens: 400,
+      max_tokens: 500,
       temperature: 0.7,
       chat_template_kwargs: { enable_thinking: false },
     }),
@@ -585,18 +598,32 @@ async function expandVideoPrompt(chat: { port: number; model: string }, idea: st
 }
 
 // Make sure the video server runs. Starting it may need the chat instance on
-// its GPU stopped first: always asked, never done silently.
-async function ensureGenServer(ctx: CommandCtx): Promise<number> {
+// its GPU stopped first: always asked, never done silently, and never from the
+// tool (mayStopChat false): that chat instance may be the model calling it.
+interface UiLike {
+  mode?: string;
+  hasUI?: boolean;
+  ui: { confirm(title: string, message: string): Promise<boolean>; setStatus(key: string, text: string | undefined): void; notify(message: string, kind?: string): void };
+}
+async function ensureGenServer(ctx: UiLike, mayStopChat = true): Promise<number> {
   const gen = await getGenStatus();
   if (!gen) throw new Error("the server has no radiance.gen block (video server not configured)");
   if (gen.running) return gen.port;
   const rad = await getRadStatus();
   const radKey = gen.gpu === 1 ? "r9700b" : "r9700a";
   const blocker = rad?.find((r) => r.gpu_id === radKey && r.running);
-  if (ctx.mode !== "tui" && blocker) {
+  if (blocker && !mayStopChat) {
+    throw new Error(
+      `the video server needs GPU ${gen.gpu}, which is running the chat model ${blocker.model ?? ""} on port ${blocker.port}. ` +
+        `This tool does not stop chat models. Tell the user to free GPU ${gen.gpu} (the /llamesa-video command ` +
+        "offers to switch it to video), then call llamesa_make_video again.",
+    );
+  }
+  const interactive = ctx.mode === "tui" || ctx.hasUI === true;
+  if (!interactive && blocker) {
     throw new Error(`GPU ${gen.gpu} is running ${blocker.model ?? "a chat model"}; stop it first`);
   }
-  if (ctx.mode === "tui") {
+  if (interactive) {
     const msg = blocker
       ? `This stops ${blocker.model ?? "the chat model"} on GPU ${gen.gpu} (port ${blocker.port}) and starts the video server there.`
       : `Start the video server on GPU ${gen.gpu} (port ${gen.port})? It takes about 15 s.`;
@@ -642,11 +669,46 @@ function videoFileBase(idea: string): string {
   return `${stamp}-${slug}`;
 }
 
+// The server refuses an over-long prompt with "the prompt is N tokens; this
+// model takes at most 1024". Callers catch this to condense and retry.
+class PromptTooLongError extends Error {
+  constructor(message: string, readonly tokens: number | null) {
+    super(message);
+  }
+}
+
+const IMAGE_TYPES: Record<string, string> = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp" };
+
+// An image file as a data URL for input_reference (the video's first frame).
+// Verified on the server: a JSON data URL makes frame 0 the image.
+async function imageDataUrl(path: string): Promise<string> {
+  const ext = extname(path).toLowerCase();
+  const type = IMAGE_TYPES[ext];
+  if (!type) throw new Error(`first-frame image must be .png, .jpg, .jpeg or .webp: ${path}`);
+  const bytes = await readFile(path);
+  return `data:${type};base64,${bytes.toString("base64")}`;
+}
+
+interface VideoExtras {
+  imagePath?: string; // first frame
+  outDir?: string; // default VIDEO_DIR
+  fileName?: string; // without extension
+  setStatus?: (text: string | undefined) => void;
+}
+
 // Queue one video, poll it with a live status line, save MP4 + prompt locally.
-async function generateVideo(ctx: CommandCtx, port: number, prompt: string, idea: string, opts: VideoOptions): Promise<string> {
+async function generateVideo(
+  port: number,
+  prompt: string,
+  idea: string,
+  opts: Pick<VideoOptions, "size" | "seconds" | "seed">,
+  extras: VideoExtras = {},
+): Promise<{ file: string; seconds: string; madeInS: number }> {
+  const setStatus = extras.setStatus ?? (() => {});
   const base = `http://${SSH_HOST}:${port}/v1/videos`;
   const body: Record<string, unknown> = { prompt, size: opts.size, seed: opts.seed };
   if (opts.seconds) body.seconds = opts.seconds;
+  if (extras.imagePath) body.input_reference = await imageDataUrl(extras.imagePath);
   const res = await fetch(base, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -654,7 +716,12 @@ async function generateVideo(ctx: CommandCtx, port: number, prompt: string, idea
     signal: AbortSignal.timeout(60_000),
   });
   const job = (await res.json()) as { id?: string; status?: string; error?: { message?: string } | null };
-  if (!res.ok || !job.id) throw new Error(job.error?.message ?? `video request HTTP ${res.status}`);
+  if (!res.ok || !job.id) {
+    const msg = job.error?.message ?? `video request HTTP ${res.status}`;
+    const m = /prompt is (\d+) tokens/.exec(msg);
+    if (m) throw new PromptTooLongError(msg, Number(m[1]));
+    throw new Error(msg);
+  }
   const startedAt = Date.now();
   let last: Record<string, unknown> = job as Record<string, unknown>;
   try {
@@ -668,26 +735,57 @@ async function generateVideo(ctx: CommandCtx, port: number, prompt: string, idea
       if (Date.now() - startedAt > VIDEO_JOB_TIMEOUT_MS) throw new Error("video job timed out after 15 min");
       const secs = Math.round((Date.now() - startedAt) / 1000);
       const steps = last.steps_total ? ` step ${last.steps_done ?? 0}/${last.steps_total}` : "";
-      ctx.ui.setStatus("llamesa", `video ${status || "queued"}${steps} · ${last.progress ?? 0}% · ${secs}s`);
+      setStatus(`video ${status || "queued"}${steps} · ${last.progress ?? 0}% · ${secs}s`);
       await sleep(1_500);
       const r = await fetch(`${base}/${job.id}`, { signal: AbortSignal.timeout(15_000) });
       last = (await r.json()) as Record<string, unknown>;
     }
-    ctx.ui.setStatus("llamesa", "video done · downloading …");
+    setStatus("video done · downloading …");
     const mp4 = await fetch(`${base}/${job.id}/content`, { signal: AbortSignal.timeout(300_000) });
     if (!mp4.ok) throw new Error(`download HTTP ${mp4.status}`);
     const bytes = Buffer.from(await mp4.arrayBuffer());
-    await mkdir(VIDEO_DIR, { recursive: true });
-    const fileBase = join(VIDEO_DIR, videoFileBase(idea));
+    const outDir = extras.outDir ?? VIDEO_DIR;
+    await mkdir(outDir, { recursive: true });
+    const fileBase = join(outDir, extras.fileName ? extras.fileName.replace(/\.mp4$/i, "") : videoFileBase(idea));
+    const madeInS = Math.round((Date.now() - startedAt) / 1000);
+    const seconds = String(last.seconds ?? opts.seconds ?? "auto");
     await writeFile(`${fileBase}.mp4`, bytes);
     await writeFile(
       `${fileBase}.txt`,
-      `idea: ${idea}\nprompt: ${prompt}\nsize: ${opts.size}\nseconds: ${last.seconds ?? opts.seconds ?? "auto"}\nseed: ${opts.seed}\nmodel: ${last.model ?? ""}\nmade in: ${Math.round((Date.now() - startedAt) / 1000)} s\n`,
+      `idea: ${idea}\nprompt: ${prompt}\nfirst frame: ${extras.imagePath ?? "none"}\nsize: ${opts.size}\nseconds: ${seconds}\nseed: ${opts.seed}\nmodel: ${last.model ?? ""}\nmade in: ${madeInS} s\n`,
     );
-    return `${fileBase}.mp4`;
+    return { file: `${fileBase}.mp4`, seconds, madeInS };
   } finally {
-    ctx.ui.setStatus("llamesa", undefined);
+    setStatus(undefined);
   }
+}
+
+// Paths the user named in a /llamesa-video line: quoted or bare, with a
+// leading @ allowed. Only paths that exist are returned.
+function findPathsInText(text: string, cwd: string): string[] {
+  const found: string[] = [];
+  const re = /"([^"]+)"|'([^']+)'|(@?(?:[A-Za-z]:)?[\\/]?[\w.\-\\/ ]+\.(?:md|txt|png|jpe?g|webp))/gi;
+  for (const m of text.matchAll(re)) {
+    const raw = (m[1] ?? m[2] ?? m[3] ?? "").trim().replace(/^@/, "");
+    if (!raw) continue;
+    const p = isAbsolute(raw) ? raw : resolve(cwd, raw);
+    if (existsSync(p) && !found.includes(p)) found.push(p);
+  }
+  return found;
+}
+
+// Images a markdown brief links to (![alt](path) or a bare `assets/x.jpg`),
+// resolved against the brief's folder; only existing files.
+function imagesInMarkdown(md: string, mdPath: string): string[] {
+  const dir = dirname(mdPath);
+  const out: string[] = [];
+  const re = /!\[[^\]]*\]\(([^)\s]+)\)|`([^`]+\.(?:png|jpe?g|webp))`/gi;
+  for (const m of md.matchAll(re)) {
+    const raw = decodeURIComponent((m[1] ?? m[2] ?? "").trim());
+    const p = isAbsolute(raw) ? raw : resolve(dir, raw);
+    if (existsSync(p) && !out.includes(p)) out.push(p);
+  }
+  return out;
 }
 
 async function askVideoOptions(ctx: CommandCtx, chatAvailable: boolean): Promise<VideoOptions> {
@@ -770,23 +868,81 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.setStatus("llamesa", "llamesa-video: checking servers …");
         const chat = await findChatPort();
         ctx.ui.setStatus("llamesa", undefined);
+
+        // Files named on the line: a .md/.txt brief is read (its text, not the
+        // path, goes to the prompt writer); images are first-frame candidates,
+        // as are the images the brief links to.
+        const cwd = (ctx as { cwd?: string }).cwd ?? process.cwd();
+        const paths = findPathsInText(idea, cwd);
+        const briefs = paths.filter((p) => /\.(md|txt)$/i.test(p));
+        const images = paths.filter((p) => IMAGE_TYPES[extname(p).toLowerCase()]);
+        let source = idea;
+        let label = idea;
+        if (briefs.length > 0) {
+          if (!chat) {
+            throw new Error("reading a brief needs a Qwen chat instance running (/llamesa-start) to turn it into a video prompt");
+          }
+          const texts = await Promise.all(briefs.map((b) => readFile(b, "utf8")));
+          for (let i = 0; i < briefs.length; i++) {
+            for (const img of imagesInMarkdown(texts[i], briefs[i])) if (!images.includes(img)) images.push(img);
+          }
+          source = `${idea}\n\n${briefs.map((b, i) => `Brief (${b}):\n${texts[i]}`).join("\n\n")}`;
+          label = briefs[0].replace(/^.*[\\/]/, "").replace(/\.(md|txt)$/i, "");
+          ctx.ui.notify(`read ${briefs.length} brief file(s)${images.length ? `, ${images.length} image(s) found` : ""}`, "info");
+        }
+        let firstFrame: string | undefined;
+        if (images.length > 0) {
+          if (ctx.mode === "tui") {
+            const none = "no first frame (text only)";
+            const pick = await ctx.ui.select(
+              "Start the video from an image? (keeps a person or product looking the same)",
+              [...images, none],
+            );
+            if (!pick) throw new Error("cancelled");
+            if (pick !== none) firstFrame = pick;
+          } else {
+            firstFrame = images[0];
+          }
+        }
+
         const opts = await askVideoOptions(ctx, chat !== null);
-        let prompt = idea;
-        if (opts.expand && chat) {
+        // A brief always goes through the prompt writer: its raw text is
+        // neither a shot description nor under the 1024-token limit.
+        const expand = briefs.length > 0 || (opts.expand && chat !== null);
+        let prompt = source;
+        if (expand && chat) {
           ctx.ui.setStatus("llamesa", "llamesa-video: Qwen is writing the prompt …");
-          prompt = await expandVideoPrompt(chat, idea);
+          prompt = await expandVideoPrompt(chat, source);
           ctx.ui.setStatus("llamesa", undefined);
           ctx.ui.notify(`prompt: ${prompt}`, "info");
           if (ctx.mode === "tui") {
-            const use = await ctx.ui.select("Use this prompt?", ["yes, make the video", "no, use my original text", "cancel"]);
+            const choices = briefs.length > 0
+              ? ["yes, make the video", "cancel"]
+              : ["yes, make the video", "no, use my original text", "cancel"];
+            const use = await ctx.ui.select("Use this prompt?", choices);
             if (!use || use === "cancel") throw new Error("cancelled");
             if (use.startsWith("no")) prompt = idea;
           }
         }
         const port = await ensureGenServer(ctx);
-        ctx.ui.notify(`making video: ${opts.size}, ${opts.seconds ? `${opts.seconds} s` : "auto length"}, seed ${opts.seed}`, "info");
-        const file = await generateVideo(ctx, port, prompt, idea, opts);
-        ctx.ui.notify(`video saved: ${file} (prompt and seed in the .txt beside it)`, "info");
+        ctx.ui.notify(
+          `making video: ${opts.size}, ${opts.seconds ? `${opts.seconds} s` : "auto length"}, seed ${opts.seed}${firstFrame ? `, first frame ${firstFrame}` : ""}`,
+          "info",
+        );
+        const setStatus = (t: string | undefined) => ctx.ui.setStatus("llamesa", t);
+        let result;
+        try {
+          result = await generateVideo(port, prompt, label, opts, { imagePath: firstFrame, setStatus });
+        } catch (err) {
+          if (!(err instanceof PromptTooLongError)) throw err;
+          if (!chat) throw new Error(`${err.message}. Shorten the text, or start Qwen (/llamesa-start) so it can condense it.`);
+          ctx.ui.notify(`${err.message}; asking Qwen to condense it`, "warning");
+          ctx.ui.setStatus("llamesa", "llamesa-video: Qwen is condensing the prompt …");
+          prompt = await expandVideoPrompt(chat, prompt);
+          ctx.ui.notify(`prompt: ${prompt}`, "info");
+          result = await generateVideo(port, prompt, label, opts, { imagePath: firstFrame, setStatus });
+        }
+        ctx.ui.notify(`video saved: ${result.file} (${result.seconds} s, made in ${result.madeInS} s; prompt and seed in the .txt beside it)`, "info");
       } catch (err) {
         ctx.ui.setStatus("llamesa", undefined);
         const msg = (err as Error).message;
@@ -794,6 +950,95 @@ export default function (pi: ExtensionAPI) {
       }
     },
   });
+
+  // The agent-facing way to make a video: the user asks in the normal prompt
+  // ("read brief.md and make the mirror reel, use assets/model.jpg"), Pi's
+  // model reads the files and views the images with its own tools, writes the
+  // shot description, and calls this. Plain JSON Schema (Pi validates any
+  // JSON Schema; no typebox import needed).
+  pi.registerTool({
+    name: "llamesa_make_video",
+    label: "LLaMesa video",
+    description:
+      "Generate one short video clip WITH a soundtrack on the user's local LTX-2.5 video server and save it as an MP4. " +
+      "One call makes one continuous shot of 0.7 to 6.7 seconds. The prompt is a shot description, not an instruction: " +
+      `the video model reads at most ${VIDEO_PROMPT_TOKEN_LIMIT} tokens (keep it to one paragraph of about 80 to 200 words) ` +
+      "and draws any written words it contains on screen. Optionally start from an image (first frame), " +
+      "which keeps a person, product or place looking like the reference. Takes about 20 to 45 s per clip.",
+    promptSnippet: "Generate a short video clip with sound from a shot description (optional first-frame image)",
+    promptGuidelines: [
+      "Use llamesa_make_video when the user asks to make, generate or render a video or clip. Read any brief, script or .md file and view any reference images first with your own tools, then write the prompt yourself.",
+      "The prompt for llamesa_make_video must be ONE paragraph describing one continuous shot: subject and setting, motion, camera shot and movement, light and colour, and the sounds heard, in concrete present-tense visual language, about 80 to 200 words.",
+      "Never put instructions, file names, paths, URLs, hashtags, titles, captions, subtitles, brand names, logos or quoted words into the llamesa_make_video prompt unless the user explicitly asks for on-screen text: the video model renders written words as on-screen text. Describe speech by who speaks and how it sounds, not the exact words.",
+      "When the user gives reference images of a person or product for llamesa_make_video, pass the best matching one as image_path so the clip starts from it, and describe the same person or product in the prompt.",
+      "For a multi-shot piece, call llamesa_make_video once per shot with a consistent description of recurring people and places, and tell the user the clips are separate files (there is no editing or joining).",
+      "If llamesa_make_video reports the prompt is too long, rewrite it shorter and call it again; do not split one shot into several calls for that reason.",
+    ],
+    parameters: {
+      type: "object",
+      properties: {
+        prompt: { type: "string", description: "One-paragraph shot description (visuals and sound only, no on-screen words unless asked)." },
+        image_path: { type: "string", description: "Optional first-frame image (.png, .jpg, .jpeg, .webp); absolute or relative to the working directory." },
+        size: {
+          type: "string",
+          enum: ["960x544", "1280x704", "544x960", "704x1280", "768x768"],
+          description: "Landscape 960x544 (default, about 22 s per 5 s clip), 1280x704 (about 42 s), portrait 544x960 or 704x1280 (reels, stories), square 768x768.",
+        },
+        seconds: { type: "number", minimum: 0.7, maximum: 6.7, description: "Clip length in seconds; omit to let the model choose from the prompt." },
+        seed: { type: "integer", description: "Optional seed; the same prompt, size and seed give the same clip." },
+        output_dir: { type: "string", description: `Folder to save into (default ${VIDEO_DIR}).` },
+        file_name: { type: "string", description: "Optional file name without extension (default: timestamp and a slug)." },
+      },
+      required: ["prompt"],
+      additionalProperties: false,
+    } as never,
+    async execute(_toolCallId: string, params: Record<string, unknown>, _signal: unknown, onUpdate: ((u: unknown) => void) | undefined, ctx: UiLike & { cwd?: string }) {
+      const cwd = ctx.cwd ?? process.cwd();
+      const fix = (p?: unknown) => {
+        if (typeof p !== "string" || !p.trim()) return undefined;
+        const raw = p.trim().replace(/^@/, "");
+        return isAbsolute(raw) ? raw : resolve(cwd, raw);
+      };
+      const prompt = String(params.prompt ?? "").trim();
+      const imagePath = fix(params.image_path);
+      const outDir = fix(params.output_dir);
+      const size = typeof params.size === "string" ? params.size : "960x544";
+      const seconds = typeof params.seconds === "number" ? String(Math.min(6.7, Math.max(0.7, params.seconds))) : null;
+      const seed = Number.isInteger(params.seed) ? (params.seed as number) : Math.floor(Math.random() * 2 ** 31);
+      const fail = (text: string) => ({ content: [{ type: "text", text }], details: {}, isError: true });
+      if (!prompt) return fail("prompt is empty");
+      if (imagePath && !existsSync(imagePath)) return fail(`image_path not found: ${imagePath}`);
+      const progress = (t: string | undefined) => {
+        ctx.ui.setStatus("llamesa", t);
+        if (t) onUpdate?.({ content: [{ type: "text", text: t }], details: {} });
+      };
+      try {
+        progress("checking the video server …");
+        const port = await ensureGenServer(ctx, false);
+        const r = await generateVideo(port, prompt, typeof params.file_name === "string" ? params.file_name : prompt.slice(0, 60), { size, seconds, seed }, {
+          imagePath,
+          outDir,
+          fileName: typeof params.file_name === "string" ? params.file_name : undefined,
+          setStatus: progress,
+        });
+        return {
+          content: [{
+            type: "text",
+            text: `Saved ${r.file} (${r.seconds} s, ${size}, seed ${seed}${imagePath ? `, first frame ${imagePath}` : ""}, made in ${r.madeInS} s). The prompt and seed are in the .txt file beside it.`,
+          }],
+          details: { file: r.file, seconds: r.seconds, size, seed, imagePath: imagePath ?? null },
+        };
+      } catch (err) {
+        if (err instanceof PromptTooLongError) {
+          return fail(`${err.message}. Rewrite the prompt as a shorter single paragraph (about 80 to 200 words) and call llamesa_make_video again.`);
+        }
+        const msg = (err as Error).message;
+        return fail(msg === "cancelled" ? "The user declined to start the video server." : `llamesa_make_video failed: ${msg}`);
+      } finally {
+        ctx.ui.setStatus("llamesa", undefined);
+      }
+    },
+  } as never);
 
   pi.registerCommand("llamesa-video-stop", {
     description: "Stop the Radiance video server (frees its GPU for chat)",

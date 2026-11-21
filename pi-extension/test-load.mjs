@@ -3,10 +3,12 @@ import { createJiti } from "jiti";
 const jiti = createJiti(import.meta.url, { interopDefault: true });
 
 const commands = new Map();
+const tools = new Map();
 const events = new Map();
 const pi = {
   on: (name, handler) => events.set(name, handler),
   registerCommand: (name, opts) => commands.set(name, opts),
+  registerTool: (def) => tools.set(def.name, def),
 };
 
 const mod = jiti(new URL("./index.ts", import.meta.url).href);
@@ -15,6 +17,7 @@ factory(pi);
 
 console.log("loaded OK");
 console.log("commands:", [...commands.keys()].join(", "));
+console.log("tools:", [...tools.keys()].join(", ") || "(none)");
 console.log("events:", [...events.keys()].join(", "));
 
 const ctx = {
