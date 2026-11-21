@@ -398,6 +398,36 @@ The host test folder `~/radiance-eval` (benchmark scripts, raw logs and the eval
 
 Rollback: `cp ~/.llamesa/llamesa.sh.bak-20261122-rad22 ~/.llamesa/llamesa.sh`, the same for `config.json`, then `llamesa.sh restart-rad`. The new `.rad` files can stay.
 
+## Video generation: LTX-2.5 distilled (2026-11-22)
+
+`StillDeadcode/radiance-ltx-2.5-distilled-iq8r` (36.86 GiB, gated: the LTX-2.x Community License must be accepted on Hugging Face, and the host needs `hf auth login`). It runs on one card only (`tp` above 1 is refused); its 14 GiB text encoder is pinned in host RAM (`vision-tower-placement: ram`). Radiance serves OpenAI's video API: `POST /v1/videos`, poll `GET /v1/videos/{id}` (`status`, `progress`, `steps_done`/`steps_total`), download `GET /v1/videos/{id}/content`.
+
+Measured on GPU 1 (Radiance 2.2.0):
+
+| Test | Result |
+|---|---|
+| Start | ready in 14 s; 31.4 GiB VRAM; about 16 GiB host RAM pinned |
+| 5 s at 960x544 | 22 s, every run (the card says 24 s) |
+| 5 s at 1280x704 | 42 s |
+| Length | 0.71 to 6.71 s; an 8 s request is refused (400) |
+| Same seed | byte-identical MP4 |
+| Output | H.264 24 fps, 48 kHz stereo AAC |
+| Stability | 9 clips over two sessions, Qwen on the other GPU during 2 of them; no kernel GPU faults; peak 329 W |
+
+Video quality was checked on still frames only; sound was not judged.
+
+Server commands (needs `"radiance": {"gen": {"models_dir": "...", "gpu": 1, "port": 1239}}`):
+
+| Command | What it does |
+|---|---|
+| `list-models-gen` | `.rad` files in `radiance.gen.models_dir` (kept apart from the chat models directory so chat pickers never list a video model) |
+| `start-gen [--model N] [--gpu K]` | refuses while a chat instance or `-big` holds that GPU, or with less than 20 GB of free RAM; writes `~/.llamesa/rad-gen.yaml`, validates it with `--check`, starts `llamesa-radiance-gen`, waits for `/health` |
+| `stop-gen`, `status-gen` | stop; status JSON with model, GPU, port, uptime, VRAM |
+
+`start-rad` and `start-big` refuse while the video server holds a GPU.
+
+Pi extension: `/llamesa-video [description]` asks for size and length, optionally has a running Qwen instance expand the idea into the long description LTX was trained on (shown for approval), asks before starting the video server (and before stopping a chat instance on its GPU), shows step progress, and saves the MP4 plus a `.txt` with the prompt and seed to `~/Videos/llamesa`. `/llamesa-video-stop` stops the server; `/llamesa` shows it and `/llamesa-stop` stops it too. Tested through the extension's code with a simulated UI (three paths: plain text, Qwen-expanded with chat on the other GPU, and stopping chat on GPU 1 first), not in Pi's own interface.
+
 ## Open items
 
 1. The repo changes are uncommitted. The repo copy of `llamesa.sh` has the new `-rad` block and the `start-big` guard; the host copy is still ahead of the repo in other places (KV and spec options from another branch).

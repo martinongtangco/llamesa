@@ -1173,6 +1173,9 @@ cmd_start_big() {
                 error "Radiance is running (port ${rp}) and holds that GPU. Run 'stop-rad' first."
             fi
         done
+        if gen_holds_gpu 0 || gen_holds_gpu 1; then
+            error "The Radiance video server is running and holds a GPU. Run 'stop-gen' first."
+        fi
     fi
 
     if is_big_running >/dev/null 2>&1; then
@@ -2341,6 +2344,9 @@ cmd_start_rad() {
 
     local key
     for key in "${RAD_SEL[@]}"; do
+        if gen_holds_gpu "${RAD_INST_GPU[$key]}"; then
+            error "The video server is running on GPU ${RAD_INST_GPU[$key]} (instance ${key}). Run 'stop-gen' first."
+        fi
         if is_rad_running "$key"; then
             warn "Radiance ${key} is already running; replacing it."
             _stop_rad_instance "$key"
@@ -2550,6 +2556,206 @@ cmd_logs_rad() {
     fi
 }
 
+# ── -gen commands (Radiance video generation, opt-in) ─────────────────────
+# One generation container (LTX-2.5 and the like) on one GPU, separate from
+# the chat instances: its own models directory (so chat pickers never list a
+# video model), port, container, YAML and session file. A GPU holds either a
+# chat instance or the video server, never both. Needs a "radiance.gen" block:
+#   "gen": {"models_dir": "...", "gpu": 1, "port": 1239}
+# The model's large text encoder is kept in pinned host RAM
+# (vision-tower-placement: ram), as the LTX-2.5 container's card says.
+
+read_gen_config() {
+    read_radiance_config
+    jq -e '.radiance.gen' "$CONFIG_FILE" >/dev/null 2>&1 \
+        || error "no radiance.gen block in config.json (models_dir, gpu, port)"
+    GEN_MODELS_DIR=$(jq -r '.radiance.gen.models_dir // empty' "$CONFIG_FILE")
+    [[ -n "$GEN_MODELS_DIR" ]] || error "radiance.gen.models_dir not set"
+    GEN_GPU=$(jq -r '.radiance.gen.gpu // 1' "$CONFIG_FILE")
+    GEN_PORT=$(jq -r '.radiance.gen.port // 1239' "$CONFIG_FILE")
+    GEN_HOST=$(jq -r '.radiance.gen.host // .radiance.host // "0.0.0.0"' "$CONFIG_FILE")
+    GEN_IMAGE=$(jq -r --arg d "$RAD_IMAGE" '.radiance.gen.image // $d' "$CONFIG_FILE")
+    GEN_RAM_MB=$(jq -r '.radiance.gen.min_free_ram_mb // 20480' "$CONFIG_FILE")
+    GEN_NAME="${RAD_NAME}-gen"
+    GEN_YAML="${LLAMESA_DIR}/rad-gen.yaml"
+    GEN_LOG="${LLAMESA_DIR}/rad-gen.log"
+    GEN_SESSION="${LLAMESA_DIR}/gen_session.json"
+    [[ "$GEN_GPU" =~ ^[0-9]+$ ]] || error "radiance.gen.gpu must be a number"
+    [[ "$GEN_PORT" =~ ^[0-9]+$ ]] || error "radiance.gen.port must be a number"
+}
+
+is_gen_running() {
+    [[ "$(timeout 20 podman inspect -f '{{.State.Running}}' "$1" 2>/dev/null || true)" == "true" ]]
+}
+
+# True when the video server runs on GPU index $1 (used by start-rad).
+gen_holds_gpu() {
+    local gpu="$1" prefix sf g
+    [[ -f "$CONFIG_FILE" ]] || return 1
+    prefix=$(jq -r '.radiance.container_name // "llamesa-radiance"' "$CONFIG_FILE" 2>/dev/null)
+    is_gen_running "${prefix}-gen" || return 1
+    sf="${LLAMESA_DIR}/gen_session.json"
+    g=$(jq -r '.gpu // empty' "$sf" 2>/dev/null || true)
+    [[ -z "$g" ]] && g=$(jq -r '.radiance.gen.gpu // 1' "$CONFIG_FILE" 2>/dev/null)
+    [[ "$g" == "$gpu" ]]
+}
+
+cmd_list_models_gen() {
+    read_gen_config
+    [[ -d "$GEN_MODELS_DIR" ]] || { echo "[]"; return 0; }
+    local -a entries=()
+    local f
+    while IFS= read -r f; do
+        [[ -z "$f" ]] && continue
+        entries+=("{\"name\":\"$(basename "$f" .rad)\",\"path\":\"${f}\",\"size_bytes\":$(stat -c%s "$f" 2>/dev/null || echo 0),\"backend\":\"radiance-gen\"}")
+    done < <(find "$GEN_MODELS_DIR" -maxdepth 2 -name "*.rad" -type f 2>/dev/null | sort)
+    local IFS=,
+    echo "[${entries[*]}]"
+}
+
+cmd_start_gen() {
+    read_base_config
+    read_gen_config
+    local model_name=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --model) model_name="$2"; shift 2 ;;
+            *) error "Unknown option: $1" ;;
+        esac
+    done
+    if [[ -z "$model_name" ]]; then
+        model_name=$(find "$GEN_MODELS_DIR" -maxdepth 2 -name "*.rad" -type f 2>/dev/null | sort | head -1 | xargs -r basename -s .rad)
+        [[ -n "$model_name" ]] || error "no video models in ${GEN_MODELS_DIR}"
+    fi
+    local model_file="${GEN_MODELS_DIR}/${model_name}.rad"
+    [[ -f "$model_file" ]] || error "video model not found: ${model_name} (see list-models-gen)"
+    local gpu="${GEN_GPU}"
+    [[ -n "${GPU_ARG_GIVEN:-}" && "$GPU_ID" =~ ^[0-9]+$ ]] && gpu="$GPU_ID"
+
+    if is_gen_running "$GEN_NAME"; then
+        warn "The video server is already running; replacing it."
+        _stop_gen_container
+    fi
+    # A chat instance on that GPU, or -big on both, holds the VRAM.
+    local k
+    for k in "${RAD_KEYS[@]}"; do
+        if [[ "${RAD_INST_GPU[$k]}" == "$gpu" ]] && is_rad_running "$k"; then
+            error "Radiance chat instance ${k} is running on GPU ${gpu}. Run 'stop-rad --gpu ${k}' first."
+        fi
+    done
+    local big_port
+    big_port=$(jq -r '.vulkan_split.port // 1236' "$CONFIG_FILE" 2>/dev/null || echo 1236)
+    if ss -tln 2>/dev/null | grep -q ":${big_port} "; then
+        error "The llama.cpp combined-VRAM server is running on both GPUs (port ${big_port}). Run stop-big first."
+    fi
+    if ss -tln 2>/dev/null | grep -q ":${GEN_PORT} "; then
+        error "Port ${GEN_PORT} is already in use."
+    fi
+    local used_mib w
+    used_mib=$(_rad_gpu_vram_used_mib "$gpu")
+    for (( w = 0; w < 15 && used_mib > 2048; w++ )); do sleep 2; used_mib=$(_rad_gpu_vram_used_mib "$gpu"); done
+    [[ "$used_mib" -gt 2048 ]] && error "GPU ${gpu} already has ${used_mib} MiB of VRAM in use by another process."
+    # The text encoder (about 14 GiB) and the embedding table are pinned in host RAM.
+    local avail_mb
+    avail_mb=$(free -m 2>/dev/null | awk '/^Mem:/{print $7}')
+    if [[ -n "$avail_mb" && "$avail_mb" -lt "$GEN_RAM_MB" ]]; then
+        error "start-gen: only ${avail_mb} MB RAM available, the video server needs about ${GEN_RAM_MB} MB (pinned text encoder). Stop other servers first."
+    fi
+
+    mkdir -p "$LLAMESA_DIR"
+    {
+        echo "# written by llamesa.sh start-gen; regenerated on every start"
+        echo "server:"
+        echo "  host: ${GEN_HOST}"
+        echo "  port: ${GEN_PORT}"
+        echo "cards: [0]"
+        if [[ -n "$RAD_HEADROOM" ]]; then
+            echo "memory:"
+            echo "  gpu-headroom-mib: ${RAD_HEADROOM}"
+        fi
+        echo "models:"
+        echo "  \"${model_name}\":"
+        echo "    model: /models/$(basename "$model_file")"
+        echo "    vision-tower-placement: ram"
+    } > "$GEN_YAML"
+    local -a run_opts=(--network host --init --ulimit memlock=-1
+        --device /dev/kfd --device /dev/dri
+        --security-opt seccomp=unconfined --security-opt label=disable --group-add keep-groups
+        -e "ROCR_VISIBLE_DEVICES=${gpu}"
+        -v "${GEN_MODELS_DIR}:/models:ro" -v "${GEN_YAML}:/cfg/radiance.yaml:ro")
+    { echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting video server (GPU ${gpu}, port ${GEN_PORT}): ${GEN_IMAGE}"; cat "$GEN_YAML"; } > "$GEN_LOG"
+    info "Launching video server (${model_name}, GPU ${gpu}, port ${GEN_PORT})..."
+    timeout 60 podman rm -f "$GEN_NAME" >/dev/null 2>&1 || true
+    timeout 180 podman run --rm "${run_opts[@]}" "$GEN_IMAGE" --config /cfg/radiance.yaml --check >> "$GEN_LOG" 2>&1 \
+        || error "video server config check failed — see ${GEN_LOG}"
+    timeout 120 podman run -d --name "$GEN_NAME" "${run_opts[@]}" "$GEN_IMAGE" --config /cfg/radiance.yaml >> "$GEN_LOG" 2>&1 \
+        || error "podman run failed for the video server — see ${GEN_LOG}"
+
+    info "Waiting for the video server..."
+    local waited=0
+    while [[ $waited -lt 300 ]]; do
+        if ! is_gen_running "$GEN_NAME"; then
+            timeout 20 podman logs --tail 30 "$GEN_NAME" >> "$GEN_LOG" 2>&1 || true
+            _stop_gen_container
+            error "the video server exited during startup — see ${GEN_LOG}"
+        fi
+        if curl -sf --max-time 2 "http://localhost:${GEN_PORT}/health" >/dev/null 2>&1; then
+            printf '{\n  "model": "%s",\n  "gpu": %s,\n  "port": %s,\n  "image": "%s"\n}\n' \
+                "$model_name" "$gpu" "$GEN_PORT" "$GEN_IMAGE" > "$GEN_SESSION"
+            info "Video server is ready!"
+            cmd_status_gen
+            return 0
+        fi
+        sleep 2; waited=$((waited + 2))
+    done
+    warn "The video server did not respond after 300s. Check ${GEN_LOG}"
+    return 1
+}
+
+_stop_gen_container() {
+    if is_gen_running "$GEN_NAME"; then
+        info "Stopping the video server..."
+        timeout 60 podman logs "$GEN_NAME" >> "$GEN_LOG" 2>&1 || true
+        timeout 60 podman stop -t 30 "$GEN_NAME" >/dev/null 2>&1 || true
+    fi
+    timeout 30 podman rm -f "$GEN_NAME" >/dev/null 2>&1 || true
+}
+
+cmd_stop_gen() {
+    read_gen_config
+    local was=false
+    is_gen_running "$GEN_NAME" && was=true
+    _stop_gen_container
+    if [[ "$was" == "true" ]]; then info "Video server stopped."; else info "Video server is not running."; fi
+    echo '{"running":false}'
+}
+
+cmd_status_gen() {
+    read_gen_config
+    local running=false model=null gpu="$GEN_GPU" uptime=null vu=0 vt=0 vb=0
+    if is_gen_running "$GEN_NAME"; then
+        running=true
+        if [[ -f "$GEN_SESSION" ]]; then
+            model=$(jq -c '.model // null' "$GEN_SESSION" 2>/dev/null || echo null)
+            gpu=$(jq -r '.gpu // empty' "$GEN_SESSION" 2>/dev/null || echo "$GEN_GPU")
+        fi
+        local started st now el
+        started=$(timeout 20 podman inspect -f '{{.State.StartedAt}}' "$GEN_NAME" 2>/dev/null | cut -d. -f1 || true)
+        st=$(date -d "$started" +%s 2>/dev/null || echo 0); now=$(date +%s); el=$((now - st))
+        [[ $st -gt 0 ]] && uptime=$(printf '"%02d:%02d:%02d"' $((el/3600)) $(((el%3600)/60)) $((el%60)))
+    fi
+    gpu="${gpu:-$GEN_GPU}"
+    if jq -e --argjson id "$gpu" '.gpus[]? | select(.id == $id)' "$CONFIG_FILE" >/dev/null 2>&1; then
+        get_gpu_config "$gpu"
+        local dp="/sys/class/drm/card${GPU_DRM_CARD}/device"
+        vu=$(cat "${dp}/mem_info_vram_used" 2>/dev/null || echo 0)
+        vt=$(cat "${dp}/mem_info_vram_total" 2>/dev/null || echo 0)
+        vb=$(cat "${dp}/gpu_busy_percent" 2>/dev/null || echo 0)
+    fi
+    printf '{"running":%s,"backend":"radiance-gen","model":%s,"gpu":%s,"port":%s,"uptime":%s,"vram_used_bytes":%s,"vram_total_bytes":%s,"gpu_busy_percent":%s}\n' \
+        "$running" "$model" "$gpu" "$GEN_PORT" "$uptime" "$vu" "$vt" "$vb"
+}
+
 # ── Main ─────────────────────────────────────────────────────────────────
 
 usage() {
@@ -2627,6 +2833,14 @@ Commands:
   logs-rad    Stream one instance's logs (--gpu required when several are configured)
     Requires a radiance block in config.json — see docs/radiance-evaluation.md
 
+  list-models-gen  List video-generation (.rad) models as JSON
+  start-gen   Start the Radiance video server on one GPU (default radiance.gen.gpu)
+    --model <name>      Model from list-models-gen (default: the first one)
+    --gpu <0|1>         GPU index (refused while a chat instance runs on it)
+  stop-gen    Stop the video server
+  status-gen  Video server status as JSON
+    Requires a radiance.gen block (models_dir, gpu, port) in config.json
+
   help        Show this help message
 
 Config: ~/.llamesa/config.json
@@ -2667,6 +2881,10 @@ main() {
         restart-rad)  cmd_restart_rad "$@" ;;
         status-rad)   cmd_status_rad "$@" ;;
         logs-rad)     cmd_logs_rad "$@" ;;
+        list-models-gen) cmd_list_models_gen "$@" ;;
+        start-gen)    cmd_start_gen "$@" ;;
+        stop-gen)     cmd_stop_gen "$@" ;;
+        status-gen)   cmd_status_gen "$@" ;;
         help|--help|-h) usage ;;
         *)           error "Unknown command: ${command}. Run 'llamesa.sh help' for usage." ;;
     esac
