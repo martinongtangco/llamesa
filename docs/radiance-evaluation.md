@@ -428,6 +428,8 @@ Server commands (needs `"radiance": {"gen": {"models_dir": "...", "gpu": 1, "por
 
 Pi extension: `/llamesa-video [description]` asks for size and length, optionally has a running Qwen instance expand the idea into the long description LTX was trained on (shown for approval), asks before starting the video server (and before stopping a chat instance on its GPU), shows step progress, and saves the MP4 plus a `.txt` with the prompt and seed to `~/Videos/llamesa`. `/llamesa-video-stop` stops the server; `/llamesa` shows it and `/llamesa-stop` stops it too. Tested through the extension's code with a simulated UI (three paths: plain text, Qwen-expanded with chat on the other GPU, and stopping chat on GPU 1 first), not in Pi's own interface.
 
+Windows client: `/video` and `/video-stop` in the command palette, the same flow (size, length, optional Qwen prompt, asks before starting the server or stopping a chat instance, live step progress, MP4 + `.txt` saved to the Videos folder, offers to open it). Tested by running `Cmd-Video` with scripted answers (server not running, Qwen on GPU 0 writing the prompt); the client's own screens were not driven. The client's `/stop` does not stop the video server; use `/video-stop`.
+
 ## Open items
 
 1. The repo changes are uncommitted. The repo copy of `llamesa.sh` has the new `-rad` block and the `start-big` guard; the host copy is still ahead of the repo in other places (KV and spec options from another branch).

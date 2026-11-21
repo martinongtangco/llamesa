@@ -2596,6 +2596,188 @@ function Cmd-Servers {
     Start-Sleep -Seconds 1
 }
 
+# ── Command: /video, /video-stop ──────────────────────────────────────────
+# Short videos with sound on the server's Radiance video server (start-gen,
+# LTX-2.5). Same flow as the Pi extension's /llamesa-video: describe, pick size
+# and length, optionally let a running Qwen instance write the long description
+# LTX was trained on, then queue, poll and save the MP4 + prompt locally.
+
+$Script:VideoDir = Join-Path ([Environment]::GetFolderPath('MyVideos')) 'llamesa'
+
+function Get-GenStatus {
+    return ConvertFrom-ServerJson (Invoke-ServerCommand "status-gen" -raw)
+}
+
+function Get-VideoPromptWriter {
+    foreach ($r in @(Get-RadRunning)) {
+        try {
+            $m = Invoke-RestMethod -Uri ("http://{0}:{1}/v1/models" -f $Script:ActiveServer.host, $r.port) -TimeoutSec 5
+            if ($m.data -and $m.data.Count -gt 0) {
+                return [PSCustomObject]@{ Port = $r.port; Model = $m.data[0].id }
+            }
+        } catch { Write-Verbose "prompt writer probe failed on port $($r.port): $_" }
+    }
+    return $null
+}
+
+function Expand-VideoPrompt {
+    param($Writer, [string]$Idea)
+    $system = "You write prompts for a text-to-video model that also generates the soundtrack. " +
+        "Rewrite the user's idea as ONE paragraph of 80 to 140 words describing: the subject and setting, " +
+        "the motion and action over a few seconds, the camera shot and movement, the light and colour, " +
+        "and the sounds heard. Concrete visual language, present tense, no lists, no title, no quotes, " +
+        "no text overlays unless asked. Output only the paragraph."
+    $body = @{
+        model = $Writer.Model
+        messages = @(@{ role = "system"; content = $system }, @{ role = "user"; content = $Idea })
+        max_tokens = 400
+        temperature = 0.7
+        chat_template_kwargs = @{ enable_thinking = $false }
+    } | ConvertTo-Json -Depth 5
+    $res = Invoke-RestMethod -Method Post -Uri ("http://{0}:{1}/v1/chat/completions" -f $Script:ActiveServer.host, $Writer.Port) `
+        -ContentType "application/json" -Body ([Text.Encoding]::UTF8.GetBytes($body)) -TimeoutSec 120
+    $text = "$($res.choices[0].message.content)".Trim().Trim('"')
+    if (-not $text) { throw "the prompt writer returned nothing" }
+    return $text
+}
+
+function Get-VideoFileBase {
+    param([string]$Idea)
+    $slug = ($Idea.ToLower() -replace '[^a-z0-9]+', '-').Trim('-')
+    if ($slug.Length -gt 40) { $slug = $slug.Substring(0, 40).Trim('-') }
+    if (-not $slug) { $slug = "video" }
+    return Join-Path $Script:VideoDir ("{0}-{1}" -f (Get-Date -Format "yyyyMMdd-HHmmss"), $slug)
+}
+
+function Cmd-Video {
+    $gen = Get-GenStatus
+    if (-not $gen) {
+        Write-Host ("{0}The server has no video server configured (radiance.gen block).{1}" -f $red, $reset)
+        return
+    }
+
+    Write-Host ""
+    $idea = (Read-Host "Describe the video (a shot, what moves, the mood, any sound)").Trim()
+    if (-not $idea) { Write-Host ("{0}Cancelled.{1}" -f $gray, $reset); return }
+
+    $sizes = @(
+        [PSCustomObject]@{ Label = "960x544 landscape (about 22 s for 5 s of video)"; Size = "960x544" },
+        [PSCustomObject]@{ Label = "1280x704 landscape (about 42 s)"; Size = "1280x704" },
+        [PSCustomObject]@{ Label = "544x960 portrait"; Size = "544x960" },
+        [PSCustomObject]@{ Label = "704x1280 portrait"; Size = "704x1280" },
+        [PSCustomObject]@{ Label = "768x768 square"; Size = "768x768" }
+    )
+    $size = Read-SelectList -Items $sizes -LabelFn { param($s) $s.Label } `
+        -HeaderFn { Write-Host ("  {0}Video size:{1}" -f $white, $reset) }
+    if (-not $size) { Write-Host ("{0}Cancelled.{1}" -f $gray, $reset); return }
+
+    $lengths = @(
+        [PSCustomObject]@{ Label = "auto (the model picks from the prompt)"; Seconds = $null },
+        [PSCustomObject]@{ Label = "3 s"; Seconds = "3" },
+        [PSCustomObject]@{ Label = "5 s"; Seconds = "5" },
+        [PSCustomObject]@{ Label = "6.7 s (the longest it makes)"; Seconds = "6.7" }
+    )
+    $length = Read-SelectList -Items $lengths -LabelFn { param($l) $l.Label } `
+        -HeaderFn { Write-Host ("  {0}Length:{1}" -f $white, $reset) }
+    if (-not $length) { Write-Host ("{0}Cancelled.{1}" -f $gray, $reset); return }
+
+    $prompt = $idea
+    $writer = Get-VideoPromptWriter
+    if ($writer) {
+        $expand = Read-SelectList -Items @("yes, let Qwen expand my idea", "no, use my text as is") -LabelFn { param($x) $x } `
+            -HeaderFn { Write-Host ("  {0}Let Qwen write the detailed prompt? (LTX works best with a long description){1}" -f $white, $reset) }
+        if (-not $expand) { Write-Host ("{0}Cancelled.{1}" -f $gray, $reset); return }
+        if ($expand -like "yes*") {
+            Write-Host ("{0}Qwen is writing the prompt...{1}" -f $cyan, $reset)
+            try {
+                $expanded = Expand-VideoPrompt -Writer $writer -Idea $idea
+                Write-Host ""
+                Write-Host ("  {0}{1}{2}" -f $white, $expanded, $reset)
+                Write-Host ""
+                $use = Read-Host "Use this prompt? (Y = yes, n = my original text, c = cancel)"
+                if ($use -match '^[cC]') { Write-Host ("{0}Cancelled.{1}" -f $gray, $reset); return }
+                if ($use -notmatch '^[nN]') { $prompt = $expanded }
+            } catch {
+                Write-Host ("{0}Prompt writer failed ({1}); using your text.{2}" -f $amber, $_.Exception.Message, $reset)
+            }
+        }
+    }
+
+    # Start the video server if needed; never stop a chat model without asking.
+    if (-not $gen.running) {
+        $genKey = if ([int]$gen.gpu -eq 1) { "r9700b" } else { "r9700a" }
+        $blocker = @(Get-RadRunning | Where-Object { $_.gpu_id -eq $genKey })
+        if ($blocker.Count -gt 0) {
+            $ans = Read-Host ("The video server needs GPU {0}, which is running {1} (port {2}). Stop it? (y/N)" -f $gen.gpu, (Get-FriendlyModelName $blocker[0].model), $blocker[0].port)
+            if ($ans -notmatch '^[yY]') { Write-Host ("{0}Cancelled.{1}" -f $gray, $reset); return }
+            $null = Invoke-ServerCommandChecked ("stop-rad --gpu {0}" -f $genKey)
+            Start-Sleep -Seconds 3
+        } else {
+            $ans = Read-Host ("Start the video server on GPU {0} (port {1}, about 15 s)? (Y/n)" -f $gen.gpu, $gen.port)
+            if ($ans -match '^[nN]') { Write-Host ("{0}Cancelled.{1}" -f $gray, $reset); return }
+        }
+        Write-Host ("{0}Starting the video server...{1}" -f $cyan, $reset)
+        $result = Invoke-ServerCommandChecked "start-gen"
+        if ($result.ExitCode -ne 0) {
+            Write-Host ($result.Output -join "`n")
+            Write-Host ("{0}start-gen failed — see error above.{1}" -f $red, $reset)
+            return
+        }
+        Write-Host ("{0}✓ Video server is up on port {1}.{2}" -f $green, $gen.port, $reset)
+    }
+
+    $seed = Get-Random -Minimum 0 -Maximum 2147483647
+    $base = "http://{0}:{1}/v1/videos" -f $Script:ActiveServer.host, $gen.port
+    $req = @{ prompt = $prompt; size = $size.Size; seed = $seed }
+    if ($length.Seconds) { $req.seconds = $length.Seconds }
+    Write-Host ("{0}Making video: {1}, {2}, seed {3}{4}" -f $cyan, $size.Size, $(if ($length.Seconds) { "$($length.Seconds) s" } else { "auto length" }), $seed, $reset)
+    $started = Get-Date
+    try {
+        $job = Invoke-RestMethod -Method Post -Uri $base -ContentType "application/json" `
+            -Body ([Text.Encoding]::UTF8.GetBytes(($req | ConvertTo-Json -Depth 4))) -TimeoutSec 60
+        $state = $job
+        # Fields appear as the job advances (a queued job has no steps yet), and
+        # the client runs under strict mode, so read every one through Get-Prop.
+        while ((Get-Prop $state 'status' '') -ne "completed") {
+            $status = Get-Prop $state 'status' 'queued'
+            if ($status -in @("failed", "cancelled")) {
+                $err = Get-Prop $state 'error' $null
+                $why = if ($err) { Get-Prop $err 'message' "no reason given" } else { "no reason given" }
+                throw "video ${status}: $why"
+            }
+            if (((Get-Date) - $started).TotalMinutes -gt 15) { throw "video job timed out after 15 min" }
+            $total = Get-Prop $state 'steps_total' $null
+            $steps = if ($total) { " step {0}/{1}" -f (Get-Prop $state 'steps_done' 0), $total } else { "" }
+            Write-Host -NoNewline ("`r  {0}{1} · {2}% · {3:N0}s   " -f $status, $steps, (Get-Prop $state 'progress' 0), ((Get-Date) - $started).TotalSeconds)
+            Start-Sleep -Milliseconds 1500
+            $state = Invoke-RestMethod -Uri ("{0}/{1}" -f $base, $job.id) -TimeoutSec 15
+        }
+        Write-Host ""
+        New-Item -ItemType Directory -Force -Path $Script:VideoDir | Out-Null
+        $fileBase = Get-VideoFileBase -Idea $idea
+        Invoke-WebRequest -Uri ("{0}/{1}/content" -f $base, $job.id) -OutFile "$fileBase.mp4" -TimeoutSec 300 -UseBasicParsing
+        $secs = [int]((Get-Date) - $started).TotalSeconds
+        @(
+            "idea: $idea", "prompt: $prompt", "size: $($size.Size)", "seconds: $(Get-Prop $state 'seconds' 'auto')",
+            "seed: $seed", "model: $(Get-Prop $state 'model' '')", "made in: $secs s"
+        ) | Set-Content -Path "$fileBase.txt" -Encoding UTF8
+        Write-Host ("{0}✓ Saved {1}.mp4 ({2} s){3}" -f $green, $fileBase, $secs, $reset)
+        $open = Read-Host "Open it now? (y/N)"
+        if ($open -match '^[yY]') { Start-Process "$fileBase.mp4" }
+    } catch {
+        Write-Host ""
+        $msg = $_.Exception.Message
+        if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $msg = $_.ErrorDetails.Message }
+        Write-Host ("{0}Video failed: {1}{2}" -f $red, $msg, $reset)
+    }
+}
+
+function Cmd-VideoStop {
+    $result = Invoke-ServerCommandChecked "stop-gen"
+    if ($result.ExitCode -eq 0) { Write-Host ("{0}✓ Video server stopped.{1}" -f $green, $reset) }
+    else { Write-Host ($result.Output -join "`n") }
+}
+
 # ── Command: /config ──────────────────────────────────────────────────────
 
 function Cmd-Config {
@@ -2635,6 +2817,8 @@ $Script:PaletteCommands = @(
     [PSCustomObject]@{ Name = "logs";     Desc = "tail verbose server output" }
     [PSCustomObject]@{ Name = "models";   Desc = "list downloaded models + sizes" }
     [PSCustomObject]@{ Name = "download"; Desc = "download from huggingface" }
+    [PSCustomObject]@{ Name = "video";    Desc = "make a short video with sound (Radiance video server)" }
+    [PSCustomObject]@{ Name = "video-stop"; Desc = "stop the video server (frees its GPU)" }
     [PSCustomObject]@{ Name = "clear";    Desc = "clear chat history" }
     [PSCustomObject]@{ Name = "think";    Desc = "enable thinking mode" }
     [PSCustomObject]@{ Name = "nothink";  Desc = "disable thinking mode" }
@@ -2643,7 +2827,7 @@ $Script:PaletteCommands = @(
     [PSCustomObject]@{ Name = "quit";     Desc = "exit LLaMesa" }
 )
 
-$Script:ServerDependentCommands = @("start", "start-2nd", "start-big", "start-llama", "start-rad", "stop", "restart", "engine", "health", "logs", "models", "download")
+$Script:ServerDependentCommands = @("start", "start-2nd", "start-big", "start-llama", "start-rad", "stop", "restart", "engine", "health", "logs", "models", "download", "video", "video-stop")
 
 function Invoke-PaletteCommand {
     param([string]$cmd)
@@ -2670,6 +2854,8 @@ function Invoke-PaletteCommand {
         "logs"     { Cmd-Logs }
         "models"   { Cmd-Models;   Read-Host "`nPress Enter to continue" | Out-Null }
         "download" { Cmd-Download; Read-Host "`nPress Enter to continue" | Out-Null }
+        "video"    { Cmd-Video;    Read-Host "`nPress Enter to continue" | Out-Null }
+        "video-stop" { Cmd-VideoStop; Read-Host "`nPress Enter to continue" | Out-Null }
         "clear"    { Cmd-ClearChat }
         "think"    { Cmd-Think }
         "nothink"  { Cmd-NoThink }
