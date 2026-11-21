@@ -1,6 +1,9 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { execFile } from "node:child_process";
+import { mkdir, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 // Single transport: SSH, key-based, to the Tailscale IP.
 // On the server box itself, ssh to the same IP (or 127.0.0.1) with the same key.
@@ -9,6 +12,20 @@ const SSH_HOST = "100.126.215.69";
 const FALLBACK_PORTS = [1234, 1235];
 const HEALTH_TIMEOUT_MS = 300_000; // matches server-side health wait
 const HEALTH_POLL_MS = 2_000;
+const VIDEO_DIR = join(homedir(), "Videos", "llamesa");
+const VIDEO_JOB_TIMEOUT_MS = 15 * 60_000;
+
+// Radiance video server (start-gen) status.
+interface GenStatus {
+  running: boolean;
+  model: string | null;
+  gpu: number;
+  port: number;
+  uptime: string | null;
+  vram_used_bytes: number;
+  vram_total_bytes: number;
+  gpu_busy_percent: number;
+}
 
 interface GpuStatus {
   gpu_id: number;
@@ -100,6 +117,16 @@ async function getRadStatus(): Promise<RadStatus[] | null> {
     const parsed = extractJson(out);
     const arr = Array.isArray(parsed) ? parsed : [parsed];
     return arr as RadStatus[];
+  } catch {
+    return null;
+  }
+}
+
+// Video server status. Null when the server has no radiance.gen block.
+async function getGenStatus(): Promise<GenStatus | null> {
+  try {
+    const out = await runLlamesa(["status-gen"]);
+    return extractJson(out) as GenStatus;
   } catch {
     return null;
   }
@@ -236,7 +263,7 @@ interface ViewEntry {
   running: boolean;
   model: string | null;
   uptime: string | null;
-  backend: "radiance" | "llama.cpp";
+  backend: "radiance" | "llama.cpp" | "radiance video";
   vramUsed: number;
   vramTotal: number;
   gpuBusy: number;
@@ -246,8 +273,18 @@ interface ViewEntry {
   hostStatsValid: boolean;
 }
 
-function mergeStatus(gpus: GpuStatus[], rad: RadStatus[] | null): ViewEntry[] {
+function mergeStatus(gpus: GpuStatus[], rad: RadStatus[] | null, gen: GenStatus | null = null): ViewEntry[] {
   return gpus.map((g) => {
+    // The video server takes a whole GPU; when it runs there it wins the view.
+    if (gen?.running && gen.gpu === g.gpu_id) {
+      return {
+        gpuId: g.gpu_id, name: g.gpu_name, port: gen.port, running: true,
+        model: gen.model, uptime: gen.uptime, backend: "radiance video",
+        vramUsed: g.vram_used_bytes, vramTotal: g.vram_total_bytes,
+        gpuBusy: gen.gpu_busy_percent, cpuPercent: 0, ramUsedMb: 0, ramTotalMb: 0,
+        hostStatsValid: false,
+      };
+    }
     const r = rad?.find((x) => x.port === g.port);
     const radUp = r?.running === true;
     const up = radUp || g.running;
@@ -479,6 +516,204 @@ function startCommand(gpuId: number, label: string) {
   };
 }
 
+// ── Video generation (Radiance video server, start-gen) ──────────────────
+
+const VIDEO_SIZES: Array<{ label: string; size: string }> = [
+  { label: "960x544 landscape (about 22 s for 5 s of video)", size: "960x544" },
+  { label: "1280x704 landscape (about 42 s)", size: "1280x704" },
+  { label: "544x960 portrait", size: "544x960" },
+  { label: "704x1280 portrait", size: "704x1280" },
+  { label: "768x768 square", size: "768x768" },
+];
+const VIDEO_LENGTHS: Array<{ label: string; seconds: string | null }> = [
+  { label: "auto (the model picks from the prompt)", seconds: null },
+  { label: "3 s", seconds: "3" },
+  { label: "5 s", seconds: "5" },
+  { label: "6.7 s (the longest it makes)", seconds: "6.7" },
+];
+
+interface VideoOptions {
+  size: string;
+  seconds: string | null;
+  seed: number;
+  expand: boolean;
+}
+
+// A running Radiance chat instance to write the prompt with (first healthy one).
+async function findChatPort(): Promise<{ port: number; model: string } | null> {
+  const rad = await getRadStatus();
+  for (const r of rad ?? []) {
+    if (!r.running) continue;
+    try {
+      const res = await fetch(`http://${SSH_HOST}:${r.port}/v1/models`, { signal: AbortSignal.timeout(5_000) });
+      const j = (await res.json()) as { data?: Array<{ id: string }> };
+      const id = j.data?.[0]?.id;
+      if (id) return { port: r.port, model: id };
+    } catch {
+      // try the next instance
+    }
+  }
+  return null;
+}
+
+// LTX-2.5 was trained on long single-paragraph captions; short prompts give
+// generic results. Ask the chat model to write one from the user's idea.
+async function expandVideoPrompt(chat: { port: number; model: string }, idea: string): Promise<string> {
+  const system =
+    "You write prompts for a text-to-video model that also generates the soundtrack. " +
+    "Rewrite the user's idea as ONE paragraph of 80 to 140 words describing: the subject and setting, " +
+    "the motion and action over a few seconds, the camera shot and movement, the light and colour, " +
+    "and the sounds heard. Concrete visual language, present tense, no lists, no title, no quotes, " +
+    "no text overlays unless asked. Output only the paragraph.";
+  const res = await fetch(`http://${SSH_HOST}:${chat.port}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: chat.model,
+      messages: [{ role: "system", content: system }, { role: "user", content: idea }],
+      max_tokens: 400,
+      temperature: 0.7,
+      chat_template_kwargs: { enable_thinking: false },
+    }),
+    signal: AbortSignal.timeout(120_000),
+  });
+  if (!res.ok) throw new Error(`prompt writer HTTP ${res.status}`);
+  const j = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
+  const text = j.choices?.[0]?.message?.content?.trim();
+  if (!text) throw new Error("prompt writer returned nothing");
+  return text.replace(/^["']|["']$/g, "");
+}
+
+// Make sure the video server runs. Starting it may need the chat instance on
+// its GPU stopped first: always asked, never done silently.
+async function ensureGenServer(ctx: CommandCtx): Promise<number> {
+  const gen = await getGenStatus();
+  if (!gen) throw new Error("the server has no radiance.gen block (video server not configured)");
+  if (gen.running) return gen.port;
+  const rad = await getRadStatus();
+  const radKey = gen.gpu === 1 ? "r9700b" : "r9700a";
+  const blocker = rad?.find((r) => r.gpu_id === radKey && r.running);
+  if (ctx.mode !== "tui" && blocker) {
+    throw new Error(`GPU ${gen.gpu} is running ${blocker.model ?? "a chat model"}; stop it first`);
+  }
+  if (ctx.mode === "tui") {
+    const msg = blocker
+      ? `This stops ${blocker.model ?? "the chat model"} on GPU ${gen.gpu} (port ${blocker.port}) and starts the video server there.`
+      : `Start the video server on GPU ${gen.gpu} (port ${gen.port})? It takes about 15 s.`;
+    const ok = await ctx.ui.confirm("Video server is not running", msg);
+    if (!ok) throw new Error("cancelled");
+  }
+  if (blocker) {
+    await runLlamesa(["stop-rad", "--gpu", blocker.gpu_id], 60_000);
+    await sleep(3_000);
+  }
+  const logFile = "~/.llamesa/pistart-gen.log";
+  // Synchronous on the server, not awaited here (same pattern as startGpu).
+  void runSsh(`bash ~/.llamesa/llamesa.sh start-gen >> ${logFile} 2>&1`, 600_000).catch(() => {});
+  const startedAt = Date.now();
+  try {
+    await sleep(6_000);
+    try {
+      const { stdout } = await runSsh(`tail -n 20 ${logFile}`, 10_000);
+      const errLine = stdout.split(/\r?\n/).find((l) => l.includes("[ERROR]"));
+      if (errLine) throw new Error(errLine.trim());
+    } catch (err) {
+      if (err instanceof Error && err.message.includes("[ERROR]")) throw err;
+    }
+    while (Date.now() - startedAt < HEALTH_TIMEOUT_MS) {
+      ctx.ui.setStatus("llamesa", `starting video server on GPU ${gen.gpu} … ${Math.round((Date.now() - startedAt) / 1000)}s`);
+      if (await healthOk(gen.port)) {
+        ctx.ui.notify(`video server ready on GPU ${gen.gpu}, port ${gen.port}`, "info");
+        return gen.port;
+      }
+      await sleep(HEALTH_POLL_MS);
+    }
+    throw new Error(`video server did not come up in ${HEALTH_TIMEOUT_MS / 1000}s. Check: tail -f ${logFile}`);
+  } finally {
+    ctx.ui.setStatus("llamesa", undefined);
+  }
+}
+
+function videoFileBase(idea: string): string {
+  const d = new Date();
+  const p = (n: number) => String(n).padStart(2, "0");
+  const stamp = `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+  const slug = idea.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 40) || "video";
+  return `${stamp}-${slug}`;
+}
+
+// Queue one video, poll it with a live status line, save MP4 + prompt locally.
+async function generateVideo(ctx: CommandCtx, port: number, prompt: string, idea: string, opts: VideoOptions): Promise<string> {
+  const base = `http://${SSH_HOST}:${port}/v1/videos`;
+  const body: Record<string, unknown> = { prompt, size: opts.size, seed: opts.seed };
+  if (opts.seconds) body.seconds = opts.seconds;
+  const res = await fetch(base, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(60_000),
+  });
+  const job = (await res.json()) as { id?: string; status?: string; error?: { message?: string } | null };
+  if (!res.ok || !job.id) throw new Error(job.error?.message ?? `video request HTTP ${res.status}`);
+  const startedAt = Date.now();
+  let last: Record<string, unknown> = job as Record<string, unknown>;
+  try {
+    while (true) {
+      const status = String(last.status ?? "");
+      if (status === "completed") break;
+      if (status === "failed" || status === "cancelled") {
+        const e = last.error as { message?: string } | null;
+        throw new Error(`video ${status}: ${e?.message ?? "no reason given"}`);
+      }
+      if (Date.now() - startedAt > VIDEO_JOB_TIMEOUT_MS) throw new Error("video job timed out after 15 min");
+      const secs = Math.round((Date.now() - startedAt) / 1000);
+      const steps = last.steps_total ? ` step ${last.steps_done ?? 0}/${last.steps_total}` : "";
+      ctx.ui.setStatus("llamesa", `video ${status || "queued"}${steps} · ${last.progress ?? 0}% · ${secs}s`);
+      await sleep(1_500);
+      const r = await fetch(`${base}/${job.id}`, { signal: AbortSignal.timeout(15_000) });
+      last = (await r.json()) as Record<string, unknown>;
+    }
+    ctx.ui.setStatus("llamesa", "video done · downloading …");
+    const mp4 = await fetch(`${base}/${job.id}/content`, { signal: AbortSignal.timeout(300_000) });
+    if (!mp4.ok) throw new Error(`download HTTP ${mp4.status}`);
+    const bytes = Buffer.from(await mp4.arrayBuffer());
+    await mkdir(VIDEO_DIR, { recursive: true });
+    const fileBase = join(VIDEO_DIR, videoFileBase(idea));
+    await writeFile(`${fileBase}.mp4`, bytes);
+    await writeFile(
+      `${fileBase}.txt`,
+      `idea: ${idea}\nprompt: ${prompt}\nsize: ${opts.size}\nseconds: ${last.seconds ?? opts.seconds ?? "auto"}\nseed: ${opts.seed}\nmodel: ${last.model ?? ""}\nmade in: ${Math.round((Date.now() - startedAt) / 1000)} s\n`,
+    );
+    return `${fileBase}.mp4`;
+  } finally {
+    ctx.ui.setStatus("llamesa", undefined);
+  }
+}
+
+async function askVideoOptions(ctx: CommandCtx, chatAvailable: boolean): Promise<VideoOptions> {
+  const seed = Math.floor(Math.random() * 2 ** 31);
+  if (ctx.mode !== "tui") return { size: "960x544", seconds: null, seed, expand: chatAvailable };
+  const sizeLabel = await ctx.ui.select("Video size", VIDEO_SIZES.map((s) => s.label));
+  if (!sizeLabel) throw new Error("cancelled");
+  const lenLabel = await ctx.ui.select("Length", VIDEO_LENGTHS.map((l) => l.label));
+  if (!lenLabel) throw new Error("cancelled");
+  let expand = false;
+  if (chatAvailable) {
+    const e = await ctx.ui.select("Let Qwen write the detailed prompt? (LTX works best with a long description)", [
+      "yes, expand my idea",
+      "no, use my text as is",
+    ]);
+    if (!e) throw new Error("cancelled");
+    expand = e.startsWith("yes");
+  }
+  return {
+    size: VIDEO_SIZES.find((s) => s.label === sizeLabel)!.size,
+    seconds: VIDEO_LENGTHS.find((l) => l.label === lenLabel)!.seconds,
+    seed,
+    expand,
+  };
+}
+
 export default function (pi: ExtensionAPI) {
   pi.on("session_start", (_event, ctx) => {
     ctx.ui.notify(`llamesa loaded · ${SSH_USER}@${SSH_HOST}`, "info");
@@ -488,8 +723,8 @@ export default function (pi: ExtensionAPI) {
     description: "LLaMesa status + performance snapshot (what's running per GPU, VRAM/GPU/CPU/RAM; modal, Esc to close)",
     handler: async (_args, ctx) => {
       try {
-        const [gpus, rad] = await Promise.all([getAllStatus(), getRadStatus()]);
-        await statModal(ctx, statLines(mergeStatus(gpus, rad)));
+        const [gpus, rad, gen] = await Promise.all([getAllStatus(), getRadStatus(), getGenStatus()]);
+        await statModal(ctx, statLines(mergeStatus(gpus, rad, gen)));
       } catch (err) {
         ctx.ui.notify(`llamesa: ${(err as Error).message}`, "error");
       }
@@ -500,7 +735,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("llamesa-start-2nd", startCommand(1, "GPU 1 (R9700B, port 1235)"));
 
   pi.registerCommand("llamesa-stop", {
-    description: "Stop all LLaMesa instances (both GPUs, both engines)",
+    description: "Stop all LLaMesa instances (both GPUs, all engines, the video server too)",
     handler: async (_args, ctx) => {
       try {
         await runLlamesa(["stop", "--gpu", "all"], 60_000);
@@ -509,10 +744,65 @@ export default function (pi: ExtensionAPI) {
         } catch {
           // no radiance block on the server; stop --gpu all still applied
         }
-        const [gpus, rad] = await Promise.all([getAllStatus(), getRadStatus()]);
-        for (const line of statusLines(mergeStatus(gpus, rad))) ctx.ui.notify(line, "info");
+        try {
+          await runLlamesa(["stop-gen"], 60_000);
+        } catch {
+          // no radiance.gen block on the server
+        }
+        const [gpus, rad, gen] = await Promise.all([getAllStatus(), getRadStatus(), getGenStatus()]);
+        for (const line of statusLines(mergeStatus(gpus, rad, gen))) ctx.ui.notify(line, "info");
       } catch (err) {
         ctx.ui.notify(`llamesa-stop: ${(err as Error).message}`, "error");
+      }
+    },
+  });
+
+  pi.registerCommand("llamesa-video", {
+    description: `Make a short video with sound on the Radiance video server (describe it; saved to ${VIDEO_DIR})`,
+    handler: async (args: string, ctx: CommandCtx) => {
+      try {
+        let idea = args.trim();
+        if (!idea) {
+          if (ctx.mode !== "tui") throw new Error("describe the video: /llamesa-video <description>");
+          idea = ((await ctx.ui.input("Describe the video", "a shot, what moves, the mood, any sound")) ?? "").trim();
+          if (!idea) throw new Error("cancelled");
+        }
+        ctx.ui.setStatus("llamesa", "llamesa-video: checking servers …");
+        const chat = await findChatPort();
+        ctx.ui.setStatus("llamesa", undefined);
+        const opts = await askVideoOptions(ctx, chat !== null);
+        let prompt = idea;
+        if (opts.expand && chat) {
+          ctx.ui.setStatus("llamesa", "llamesa-video: Qwen is writing the prompt …");
+          prompt = await expandVideoPrompt(chat, idea);
+          ctx.ui.setStatus("llamesa", undefined);
+          ctx.ui.notify(`prompt: ${prompt}`, "info");
+          if (ctx.mode === "tui") {
+            const use = await ctx.ui.select("Use this prompt?", ["yes, make the video", "no, use my original text", "cancel"]);
+            if (!use || use === "cancel") throw new Error("cancelled");
+            if (use.startsWith("no")) prompt = idea;
+          }
+        }
+        const port = await ensureGenServer(ctx);
+        ctx.ui.notify(`making video: ${opts.size}, ${opts.seconds ? `${opts.seconds} s` : "auto length"}, seed ${opts.seed}`, "info");
+        const file = await generateVideo(ctx, port, prompt, idea, opts);
+        ctx.ui.notify(`video saved: ${file} (prompt and seed in the .txt beside it)`, "info");
+      } catch (err) {
+        ctx.ui.setStatus("llamesa", undefined);
+        const msg = (err as Error).message;
+        ctx.ui.notify(msg === "cancelled" ? "llamesa-video: cancelled" : `llamesa-video: ${msg}`, msg === "cancelled" ? "info" : "error");
+      }
+    },
+  });
+
+  pi.registerCommand("llamesa-video-stop", {
+    description: "Stop the Radiance video server (frees its GPU for chat)",
+    handler: async (_args, ctx) => {
+      try {
+        await runLlamesa(["stop-gen"], 60_000);
+        ctx.ui.notify("video server stopped", "info");
+      } catch (err) {
+        ctx.ui.notify(`llamesa-video-stop: ${(err as Error).message}`, "error");
       }
     },
   });

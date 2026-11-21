@@ -55,6 +55,21 @@
       "env": {
         "RADV_PERFTEST": "nogttspill"
       }
+    },
+    "radiance": {
+      "image": "docker.io/stilldeadcode/radiance:1.17.0",
+      "models_dir": "/var/mnt/games/models-radiance",
+      "served_model_name": "qwen3.8-27b",
+      "default_context": 262144,
+      "tp": 1,
+      "max_num_seqs": 8,
+      "kv_cache_dtype": "fp8",
+      "speculative": true,
+      "extra_args": ["--gpu-headroom-mib", "1024"],
+      "instances": {
+        "r9700a": { "gpu": 0, "port": 1234 },
+        "r9700b": { "gpu": 1, "port": 1235 }
+      }
     }
   }
 }

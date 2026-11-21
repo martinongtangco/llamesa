@@ -31,7 +31,7 @@ $Script:ChatHistory        = [System.Collections.Generic.List[object]]::new()   
 $Script:LastTokS           = $null   # updated after each chat response; shown in header badge
 $Script:LastStatusRefresh  = $null   # tracks when stat cards were last fetched
 $Script:GpuStatus         = $null   # parsed GPU status array from --gpu all
-$Script:ActiveMode       = "single" # single, big, dual — tracks which kind of server was last started (local state only, never written to config)
+$Script:ActiveMode       = "single" # single, big, dual, rad — tracks which kind of server was last started (local state only, never written to config)
 $Script:ChatPort           = $null   # resolved chat endpoint port; re-resolved when ActiveMode changes
 $Script:ChatModeSnapshot   = $null   # ActiveMode at the time ChatPort was resolved
 $Script:ThinkingEnabled    = $false  # toggled with /think, /nothink; seeded from server status on first resolve
@@ -469,6 +469,80 @@ function Get-BigStatus {
     return ConvertFrom-ServerJson (Invoke-ServerCommand "status-big" -raw)
 }
 
+# Radiance engine (opt-in, see docs/radiance-evaluation.md). status-rad prints
+# the same JSON shape as status-big plus "backend":"radiance". On a server
+# without a radiance config block the command fails on stderr, which
+# Invoke-ServerCommand discards, so this simply returns $null there.
+function Get-RadStatus {
+    return ConvertFrom-ServerJson (Invoke-ServerCommand "status-rad" -raw)
+}
+
+# status-rad returns one object for a single instance and an array when several
+# are configured (the same convention status-dual uses). These helpers hide that.
+function Get-RadInstances {
+    $s = Get-RadStatus
+    if ($null -eq $s) { return @() }
+    return @($s)
+}
+
+function Get-RadRunning {
+    return @(Get-RadInstances | Where-Object { (Get-Prop $_ 'running' $false) -eq $true })
+}
+
+# One status object for the dashboard header: the per-GPU bars of every
+# instance, the models joined, ports joined, and an instance count.
+function ConvertTo-RadCombinedStatus {
+    param($status)
+    if ($null -eq $status) { return $null }
+    $list = @($status)
+    if ($list.Count -le 1) { return $list[0] }
+    $running = @($list | Where-Object { (Get-Prop $_ 'running' $false) -eq $true })
+    $first = if ($running.Count -gt 0) { $running[0] } else { $list[0] }
+    $devices = @()
+    foreach ($i in $list) {
+        $d = Get-Prop $i 'devices' $null
+        if ($d) { $devices += @($d) }
+    }
+    $models = @($running | ForEach-Object { Get-Prop $_ 'model' '' } | Select-Object -Unique)
+    $modelText = if ($models.Count -eq 1) { "{0} x{1}" -f $models[0], $running.Count } else { $models -join " + " }
+    $ports = (@($running | ForEach-Object { Get-Prop $_ 'port' '' }) -join " · ")
+    return [PSCustomObject]@{
+        running      = ($running.Count -gt 0)
+        model        = $modelText
+        backend      = "radiance"
+        ctx          = Get-Prop $first 'ctx' 0
+        port         = $ports
+        uptime       = Get-Prop $first 'uptime' $null
+        devices      = $devices
+        thinking     = Get-Prop $first 'thinking' $false
+        cpu_percent  = Get-Prop $first 'cpu_percent' 0
+        ram_used_mb  = Get-Prop $first 'ram_used_mb' 0
+        ram_total_mb = Get-Prop $first 'ram_total_mb' 0
+        instances    = [Math]::Max($running.Count, 1)
+    }
+}
+
+# Which Radiance instance to talk to: the only running one, or ask when both are.
+function Select-RadInstance {
+    $running = @(Get-RadRunning)
+    if ($running.Count -eq 0) { return $null }
+    if ($running.Count -eq 1) { return $running[0] }
+    return (Read-SelectList -Items $running -LabelFn { param($i) "{0}  {1}  (port {2})" -f $i.gpu_id, (Get-Prop $i 'name' $i.model), $i.port } `
+        -HeaderFn { Write-Host ("  {0}Which Radiance instance?{1}" -f $white, $reset) })
+}
+
+function Get-RadModelList {
+    $raw = Invoke-ServerCommand "list-models-rad" -raw
+    if (-not $raw) { return @() }
+
+    try {
+        $jsonText = $raw -join "`n"
+        return @($jsonText | ConvertFrom-Json)
+    } catch {
+        return @()
+    }
+}
+
 function Get-ModelList {
     $raw = Invoke-ServerCommand "list-models" -raw
     if (-not $raw) { return @() }
@@ -813,13 +887,16 @@ function Show-Header {
 # $Script:ActiveMode — not by a branch inside Show-Header itself.
 
 function Show-HeaderBig {
-    param($status = $null)
+    param($status = $null, [switch]$Radiance)
 
     $w = Get-ViewportWidth
+    $engineLabel = if ($Radiance) { "Radiance engine" } else { "Vulkan combined-VRAM" }
+    $radN = [int](Get-Prop $status 'instances' 1)
+    $backendPill = if ($Radiance) { "radiance · {0} GPU{1}" -f $radN, $(if ($radN -ne 1) { "s" } else { "" }) } else { "vulkan · both GPUs" }
 
     # Line 1 — logo + tagline
     $logo    = "{0}LL{1}a{2}M{3}esa{4}" -f $teal, $amber, $teal, $amber, $reset
-    $tagline = "{0}local inference control plane · v0.2 · Vulkan combined-VRAM{1}" -f $dim, $reset
+    $tagline = "{0}local inference control plane · v0.2 · {2}{1}" -f $dim, $reset, $engineLabel
     Out-Line ("{0} {1}" -f $logo, $tagline)
 
     # Line 2 — server dot + name + host + port
@@ -884,7 +961,7 @@ function Show-HeaderBig {
             $thinkingPill = if (Get-Prop $status 'thinking' $false) { "${teal}[thinking on]${reset}" } else { "${gray}[thinking off]${reset}" }
             $ctxPill      = if ($ctx -gt 0)       { "${teal}[ctx $ctx]${reset}" } else { "" }
             $toksPill     = if ($Script:LastTokS)  { "${amber}[$($Script:LastTokS) tok/s]${reset}" } else { "" }
-            Out-Line ("  ${gray}MODEL${reset}  ${white}$(Get-FriendlyModelName (Get-Prop $status 'model' ''))${reset}  ${ctxPill}  ${thinkingPill}  ${toksPill}  ${gray}[vulkan · both GPUs]${reset}")
+            Out-Line ("  ${gray}MODEL${reset}  ${white}$(Get-FriendlyModelName (Get-Prop $status 'model' ''))${reset}  ${ctxPill}  ${thinkingPill}  ${toksPill}  ${gray}[$backendPill]${reset}")
         } else {
             Out-Line ("  ${gray}MODEL  none${reset}")
         }
@@ -1033,6 +1110,8 @@ function Show-ActiveHeader {
     param($status = $null)
     if ($Script:ActiveMode -eq "big") {
         Show-HeaderBig -status $status
+    } elseif ($Script:ActiveMode -eq "rad") {
+        Show-HeaderBig -status (ConvertTo-RadCombinedStatus $status) -Radiance
     } elseif ($Script:ActiveMode -eq "dual") {
         Show-HeaderDual -status $status
     } else {
@@ -1058,6 +1137,7 @@ function Get-StatusCommandForMode {
     switch ($Script:ActiveMode) {
         "big"  { return "status-big" }
         "dual" { return "status-dual" }
+        "rad"  { return "status-rad" }
         default { return "status --gpu all" }
     }
 }
@@ -1190,6 +1270,13 @@ function Detect-ActiveMode {
     elseif ($dual) { $dualInstances = @($dual) }
     if (@($dualInstances | Where-Object { $_.running -eq $true }).Count -gt 0) {
         $Script:ActiveMode = "dual"
+        return
+    }
+
+    # Radiance may run next to a single-GPU llama.cpp server. Prefer it here
+    # (an explicit opt-in engine); /engine switches back to llama.cpp.
+    if (@(Get-RadRunning).Count -gt 0) {
+        $Script:ActiveMode = "rad"
         return
     }
 
@@ -1328,7 +1415,7 @@ function Read-CtxArg {
     return ""
 }
 
-# ── Command: /start ───────────────────────────────────────────────────────
+# ── Command: /start-llama (the original llama.cpp /start flow) ───────────
 # Unified entry point: picks 1..gpuCount models and infers the mode from how
 # many were picked — 1 model → combined VRAM across all GPUs (single-GPU
 # boxes just use that one GPU); exactly 2 models on a 2-GPU box → one model
@@ -1452,6 +1539,249 @@ function Cmd-Start {
     }
 }
 
+# ── Radiance helpers and /engine (Radiance, opt-in) ─────────────────────────
+# Radiance runs in its own container on its own port, next to the llama.cpp
+# modes; its start commands are /start and /start-2nd (see below).
+
+function Wait-RadLoaded {
+    Write-Host ("{0}Waiting for Radiance to load...{1}" -f $cyan, $reset)
+    for ($i = 0; $i -lt 150; $i++) {
+        if (@(Get-RadRunning).Count -gt 0) {
+            Write-Host ("{0}✓ Radiance is up!{1}" -f $green, $reset)
+            return
+        }
+        Start-Sleep -Seconds 2
+        if (($i + 1) % 15 -eq 0) {
+            Write-Host ("  Loading... ({0}s elapsed)" -f (($i + 1) * 2))
+        }
+    }
+    Write-Host ("{0}Timed out waiting for Radiance to load.{1}" -f $red, $reset)
+}
+
+# ── Command: /start, /start-2nd, /start-big ───────────────────────────────
+# Fixed slots, so the ports never move:
+#   /start      first GPU,  Radiance, the main port
+#   /start-2nd  second GPU, Radiance, the next port (same model and settings as
+#               the first GPU unless you choose otherwise)
+#   /start-big  llama.cpp across both GPUs (combined VRAM), its own port
+# A port belongs to a GPU slot, not to an engine, and a GPU holds one server at a
+# time, so the same port numbers are used whichever engine is on that GPU.
+# The previous llama.cpp flow (one model across both GPUs, or one per GPU) is
+# still available as /start-llama.
+
+function Wait-RadInstance {
+    param([string]$Key)
+    Write-Host ("{0}Waiting for Radiance on {1}...{2}" -f $cyan, $Key, $reset)
+    for ($i = 0; $i -lt 150; $i++) {
+        $up = @(Get-RadRunning | Where-Object { $_.gpu_id -eq $Key })
+        if ($up.Count -gt 0) {
+            Write-Host ("{0}✓ Radiance {1} is up on port {2}!{3}" -f $green, $Key, $up[0].port, $reset)
+            return
+        }
+        Start-Sleep -Seconds 2
+        if (($i + 1) % 15 -eq 0) {
+            Write-Host ("  Loading... ({0}s elapsed)" -f (($i + 1) * 2))
+        }
+    }
+    Write-Host ("{0}Timed out waiting for Radiance on {1}.{2}" -f $red, $Key, $reset)
+}
+
+function Cmd-StartRadSlot {
+    param([ValidateSet("first", "second")][string]$Slot)
+
+    $instances = @(Get-RadInstances)
+    $idx = if ($Slot -eq "first") { 0 } else { 1 }
+    if ($instances.Count -le $idx) {
+        Write-Host ("{0}No {1} Radiance instance is configured on the server (radiance.instances).{2}" -f $red, $Slot, $reset)
+        return
+    }
+    $target = $instances[$idx]
+    $key    = $target.gpu_id
+    $label  = if ($Slot -eq "first") { "first GPU" } else { "second GPU" }
+
+    $big = Get-BigStatus
+    if ($big -and $big.running) {
+        Write-Host ("{0}The llama.cpp combined-VRAM server is using both GPUs. /stop it first.{1}" -f $red, $reset)
+        return
+    }
+    if ((Get-Prop $target 'running' $false) -eq $true) {
+        Write-Host ("{0}Radiance is already running on the {1} (port {2}); starting again replaces it.{3}" -f $amber, $label, $target.port, $reset)
+    }
+
+    # /start-2nd: default to exactly what the first GPU is running.
+    if ($Slot -eq "second") {
+        $first = $instances[0]
+        if ((Get-Prop $first 'running' $false) -eq $true) {
+            $thinkText = if (Get-Prop $first 'thinking' $false) { "on" } else { "off" }
+            $sameLabel = "Same as {0}: {1}, context {2}, thinking {3}" -f $first.gpu_id, (Get-FriendlyModelName $first.model), $first.ctx, $thinkText
+            $choices = @(
+                [PSCustomObject]@{ Label = $sameLabel; Same = $true },
+                [PSCustomObject]@{ Label = "Choose model and settings"; Same = $false }
+            )
+            $pick = Read-SelectList -Items $choices -LabelFn { param($c) $c.Label } `
+                -HeaderFn { Write-Host ("  {0}Second GPU:{1}" -f $white, $reset) }
+            if (-not $pick) { Write-Host ("{0}Cancelled.{1}" -f $gray, $reset); return }
+            if ($pick.Same) {
+                Write-Host ""
+                Write-Host ("{0}Starting {1} on the {2} (port {3}), same as {4}...{5}" -f $cyan, (Get-FriendlyModelName $first.model), $label, $target.port, $first.gpu_id, $reset)
+                $result = Invoke-ServerCommandChecked ("start-rad --gpu {0} --like {1}" -f $key, $first.gpu_id)
+                Write-Host ($result.Output -join "`n")
+                if ($result.ExitCode -ne 0) {
+                    Write-Host ("{0}start failed — see error above.{1}" -f $red, $reset)
+                    return
+                }
+                $Script:ActiveMode = "rad"
+                Wait-RadInstance -Key $key
+                return
+            }
+        }
+    }
+
+    Write-Host ("{0}Fetching Radiance models...{1}" -f $cyan, $reset)
+    $models = @(Get-RadModelList)
+    if ($models.Count -eq 0) {
+        Write-Host ("{0}No Radiance (.rad) models found. Is the radiance block set up in the server config?{1}" -f $red, $reset)
+        return
+    }
+
+    $model = Read-SelectList -Items $models -LabelFn { param($m) Format-ModelLabel $m } `
+        -HeaderFn { Write-Host ("  {0}Select a Radiance model for the {1} (port {2}):{3}" -f $white, $label, $target.port, $reset) }
+    if (-not $model) { Write-Host ("{0}Cancelled.{1}" -f $gray, $reset); return }
+
+    $thinkChoice = Read-SelectList -Items @("on", "off") -LabelFn { param($x) $x } `
+        -HeaderFn { Write-Host ("  {0}Thinking mode?{1}" -f $white, $reset) }
+    if (-not $thinkChoice) { Write-Host ("{0}Cancelled.{1}" -f $gray, $reset); return }
+    $thinking = if ($thinkChoice -eq "on") { "true" } else { "false" }
+
+    # .rad files carry no GGUF header, so list-models-rad reports the configured
+    # radiance.default_context (the model's native max) as context_length.
+    $ctxSuggestion = $null
+    $modelCtx = Get-Prop $model 'context_length' $null
+    if ($modelCtx) { $ctxSuggestion = [int]$modelCtx }
+    $ctxArg = Read-CtxArg -SuggestedMax $ctxSuggestion
+
+    $parallelArg = ""
+    $parallelInput = Read-Host "Parallel sequences? [1-32, Enter for the server default]"
+    if ($parallelInput -match '^\d+$') {
+        $parallelArg = "--parallel {0}" -f [math]::Max(1, [math]::Min(32, [int]$parallelInput))
+    }
+
+    Write-Host ""
+    Write-Host ("{0}Starting {1} on the {2} (port {3})...{4}" -f $cyan, $model.name, $label, $target.port, $reset)
+    $result = Invoke-ServerCommandChecked ("start-rad --gpu {0} --model ""{1}"" --thinking {2} {3} {4}" -f $key, $model.name, $thinking, $ctxArg, $parallelArg)
+    Write-Host ($result.Output -join "`n")
+    if ($result.ExitCode -ne 0) {
+        Write-Host ("{0}start failed — see error above.{1}" -f $red, $reset)
+        return
+    }
+    $Script:ActiveMode = "rad"
+    Wait-RadInstance -Key $key
+}
+
+function Cmd-StartBig {
+    if (@(Get-RadRunning).Count -gt 0) {
+        Write-Host ("{0}Radiance is running on a GPU. The llama.cpp combined-VRAM server needs both GPUs: /stop Radiance first.{1}" -f $red, $reset)
+        return
+    }
+
+    Write-Host ("{0}Fetching available models...{1}" -f $cyan, $reset)
+    $models = @(Get-ModelList)
+    if ($models.Count -eq 0) {
+        Write-Host ("{0}No models found.{1}" -f $red, $reset)
+        return
+    }
+
+    $model = Read-SelectList -Items $models -LabelFn { param($m) Format-ModelLabel $m } `
+        -HeaderFn { Write-Host ("  {0}Select a llama.cpp model (loaded across both GPUs):{1}" -f $white, $reset) }
+    if (-not $model) { Write-Host ("{0}Cancelled.{1}" -f $gray, $reset); return }
+
+    $thinkChoice = Read-SelectList -Items @("on", "off") -LabelFn { param($x) $x } `
+        -HeaderFn { Write-Host ("  {0}Thinking mode?{1}" -f $white, $reset) }
+    if (-not $thinkChoice) { Write-Host ("{0}Cancelled.{1}" -f $gray, $reset); return }
+    $thinking = if ($thinkChoice -eq "on") { "true" } else { "false" }
+
+    Write-Host ("{0}Checking model's max context...{1}" -f $gray, $reset)
+    $ctxArg = Read-CtxArg -SuggestedMax (Get-ModelContextLength $model.path)
+
+    Write-Host ""
+    Write-Host ("{0}Starting {1} with llama.cpp (combined VRAM across both GPUs)...{2}" -f $cyan, $model.name, $reset)
+    $result = Invoke-ServerCommandChecked ("start-big --model ""{0}"" --thinking {1} {2}" -f $model.name, $thinking, $ctxArg)
+    Write-Host ($result.Output -join "`n")
+    if ($result.ExitCode -ne 0) {
+        Write-Host ("{0}start failed — see error above.{1}" -f $red, $reset)
+        return
+    }
+    $Script:ActiveMode = "big"
+    Wait-BigLoaded
+}
+
+function Restart-RadMode {
+    Write-Host ("{0}Restarting Radiance with the remembered settings...{1}" -f $cyan, $reset)
+    # Restart exactly the instances that are running; with none running, ask the
+    # server to restart every instance that has a remembered session.
+    $targets = @(Get-RadRunning | ForEach-Object { "restart-rad --gpu {0}" -f $_.gpu_id })
+    if ($targets.Count -eq 0) { $targets = @("restart-rad") }
+    foreach ($cmd in $targets) {
+        $result = Invoke-ServerCommandChecked $cmd
+        Write-Host ($result.Output -join "`n")
+        if ($result.ExitCode -ne 0) {
+            Write-Host ("{0}restart failed — see error above.{1}" -f $red, $reset)
+            return
+        }
+    }
+    $Script:ActiveMode = "rad"
+    Wait-RadLoaded
+}
+
+# Chat, the dashboard header and /health follow $Script:ActiveMode, which only
+# holds one engine. With Radiance and a llama.cpp server both running, this
+# switches which one the client talks to.
+function Cmd-Engine {
+    $options = @()
+
+    $radRunning = @(Get-RadRunning)
+    if ($radRunning.Count -gt 0) {
+        $radPorts = ($radRunning | ForEach-Object { $_.port }) -join ", "
+        $options += [PSCustomObject]@{ Label = "Radiance: {0} ({1} GPU{2}, port {3})" -f (Get-FriendlyModelName $radRunning[0].model), $radRunning.Count, $(if ($radRunning.Count -ne 1) { "s" } else { "" }), $radPorts; Mode = "rad" }
+    }
+
+    $big = Get-BigStatus
+    if ($big -and $big.running) {
+        $options += [PSCustomObject]@{ Label = "llama.cpp combined VRAM: {0}" -f (Get-FriendlyModelName $big.model); Mode = "big" }
+    }
+
+    $dual = Get-DualStatus
+    $dualInstances = @()
+    if ($dual -is [array]) { $dualInstances = $dual } elseif ($dual) { $dualInstances = @($dual) }
+    if (@($dualInstances | Where-Object { $_.running -eq $true }).Count -gt 0) {
+        $options += [PSCustomObject]@{ Label = "llama.cpp one-per-GPU instances"; Mode = "dual" }
+    }
+
+    Get-ServerStatus | Out-Null
+    $runningGpus = @()
+    if ($Script:GpuStatus -is [array]) { $runningGpus = @($Script:GpuStatus | Where-Object { $_.running -eq $true }) }
+    elseif ($Script:GpuStatus -and $Script:GpuStatus.running) { $runningGpus = @($Script:GpuStatus) }
+    if ($runningGpus.Count -gt 0) {
+        $options += [PSCustomObject]@{ Label = "llama.cpp single-GPU server(s)"; Mode = "single" }
+    }
+
+    if ($options.Count -eq 0) {
+        Write-Host ("{0}Nothing running.{1}" -f $gray, $reset)
+        return
+    }
+    if ($options.Count -eq 1) {
+        Write-Host ("{0}Only one engine is running: {1}{2}" -f $gray, $options[0].Label, $reset)
+        $pick = $options[0]
+    } else {
+        $pick = Read-SelectList -Items $options -LabelFn { param($o) $o.Label } `
+            -HeaderFn { Write-Host ("  {0}Use which engine?{1}" -f $white, $reset) }
+        if (-not $pick) { Write-Host ("{0}Cancelled.{1}" -f $gray, $reset); return }
+    }
+    $Script:ActiveMode = $pick.Mode
+    $Script:ChatPort = $null
+    Write-Host ("{0}Now using: {1}{2}" -f $green, $pick.Label, $reset)
+}
+
 # ── Command: /stop ────────────────────────────────────────────────────────
 # Unified entry point: detects whatever's actually running (combined-VRAM,
 # dual instances, or plain single-GPU) and stops it directly with no prompt
@@ -1484,6 +1814,12 @@ function Cmd-Stop {
         }
     }
 
+    # Radiance lives beside the llama.cpp modes, so it is appended after them
+    # and never changes the "nothing found, try single-GPU" fallback above.
+    foreach ($inst in @(Get-RadRunning)) {
+        $running += [PSCustomObject]@{ Label = "{0}: {1} (Radiance)" -f $inst.gpu_id, (Get-FriendlyModelName $inst.model); Mode = "rad"; GpuArg = $inst.gpu_id }
+    }
+
     if ($running.Count -eq 0) {
         Write-Host ("{0}Nothing running.{1}" -f $gray, $reset)
         return
@@ -1509,6 +1845,11 @@ function Cmd-Stop {
             "dual" {
                 $result = Invoke-ServerCommandChecked ("stop-dual --gpu {0}" -f $t.GpuArg)
                 Write-Host ($result.Output -join "`n")
+            }
+            "rad" {
+                $result = Invoke-ServerCommandChecked ("stop-rad --gpu {0}" -f $t.GpuArg)
+                Write-Host ($result.Output -join "`n")
+                if ($result.ExitCode -eq 0 -and $Script:ActiveMode -eq "rad" -and @(Get-RadRunning).Count -eq 0) { $Script:ActiveMode = "single" }
             }
             "single" {
                 $raw = Invoke-ServerCommand ("stop --gpu {0}" -f $t.GpuArg) -raw
@@ -1675,6 +2016,11 @@ function Restart-DualMode {
 }
 
 function Cmd-Restart {
+    if ($Script:ActiveMode -eq "rad") {
+        Restart-RadMode
+        return
+    }
+
     $bigStatus = Get-BigStatus
     if ($bigStatus -and $bigStatus.running) {
         Restart-BigMode
@@ -1696,7 +2042,7 @@ function Cmd-Restart {
 
 function Cmd-Models {
     Write-Host ("{0}Fetching model list...{1}" -f $cyan, $reset)
-    $models = Get-ModelList
+    $models = if ($Script:ActiveMode -eq "rad") { Get-RadModelList } else { Get-ModelList }
 
     if (-not $models -or $models.Count -eq 0) {
         Write-Host ("{0}No models found.{1}" -f $red, $reset)
@@ -1721,6 +2067,13 @@ function Cmd-Logs {
     $sshUser     = $Script:ActiveServer.ssh_user
     $sshHost     = $Script:ActiveServer.host
     $llamesaPath = $Script:ActiveServer.llamesa_path
+
+    if ($Script:ActiveMode -eq "rad") {
+        $inst = Select-RadInstance
+        $gpuArg = if ($inst) { " --gpu $($inst.gpu_id)" } else { "" }
+        ssh "${sshUser}@${sshHost}" "bash ${llamesaPath} logs-rad${gpuArg}"
+        return
+    }
 
     # Pick GPU — default 0; if a running GPU is known, use it
     $gpuId = 0
@@ -1768,6 +2121,11 @@ function Get-HealthCheckTargets {
             if ($dualStatus -is [array]) { $instances = $dualStatus } elseif ($dualStatus) { $instances = @($dualStatus) }
             foreach ($inst in @($instances | Where-Object { $_.running -eq $true -and $_.port })) {
                 $targets += [PSCustomObject]@{ Label = $inst.gpu_id; Port = $inst.port }
+            }
+        }
+        "rad" {
+            foreach ($inst in @(Get-RadRunning)) {
+                if ($inst.port) { $targets += [PSCustomObject]@{ Label = $inst.gpu_id; Port = $inst.port } }
             }
         }
         default {
@@ -1863,8 +2221,8 @@ function Resolve-ChatEndpoint {
     # than the v1 single-GPU path Get-ActiveGpuPort resolves.
     $bigPort = $null
     $bigThinking = $null
-    if ($Script:ActiveMode -eq "big") {
-        $bigStatus = Get-BigStatus
+    if ($Script:ActiveMode -eq "big" -or $Script:ActiveMode -eq "rad") {
+        $bigStatus = if ($Script:ActiveMode -eq "rad") { Select-RadInstance } else { Get-BigStatus }
         if (-not $bigStatus -or -not $bigStatus.running) {
             Write-Host ("{0}No running model to chat with.{1}" -f $red, $reset)
             return $false
@@ -2182,6 +2540,11 @@ function Cmd-Servers {
             if ($bigStatus -and $bigStatus.running -and $bigStatus.port) {
                 $portLabel = "big:$($bigStatus.port)"
             }
+        } elseif ($isActive -and $Script:ActiveMode -eq "rad") {
+            $radRun = @(Get-RadRunning)
+            if ($radRun.Count -gt 0) {
+                $portLabel = "rad:" + (($radRun | ForEach-Object { "$($_.gpu_id):$($_.port)" }) -join ", ")
+            }
         }
 
         Write-Host ("    {0} {1,-15} {2,-20} {3,-15} {4}" -f $marker, $prop.Name, $s.host, $s.ssh_user, $portLabel)
@@ -2233,6 +2596,188 @@ function Cmd-Servers {
     Start-Sleep -Seconds 1
 }
 
+# ── Command: /video, /video-stop ──────────────────────────────────────────
+# Short videos with sound on the server's Radiance video server (start-gen,
+# LTX-2.5). Same flow as the Pi extension's /llamesa-video: describe, pick size
+# and length, optionally let a running Qwen instance write the long description
+# LTX was trained on, then queue, poll and save the MP4 + prompt locally.
+
+$Script:VideoDir = Join-Path ([Environment]::GetFolderPath('MyVideos')) 'llamesa'
+
+function Get-GenStatus {
+    return ConvertFrom-ServerJson (Invoke-ServerCommand "status-gen" -raw)
+}
+
+function Get-VideoPromptWriter {
+    foreach ($r in @(Get-RadRunning)) {
+        try {
+            $m = Invoke-RestMethod -Uri ("http://{0}:{1}/v1/models" -f $Script:ActiveServer.host, $r.port) -TimeoutSec 5
+            if ($m.data -and $m.data.Count -gt 0) {
+                return [PSCustomObject]@{ Port = $r.port; Model = $m.data[0].id }
+            }
+        } catch { Write-Verbose "prompt writer probe failed on port $($r.port): $_" }
+    }
+    return $null
+}
+
+function Expand-VideoPrompt {
+    param($Writer, [string]$Idea)
+    $system = "You write prompts for a text-to-video model that also generates the soundtrack. " +
+        "Rewrite the user's idea as ONE paragraph of 80 to 140 words describing: the subject and setting, " +
+        "the motion and action over a few seconds, the camera shot and movement, the light and colour, " +
+        "and the sounds heard. Concrete visual language, present tense, no lists, no title, no quotes, " +
+        "no text overlays unless asked. Output only the paragraph."
+    $body = @{
+        model = $Writer.Model
+        messages = @(@{ role = "system"; content = $system }, @{ role = "user"; content = $Idea })
+        max_tokens = 400
+        temperature = 0.7
+        chat_template_kwargs = @{ enable_thinking = $false }
+    } | ConvertTo-Json -Depth 5
+    $res = Invoke-RestMethod -Method Post -Uri ("http://{0}:{1}/v1/chat/completions" -f $Script:ActiveServer.host, $Writer.Port) `
+        -ContentType "application/json" -Body ([Text.Encoding]::UTF8.GetBytes($body)) -TimeoutSec 120
+    $text = "$($res.choices[0].message.content)".Trim().Trim('"')
+    if (-not $text) { throw "the prompt writer returned nothing" }
+    return $text
+}
+
+function Get-VideoFileBase {
+    param([string]$Idea)
+    $slug = ($Idea.ToLower() -replace '[^a-z0-9]+', '-').Trim('-')
+    if ($slug.Length -gt 40) { $slug = $slug.Substring(0, 40).Trim('-') }
+    if (-not $slug) { $slug = "video" }
+    return Join-Path $Script:VideoDir ("{0}-{1}" -f (Get-Date -Format "yyyyMMdd-HHmmss"), $slug)
+}
+
+function Cmd-Video {
+    $gen = Get-GenStatus
+    if (-not $gen) {
+        Write-Host ("{0}The server has no video server configured (radiance.gen block).{1}" -f $red, $reset)
+        return
+    }
+
+    Write-Host ""
+    $idea = (Read-Host "Describe the video (a shot, what moves, the mood, any sound)").Trim()
+    if (-not $idea) { Write-Host ("{0}Cancelled.{1}" -f $gray, $reset); return }
+
+    $sizes = @(
+        [PSCustomObject]@{ Label = "960x544 landscape (about 22 s for 5 s of video)"; Size = "960x544" },
+        [PSCustomObject]@{ Label = "1280x704 landscape (about 42 s)"; Size = "1280x704" },
+        [PSCustomObject]@{ Label = "544x960 portrait"; Size = "544x960" },
+        [PSCustomObject]@{ Label = "704x1280 portrait"; Size = "704x1280" },
+        [PSCustomObject]@{ Label = "768x768 square"; Size = "768x768" }
+    )
+    $size = Read-SelectList -Items $sizes -LabelFn { param($s) $s.Label } `
+        -HeaderFn { Write-Host ("  {0}Video size:{1}" -f $white, $reset) }
+    if (-not $size) { Write-Host ("{0}Cancelled.{1}" -f $gray, $reset); return }
+
+    $lengths = @(
+        [PSCustomObject]@{ Label = "auto (the model picks from the prompt)"; Seconds = $null },
+        [PSCustomObject]@{ Label = "3 s"; Seconds = "3" },
+        [PSCustomObject]@{ Label = "5 s"; Seconds = "5" },
+        [PSCustomObject]@{ Label = "6.7 s (the longest it makes)"; Seconds = "6.7" }
+    )
+    $length = Read-SelectList -Items $lengths -LabelFn { param($l) $l.Label } `
+        -HeaderFn { Write-Host ("  {0}Length:{1}" -f $white, $reset) }
+    if (-not $length) { Write-Host ("{0}Cancelled.{1}" -f $gray, $reset); return }
+
+    $prompt = $idea
+    $writer = Get-VideoPromptWriter
+    if ($writer) {
+        $expand = Read-SelectList -Items @("yes, let Qwen expand my idea", "no, use my text as is") -LabelFn { param($x) $x } `
+            -HeaderFn { Write-Host ("  {0}Let Qwen write the detailed prompt? (LTX works best with a long description){1}" -f $white, $reset) }
+        if (-not $expand) { Write-Host ("{0}Cancelled.{1}" -f $gray, $reset); return }
+        if ($expand -like "yes*") {
+            Write-Host ("{0}Qwen is writing the prompt...{1}" -f $cyan, $reset)
+            try {
+                $expanded = Expand-VideoPrompt -Writer $writer -Idea $idea
+                Write-Host ""
+                Write-Host ("  {0}{1}{2}" -f $white, $expanded, $reset)
+                Write-Host ""
+                $use = Read-Host "Use this prompt? (Y = yes, n = my original text, c = cancel)"
+                if ($use -match '^[cC]') { Write-Host ("{0}Cancelled.{1}" -f $gray, $reset); return }
+                if ($use -notmatch '^[nN]') { $prompt = $expanded }
+            } catch {
+                Write-Host ("{0}Prompt writer failed ({1}); using your text.{2}" -f $amber, $_.Exception.Message, $reset)
+            }
+        }
+    }
+
+    # Start the video server if needed; never stop a chat model without asking.
+    if (-not $gen.running) {
+        $genKey = if ([int]$gen.gpu -eq 1) { "r9700b" } else { "r9700a" }
+        $blocker = @(Get-RadRunning | Where-Object { $_.gpu_id -eq $genKey })
+        if ($blocker.Count -gt 0) {
+            $ans = Read-Host ("The video server needs GPU {0}, which is running {1} (port {2}). Stop it? (y/N)" -f $gen.gpu, (Get-FriendlyModelName $blocker[0].model), $blocker[0].port)
+            if ($ans -notmatch '^[yY]') { Write-Host ("{0}Cancelled.{1}" -f $gray, $reset); return }
+            $null = Invoke-ServerCommandChecked ("stop-rad --gpu {0}" -f $genKey)
+            Start-Sleep -Seconds 3
+        } else {
+            $ans = Read-Host ("Start the video server on GPU {0} (port {1}, about 15 s)? (Y/n)" -f $gen.gpu, $gen.port)
+            if ($ans -match '^[nN]') { Write-Host ("{0}Cancelled.{1}" -f $gray, $reset); return }
+        }
+        Write-Host ("{0}Starting the video server...{1}" -f $cyan, $reset)
+        $result = Invoke-ServerCommandChecked "start-gen"
+        if ($result.ExitCode -ne 0) {
+            Write-Host ($result.Output -join "`n")
+            Write-Host ("{0}start-gen failed — see error above.{1}" -f $red, $reset)
+            return
+        }
+        Write-Host ("{0}✓ Video server is up on port {1}.{2}" -f $green, $gen.port, $reset)
+    }
+
+    $seed = Get-Random -Minimum 0 -Maximum 2147483647
+    $base = "http://{0}:{1}/v1/videos" -f $Script:ActiveServer.host, $gen.port
+    $req = @{ prompt = $prompt; size = $size.Size; seed = $seed }
+    if ($length.Seconds) { $req.seconds = $length.Seconds }
+    Write-Host ("{0}Making video: {1}, {2}, seed {3}{4}" -f $cyan, $size.Size, $(if ($length.Seconds) { "$($length.Seconds) s" } else { "auto length" }), $seed, $reset)
+    $started = Get-Date
+    try {
+        $job = Invoke-RestMethod -Method Post -Uri $base -ContentType "application/json" `
+            -Body ([Text.Encoding]::UTF8.GetBytes(($req | ConvertTo-Json -Depth 4))) -TimeoutSec 60
+        $state = $job
+        # Fields appear as the job advances (a queued job has no steps yet), and
+        # the client runs under strict mode, so read every one through Get-Prop.
+        while ((Get-Prop $state 'status' '') -ne "completed") {
+            $status = Get-Prop $state 'status' 'queued'
+            if ($status -in @("failed", "cancelled")) {
+                $err = Get-Prop $state 'error' $null
+                $why = if ($err) { Get-Prop $err 'message' "no reason given" } else { "no reason given" }
+                throw "video ${status}: $why"
+            }
+            if (((Get-Date) - $started).TotalMinutes -gt 15) { throw "video job timed out after 15 min" }
+            $total = Get-Prop $state 'steps_total' $null
+            $steps = if ($total) { " step {0}/{1}" -f (Get-Prop $state 'steps_done' 0), $total } else { "" }
+            Write-Host -NoNewline ("`r  {0}{1} · {2}% · {3:N0}s   " -f $status, $steps, (Get-Prop $state 'progress' 0), ((Get-Date) - $started).TotalSeconds)
+            Start-Sleep -Milliseconds 1500
+            $state = Invoke-RestMethod -Uri ("{0}/{1}" -f $base, $job.id) -TimeoutSec 15
+        }
+        Write-Host ""
+        New-Item -ItemType Directory -Force -Path $Script:VideoDir | Out-Null
+        $fileBase = Get-VideoFileBase -Idea $idea
+        Invoke-WebRequest -Uri ("{0}/{1}/content" -f $base, $job.id) -OutFile "$fileBase.mp4" -TimeoutSec 300 -UseBasicParsing
+        $secs = [int]((Get-Date) - $started).TotalSeconds
+        @(
+            "idea: $idea", "prompt: $prompt", "size: $($size.Size)", "seconds: $(Get-Prop $state 'seconds' 'auto')",
+            "seed: $seed", "model: $(Get-Prop $state 'model' '')", "made in: $secs s"
+        ) | Set-Content -Path "$fileBase.txt" -Encoding UTF8
+        Write-Host ("{0}✓ Saved {1}.mp4 ({2} s){3}" -f $green, $fileBase, $secs, $reset)
+        $open = Read-Host "Open it now? (y/N)"
+        if ($open -match '^[yY]') { Start-Process "$fileBase.mp4" }
+    } catch {
+        Write-Host ""
+        $msg = $_.Exception.Message
+        if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $msg = $_.ErrorDetails.Message }
+        Write-Host ("{0}Video failed: {1}{2}" -f $red, $msg, $reset)
+    }
+}
+
+function Cmd-VideoStop {
+    $result = Invoke-ServerCommandChecked "stop-gen"
+    if ($result.ExitCode -eq 0) { Write-Host ("{0}✓ Video server stopped.{1}" -f $green, $reset) }
+    else { Write-Host ($result.Output -join "`n") }
+}
+
 # ── Command: /config ──────────────────────────────────────────────────────
 
 function Cmd-Config {
@@ -2261,13 +2806,19 @@ function Cmd-Config {
 # typing a full command name (e.g. "/start" + Enter) dispatches to.
 
 $Script:PaletteCommands = @(
-    [PSCustomObject]@{ Name = "start";    Desc = "start server — model(s), thinking, context" }
+    [PSCustomObject]@{ Name = "start";    Desc = "start Radiance on the first GPU (main port)" }
+    [PSCustomObject]@{ Name = "start-2nd"; Desc = "start Radiance on the second GPU (next port), same as first" }
+    [PSCustomObject]@{ Name = "start-big"; Desc = "start llama.cpp across both GPUs (combined VRAM)" }
+    [PSCustomObject]@{ Name = "start-llama"; Desc = "llama.cpp: pick model(s), combined or one per GPU" }
     [PSCustomObject]@{ Name = "stop";     Desc = "stop what's running" }
     [PSCustomObject]@{ Name = "restart";  Desc = "stop + start with same settings" }
+    [PSCustomObject]@{ Name = "engine";   Desc = "switch between running engines (llama.cpp / Radiance)" }
     [PSCustomObject]@{ Name = "health";   Desc = "ping /health and /v1/models" }
     [PSCustomObject]@{ Name = "logs";     Desc = "tail verbose server output" }
     [PSCustomObject]@{ Name = "models";   Desc = "list downloaded models + sizes" }
     [PSCustomObject]@{ Name = "download"; Desc = "download from huggingface" }
+    [PSCustomObject]@{ Name = "video";    Desc = "make a short video with sound (Radiance video server)" }
+    [PSCustomObject]@{ Name = "video-stop"; Desc = "stop the video server (frees its GPU)" }
     [PSCustomObject]@{ Name = "clear";    Desc = "clear chat history" }
     [PSCustomObject]@{ Name = "think";    Desc = "enable thinking mode" }
     [PSCustomObject]@{ Name = "nothink";  Desc = "disable thinking mode" }
@@ -2276,7 +2827,7 @@ $Script:PaletteCommands = @(
     [PSCustomObject]@{ Name = "quit";     Desc = "exit LLaMesa" }
 )
 
-$Script:ServerDependentCommands = @("start", "stop", "restart", "health", "logs", "models", "download")
+$Script:ServerDependentCommands = @("start", "start-2nd", "start-big", "start-llama", "start-rad", "stop", "restart", "engine", "health", "logs", "models", "download", "video", "video-stop")
 
 function Invoke-PaletteCommand {
     param([string]$cmd)
@@ -2291,13 +2842,20 @@ function Invoke-PaletteCommand {
     }
 
     switch ($cmd) {
-        "start"    { Cmd-Start;    Read-Host "`nPress Enter to continue" | Out-Null }
+        "start"    { Cmd-StartRadSlot -Slot first;  Read-Host "`nPress Enter to continue" | Out-Null }
+        "start-2nd" { Cmd-StartRadSlot -Slot second; Read-Host "`nPress Enter to continue" | Out-Null }
+        "start-big" { Cmd-StartBig;  Read-Host "`nPress Enter to continue" | Out-Null }
+        "start-llama" { Cmd-Start;   Read-Host "`nPress Enter to continue" | Out-Null }
         "stop"     { Cmd-Stop;     Read-Host "`nPress Enter to continue" | Out-Null }
         "restart"  { Cmd-Restart;  Read-Host "`nPress Enter to continue" | Out-Null }
+        "start-rad" { Cmd-StartRadSlot -Slot first; Read-Host "`nPress Enter to continue" | Out-Null }
+        "engine"   { Cmd-Engine;   Read-Host "`nPress Enter to continue" | Out-Null }
         "health"   { Cmd-Health;   Read-Host "`nPress Enter to continue" | Out-Null }
         "logs"     { Cmd-Logs }
         "models"   { Cmd-Models;   Read-Host "`nPress Enter to continue" | Out-Null }
         "download" { Cmd-Download; Read-Host "`nPress Enter to continue" | Out-Null }
+        "video"    { Cmd-Video;    Read-Host "`nPress Enter to continue" | Out-Null }
+        "video-stop" { Cmd-VideoStop; Read-Host "`nPress Enter to continue" | Out-Null }
         "clear"    { Cmd-ClearChat }
         "think"    { Cmd-Think }
         "nothink"  { Cmd-NoThink }
@@ -2314,6 +2872,9 @@ function Test-ModelLoaded {
         "big" {
             $s = Get-BigStatus
             return [bool]($s -and $s.running)
+        }
+        "rad" {
+            return (@(Get-RadRunning).Count -gt 0)
         }
         "dual" {
             $s = Get-DualStatus

@@ -468,3 +468,55 @@ believed to have caused the original (now-resolved) cross-GPU split failures. If
 background `stop-dual`/`stop-big` SSH command appears to hang, the remote command has
 sometimes still completed fine — verify via a fresh SSH connection checking
 `ps aux`/`free -h` rather than assuming failure or retrying blindly.
+
+## Radiance (`-rad`, opt-in, experimental)
+
+`start-rad`, `stop-rad`, `restart-rad`, `status-rad`, `logs-rad` and `list-models-rad` run the
+[Radiance](https://codeberg.org/StillDeadcode/radiance) engine in rootless podman containers.
+They are independent of the llama.cpp commands and fail fast without a `radiance` block in
+`config.json` (see `config/server.example.json`).
+
+**Ports are fixed by GPU slot, not by engine.**
+
+| Slot | Port | Client command | What runs there |
+|---|---|---|---|
+| First GPU (`r9700a`) | 1234 (main) | `/start` | Radiance, one TP1 instance |
+| Second GPU (`r9700b`) | 1235 | `/start-2nd` | Radiance, same model and settings as the first unless you choose otherwise |
+| Both GPUs | 1236 | `/start-big` | llama.cpp combined VRAM (`vulkan_split`) |
+
+A GPU holds one server at a time, so Radiance and llama.cpp never run on the same GPU together
+and can reuse the same port numbers. `/start-llama` is the original llama.cpp flow (one model
+across both GPUs, or one per GPU). `start-rad` refuses to start while `-big` holds both GPUs, and
+also when another process already uses more than 2 GiB of VRAM on the target GPU; the client
+refuses `/start-big` while Radiance runs. The llama.cpp status and stop checks ignore a port that
+a running Radiance container is using.
+
+**Instances.** `radiance.instances` lists the instances, keyed like `-dual` (`r9700a`, `r9700b`),
+each with a GPU index and a port. Every instance runs the same model with the same settings (TP1)
+and differs only in GPU, port and served model name (`<served_model_name>-a`, `-b`). Without
+`--gpu`, the commands act on every configured instance; `--gpu r9700b` (or `--gpu 1`) scopes to
+one. `start-rad --gpu r9700b --like r9700a` copies model, context, thinking and parallel from the
+first instance's remembered session (this is what `/start-2nd` uses by default). Without an
+`instances` block there is a single instance, `r9700a`, using `radiance.gpu` and `radiance.port`.
+
+- The context is `radiance.default_context` (262144, the model's native maximum) when `--ctx` is
+  not given.
+- The model name in a request is not checked by the server, so the served name is a label, not a
+  routing key. Sharing one port would need a proxy in front, which is not built.
+- `status-rad` prints one object for a single instance and an array for several, like `status-dual`.
+- `logs-rad` needs `--gpu` when several instances are configured.
+- `restart-rad` restores each instance's remembered model, context, thinking and parallel settings.
+
+What to know before using it (details and benchmarks in `docs/radiance-evaluation.md`):
+
+- Radiance reads its own `.rad` checkpoints, not GGUF. `list-models-rad` lists `*.rad` files in
+  `radiance.models_dir`. Vision is built into the `.rad`, so there is no mmproj.
+- `radiance.tp` must be 1. Two-GPU tensor parallel wedges on 2x R9700 upstream (issues #356, #409,
+  #415), so `-rad` refuses other values.
+- `start-rad` refuses to start if free RAM is below about 12 GiB per instance plus 4 GiB.
+- `radiance.speculative: false` passes `--num-speculative-tokens 0`.
+- Radiance reserves nearly all VRAM on its GPU at start (weights plus a KV cache sized to fill the card), leaving only 96 MiB unclaimed by default. The example config adds `--gpu-headroom-mib 1024` through `radiance.extra_args` so the GPU keeps about 1 GiB free for kernel first-launch needs and the desktop, at the cost of roughly 1 GiB less KV cache.
+- Client: `/engine` switches which running engine the client follows, and `/stop`, `/restart`,
+  `/health`, `/logs`, `/models` follow the `rad` mode.
+- Rollback: `stop-rad`, then remove the `radiance` block and the models directory. Nothing else
+  is changed.
